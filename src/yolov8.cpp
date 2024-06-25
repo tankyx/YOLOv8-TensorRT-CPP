@@ -21,6 +21,7 @@ YoloV8::YoloV8(const std::string &onnxModelPath, const YoloV8Config &config)
 
     // Create our TensorRT inference engine
     m_trtEngine = std::make_unique<Engine<float>>(options);
+    std::cout << "Building or loading TensorRT engine..." << std::endl;
 
     // Build the onnx model into a TensorRT engine file, cache the file to disk, and then load the TensorRT engine file into memory.
     // If the engine file already exists on disk, this function will not rebuild but only load into memory.
@@ -31,6 +32,7 @@ YoloV8::YoloV8(const std::string &onnxModelPath, const YoloV8Config &config)
                                    "Try increasing TensorRT log severity to kVERBOSE (in /libs/tensorrt-cpp-api/engine.cpp).";
         throw std::runtime_error(errMsg);
     }
+    std::cout << "TensorRT engine built and loaded!" << std::endl;
 }
 
 std::vector<std::vector<cv::cuda::GpuMat>> YoloV8::preprocess(const cv::cuda::GpuMat &gpuImg) {
@@ -65,31 +67,14 @@ std::vector<std::vector<cv::cuda::GpuMat>> YoloV8::preprocess(const cv::cuda::Gp
 
 std::vector<Object> YoloV8::detectObjects(const cv::cuda::GpuMat &inputImageBGR) {
     // Preprocess the input image
-#ifdef ENABLE_BENCHMARKS
-    static int numIts = 1;
-    preciseStopwatch s1;
-#endif
     const auto input = preprocess(inputImageBGR);
-#ifdef ENABLE_BENCHMARKS
-    static long long t1 = 0;
-    t1 += s1.elapsedTime<long long, std::chrono::microseconds>();
-    std::cout << "Avg Preprocess time: " << (t1 / numIts) / 1000.f << " ms" << std::endl;
-#endif
+
     // Run inference using the TensorRT engine
-#ifdef ENABLE_BENCHMARKS
-    preciseStopwatch s2;
-#endif
     std::vector<std::vector<std::vector<float>>> featureVectors;
     auto succ = m_trtEngine->runInference(input, featureVectors);
     if (!succ) {
         throw std::runtime_error("Error: Unable to run inference.");
     }
-#ifdef ENABLE_BENCHMARKS
-    static long long t2 = 0;
-    t2 += s2.elapsedTime<long long, std::chrono::microseconds>();
-    std::cout << "Avg Inference time: " << (t2 / numIts) / 1000.f << " ms" << std::endl;
-    preciseStopwatch s3;
-#endif
     // Check if our model does only object detection or also supports segmentation
     std::vector<Object> ret;
     const auto &numOutputs = m_trtEngine->getOutputDims().size();
@@ -117,11 +102,6 @@ std::vector<Object> YoloV8::detectObjects(const cv::cuda::GpuMat &inputImageBGR)
         Engine<float>::transformOutput(featureVectors, featureVector);
         ret = postProcessSegmentation(featureVector);
     }
-#ifdef ENABLE_BENCHMARKS
-    static long long t3 = 0;
-    t3 += s3.elapsedTime<long long, std::chrono::microseconds>();
-    std::cout << "Avg Postprocess time: " << (t3 / numIts++) / 1000.f << " ms\n" << std::endl;
-#endif
     return ret;
 }
 
@@ -399,7 +379,15 @@ std::vector<Object> YoloV8::postprocessDetect(std::vector<float> &featureVector)
     return objects;
 }
 
-void YoloV8::drawObjectLabels(cv::Mat &image, const std::vector<Object> &objects, unsigned int scale) {
+void YoloV8::drawObjectLabels(cv::Mat &image, const std::vector<Object> &objects, unsigned int scale, int squareHalfSize) {
+    // Get the center of the screen
+    int screenCenterX = image.cols / 2;
+    int screenCenterY = image.rows / 2;
+
+    cv::rectangle(image, cv::Point(screenCenterX - squareHalfSize, screenCenterY - squareHalfSize),
+                  cv::Point(screenCenterX + squareHalfSize, screenCenterY + squareHalfSize), cv::Scalar(255, 0, 0),
+                  scale); // Drawing with a blue color
+
     // If segmentation information is present, start with that
     if (!objects.empty() && !objects[0].boxMask.empty()) {
         cv::Mat mask = image.clone();
@@ -420,33 +408,18 @@ void YoloV8::drawObjectLabels(cv::Mat &image, const std::vector<Object> &objects
         // Choose the color
         int colorIndex = object.label % COLOR_LIST.size(); // We have only defined 80 unique colors
         cv::Scalar color = cv::Scalar(COLOR_LIST[colorIndex][0], COLOR_LIST[colorIndex][1], COLOR_LIST[colorIndex][2]);
-        float meanColor = cv::mean(color)[0];
-        cv::Scalar txtColor;
-        if (meanColor > 0.5) {
-            txtColor = cv::Scalar(0, 0, 0);
-        } else {
-            txtColor = cv::Scalar(255, 255, 255);
-        }
 
         const auto &rect = object.rect;
 
-        // Draw rectangles and text
-        char text[256];
-        sprintf(text, "%s %.1f%%", CLASS_NAMES[object.label].c_str(), object.probability * 100);
-
-        int baseLine = 0;
-        cv::Size labelSize = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, 0.35 * scale, scale, &baseLine);
-
-        cv::Scalar txt_bk_color = color * 0.7 * 255;
-
-        int x = object.rect.x;
-        int y = object.rect.y + 1;
-
+        // Draw rectangles
         cv::rectangle(image, rect, color * 255, scale + 1);
 
-        cv::rectangle(image, cv::Rect(cv::Point(x, y), cv::Size(labelSize.width, labelSize.height + baseLine)), txt_bk_color, -1);
-
-        cv::putText(image, text, cv::Point(x, y + labelSize.height), cv::FONT_HERSHEY_SIMPLEX, 0.35 * scale, txtColor, scale);
+        // Draw a line from the center of the screen to the center of the CH/TH box
+        if (object.label == 1 || object.label == 3) { // Replace CH_LABEL and TH_LABEL with actual label values
+            int boxCenterX = rect.x + rect.width / 2;
+            int boxCenterY = rect.y + rect.height / 2;
+            cv::line(image, cv::Point(screenCenterX, screenCenterY), cv::Point(boxCenterX, boxCenterY), color * 255, scale);
+        }
 
         // Pose estimation
         if (!object.kps.empty()) {

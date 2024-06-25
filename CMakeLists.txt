@@ -4,9 +4,14 @@ project(YOLOv8_TensorRT_CPP)
 # Use ccache to speed up rebuilds
 include(cmake/ccache.cmake)
 
-# Set C++ version and optimization level
+# Enable Hot Reload for MSVC compilers if supported.
+if (POLICY CMP0141)
+  cmake_policy(SET CMP0141 NEW)
+  set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<IF:$<AND:$<C_COMPILER_ID:MSVC>,$<CXX_COMPILER_ID:MSVC>>,$<$<CONFIG:Debug,RelWithDebInfo>:EditAndContinue>,$<$<CONFIG:Debug,RelWithDebInfo>:ProgramDatabase>>")
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Ofast -DNDEBUG -Wno-deprecated-declarations")
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # CMake Options
 option(ENABLE_BENCHMARKS "Benchmark the preprocessing, inference, and post processing" OFF)
@@ -15,25 +20,17 @@ if (ENABLE_BENCHMARKS)
 endif()
 
 find_package(OpenCV REQUIRED)
+find_package(CUDA REQUIRED)
 
-# TODO: Specify the path to TensorRT root dir
-set(TensorRT_DIR /home/cyrus/work/libs/TensorRT-10.0.0.6/)
-
-# Build the TensorRT inference engine library
-# TensorRT is found and linked by the tensorrt-cpp-api
-add_subdirectory(libs/tensorrt-cpp-api)
-
-# Build the YoloV8 library
-add_library(YoloV8_TRT SHARED src/yolov8.cpp)
-target_link_libraries(YoloV8_TRT PUBLIC tensorrt_cpp_api ${OpenCV_LIBS})
-target_include_directories(YoloV8_TRT PUBLIC libs/tensorrt-cpp-api/src)
+include_directories(${OpenCV_INCLUDE_DIRS} ${CUDA_INCLUDE_DIRS})
 
 # Build and link the executables
-add_executable(detect_object_image src/object_detection_image.cpp)
-target_link_libraries(detect_object_image YoloV8_TRT)
+add_executable(detect_object_image src/object_detection_image.cpp src/yolov8.cpp src/engine.cpp "src/MouseController.h")
+target_link_libraries(detect_object_image PUBLIC ${OpenCV_LIBS} ${CUDA_LIBRARIES}
+    "${CUDA_TOOLKIT_ROOT_DIR}/lib/nvinfer_10.lib"
+    "${CUDA_TOOLKIT_ROOT_DIR}/lib/nvonnxparser_10.lib"
+    "${CUDA_TOOLKIT_ROOT_DIR}/lib/nvinfer_plugin_10.lib")
 
-add_executable(benchmark src/benchmark.cpp)
-target_link_libraries(benchmark YoloV8_TRT)
 
-add_executable(detect_object_video src/object_detection_video_stream.cpp)
-target_link_libraries(detect_object_video YoloV8_TRT)
+# Add /NODEFAULTLIB to avoid conflicts
+set_target_properties(detect_object_image PROPERTIES LINK_FLAGS "/NODEFAULTLIB:LIBCMT")

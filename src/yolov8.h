@@ -1,6 +1,7 @@
 #pragma once
 #include "engine.h"
 #include <fstream>
+#include <algorithm>
 
 // Utility method for checking if a file exists on disk
 inline bool doesFileExist(const std::string &name) {
@@ -43,19 +44,7 @@ struct YoloV8Config {
     int numKPS = 17;
     float kpsThreshold = 0.5f;
     // Class thresholds (default are COCO classes)
-    std::vector<std::string> classNames = {
-        "person",         "bicycle",    "car",           "motorcycle",    "airplane",     "bus",           "train",
-        "truck",          "boat",       "traffic light", "fire hydrant",  "stop sign",    "parking meter", "bench",
-        "bird",           "cat",        "dog",           "horse",         "sheep",        "cow",           "elephant",
-        "bear",           "zebra",      "giraffe",       "backpack",      "umbrella",     "handbag",       "tie",
-        "suitcase",       "frisbee",    "skis",          "snowboard",     "sports ball",  "kite",          "baseball bat",
-        "baseball glove", "skateboard", "surfboard",     "tennis racket", "bottle",       "wine glass",    "cup",
-        "fork",           "knife",      "spoon",         "bowl",          "banana",       "apple",         "sandwich",
-        "orange",         "broccoli",   "carrot",        "hot dog",       "pizza",        "donut",         "cake",
-        "chair",          "couch",      "potted plant",  "bed",           "dining table", "toilet",        "tv",
-        "laptop",         "mouse",      "remote",        "keyboard",      "cell phone",   "microwave",     "oven",
-        "toaster",        "sink",       "refrigerator",  "book",          "clock",        "vase",          "scissors",
-        "teddy bear",     "hair drier", "toothbrush"};
+    std::vector<std::string> classNames = {"c", "ch", "t", "th"};
 };
 
 class YoloV8 {
@@ -68,7 +57,9 @@ public:
     std::vector<Object> detectObjects(const cv::cuda::GpuMat &inputImageBGR);
 
     // Draw the object bounding boxes and labels on the image
-    void drawObjectLabels(cv::Mat &image, const std::vector<Object> &objects, unsigned int scale = 2);
+    void drawObjectLabels(cv::Mat &image, const std::vector<Object> &objects, unsigned int scale = 2, int squareHalfSize = 0);
+    // Object classes as strings
+    const std::vector<std::string> CLASS_NAMES;
 
 private:
     // Preprocess the input
@@ -105,9 +96,6 @@ private:
     const int SEG_H;
     const int SEG_W;
     const float SEGMENTATION_THRESHOLD;
-
-    // Object classes as strings
-    const std::vector<std::string> CLASS_NAMES;
 
     // Pose estimation constant
     const int NUM_KPS;

@@ -36,7 +36,7 @@ build*
 cmake-build-*
 .idea/
 
-*.onnx
-*.pt
-
 .vscode
+*.ipch
+*.vsidx
+/.vs
