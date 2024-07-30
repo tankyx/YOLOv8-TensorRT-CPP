@@ -173,6 +173,11 @@ public:
     static cv::cuda::GpuMat blobFromGpuMats(const std::vector<cv::cuda::GpuMat> &batchInput, const std::array<float, 3> &subVals,
                                             const std::array<float, 3> &divVals, bool normalize);
 
+    void setCaptureDimensions(int height, int width) {
+		captureHeight = height;
+		captureWidth = width;
+	}
+
 private:
     // Build the network
     bool build(std::string onnxModelPath, const std::array<float, 3> &subVals, const std::array<float, 3> &divVals, bool normalize);
@@ -205,6 +210,9 @@ private:
     std::unique_ptr<nvinfer1::IExecutionContext> m_context = nullptr;
     const Options m_options;
     Logger m_logger;
+
+    int captureHeight;
+    int captureWidth;
 };
 
 template <typename T> Engine<T>::Engine(const Options &options) : m_options(options) {}
@@ -337,8 +345,9 @@ bool Engine<T>::loadNetwork(std::string trtModelPath, const std::array<float, 3>
 
         if (tensorType == nvinfer1::TensorIOMode::kINPUT) {
             // The implementation currently only supports inputs of type float
-            if (m_engine->getTensorDataType(tensorName) != nvinfer1::DataType::kFLOAT) {
-                throw std::runtime_error("Error, the implementation currently only supports float inputs");
+            if (m_engine->getTensorDataType(tensorName) != nvinfer1::DataType::kFLOAT &&
+                m_engine->getTensorDataType(tensorName) != nvinfer1::DataType::kHALF) {
+                throw std::runtime_error("Error, the implementation currently only supports float and half inputs");
             }
 
             // Don't need to allocate memory for inputs as we will be using the OpenCV
@@ -484,8 +493,8 @@ bool Engine<T>::build(std::string onnxModelPath, const std::array<float, 3> &sub
         const auto inputName = input->getName();
         const auto inputDims = input->getDimensions();
         int32_t inputC = inputDims.d[1];
-        int32_t inputH = 640;
-        int32_t inputW = 640;
+        int32_t inputH = inputDims.d[2];
+        int32_t inputW = inputDims.d[3];
 
         std::cout << "Input name: " << inputName << ", dimensions: " << inputC << "x" << inputH << "x" << inputW << std::endl;
 
@@ -509,7 +518,9 @@ bool Engine<T>::build(std::string onnxModelPath, const std::array<float, 3> &sub
         // Ensure the GPU supports FP16 inference
         if (!builder->platformHasFastFp16()) {
             throw std::runtime_error("Error: GPU does not support FP16 precision");
-        }
+        } else {
+			std::cout << "Using FP16 precision" << std::endl;
+		}
         config->setFlag(nvinfer1::BuilderFlag::kFP16);
     } else if (m_options.precision == Precision::INT8) {
         if (numInputs > 1) {
@@ -619,7 +630,6 @@ bool Engine<T>::runInference(const std::vector<std::vector<cv::cuda::GpuMat>> &i
 
     std::vector<cv::cuda::GpuMat> preprocessedInputs;
 
-    // Preprocess all the inputs
     for (size_t i = 0; i < numInputs; ++i) {
         const auto &batchInput = inputs[i];
         const auto &dims = m_inputDims[i];
@@ -689,9 +699,9 @@ bool Engine<T>::runInference(const std::vector<std::vector<cv::cuda::GpuMat>> &i
         featureVectors.emplace_back(std::move(batchOutputs));
     }
 
-    // Synchronize the cuda stream
     Util::checkCudaErrorCode(cudaStreamSynchronize(inferenceCudaStream));
     Util::checkCudaErrorCode(cudaStreamDestroy(inferenceCudaStream));
+
     return true;
 }
 

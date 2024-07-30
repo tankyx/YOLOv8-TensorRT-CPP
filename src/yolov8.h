@@ -47,7 +47,7 @@ struct YoloV8Config {
     std::vector<std::string> classNames = {"c", "ch", "t", "th"};
 };
 
-class YoloV8 {
+template <typename T> class YoloV8 {
 public:
     // Builds the onnx model into a TensorRT engine, and loads the engine into memory
     YoloV8(const std::string &onnxModelPath, const YoloV8Config &config);
@@ -66,15 +66,15 @@ private:
     std::vector<std::vector<cv::cuda::GpuMat>> preprocess(const cv::cuda::GpuMat &gpuImg);
 
     // Postprocess the output
-    std::vector<Object> postprocessDetect(std::vector<float> &featureVector);
+    std::vector<Object> postprocessDetect(std::vector<T> &featureVector);
 
     // Postprocess the output for pose model
-    std::vector<Object> postprocessPose(std::vector<float> &featureVector);
+    std::vector<Object> postprocessPose(std::vector<T> &featureVector);
 
     // Postprocess the output for segmentation model
-    std::vector<Object> postProcessSegmentation(std::vector<std::vector<float>> &featureVectors);
+    std::vector<Object> postProcessSegmentation(std::vector<std::vector<T>> &featureVectors);
 
-    std::unique_ptr<Engine<float>> m_trtEngine = nullptr;
+    std::unique_ptr<Engine<T>> m_trtEngine = nullptr;
 
     // Used for image preprocessing
     // YoloV8 model expects values between [0.f, 1.f] so we use the following params
@@ -100,6 +100,13 @@ private:
     // Pose estimation constant
     const int NUM_KPS;
     const float KPS_THRESHOLD;
+
+    const std::vector<std::vector<float>> CS2_COLORS = {
+        {1.0, 0.0, 0.0}, // Red
+        {1.0, 0.5, 0.5}, // Light Red
+		{0.0, 0.0, 1.0}, // Blue
+		{0.5, 0.5, 1.0}  // Light Blue
+    };
 
     // Color list for drawing objects
     const std::vector<std::vector<float>> COLOR_LIST = {{1, 1, 1},

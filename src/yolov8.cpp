@@ -1,7 +1,7 @@
 #include "yolov8.h"
 #include <opencv2/cudaimgproc.hpp>
 
-YoloV8::YoloV8(const std::string &onnxModelPath, const YoloV8Config &config)
+template <typename T> YoloV8<T>::YoloV8(const std::string &onnxModelPath, const YoloV8Config &config)
     : PROBABILITY_THRESHOLD(config.probabilityThreshold), NMS_THRESHOLD(config.nmsThreshold), TOP_K(config.topK),
       SEG_CHANNELS(config.segChannels), SEG_H(config.segH), SEG_W(config.segW), SEGMENTATION_THRESHOLD(config.segmentationThreshold),
       CLASS_NAMES(config.classNames), NUM_KPS(config.numKPS), KPS_THRESHOLD(config.kpsThreshold) {
@@ -20,7 +20,7 @@ YoloV8::YoloV8(const std::string &onnxModelPath, const YoloV8Config &config)
     }
 
     // Create our TensorRT inference engine
-    m_trtEngine = std::make_unique<Engine<float>>(options);
+    m_trtEngine = std::make_unique<Engine<T>>(options);
     std::cout << "Building or loading TensorRT engine..." << std::endl;
 
     // Build the onnx model into a TensorRT engine file, cache the file to disk, and then load the TensorRT engine file into memory.
@@ -35,7 +35,7 @@ YoloV8::YoloV8(const std::string &onnxModelPath, const YoloV8Config &config)
     std::cout << "TensorRT engine built and loaded!" << std::endl;
 }
 
-std::vector<std::vector<cv::cuda::GpuMat>> YoloV8::preprocess(const cv::cuda::GpuMat &gpuImg) {
+template <typename T>  std::vector<std::vector<cv::cuda::GpuMat>> YoloV8<T>::preprocess(const cv::cuda::GpuMat &gpuImg) {
     // Populate the input vectors
     const auto &inputDims = m_trtEngine->getInputDims();
 
@@ -65,12 +65,12 @@ std::vector<std::vector<cv::cuda::GpuMat>> YoloV8::preprocess(const cv::cuda::Gp
     return inputs;
 }
 
-std::vector<Object> YoloV8::detectObjects(const cv::cuda::GpuMat &inputImageBGR) {
+template <typename T> std::vector<Object> YoloV8<T>::detectObjects(const cv::cuda::GpuMat &inputImageBGR) {
     // Preprocess the input image
     const auto input = preprocess(inputImageBGR);
 
     // Run inference using the TensorRT engine
-    std::vector<std::vector<std::vector<float>>> featureVectors;
+    std::vector<std::vector<std::vector<T>>> featureVectors;
     auto succ = m_trtEngine->runInference(input, featureVectors);
     if (!succ) {
         throw std::runtime_error("Error: Unable to run inference.");
@@ -81,8 +81,8 @@ std::vector<Object> YoloV8::detectObjects(const cv::cuda::GpuMat &inputImageBGR)
     if (numOutputs == 1) {
         // Object detection or pose estimation
         // Since we have a batch size of 1 and only 1 output, we must convert the output from a 3D array to a 1D array.
-        std::vector<float> featureVector;
-        Engine<float>::transformOutput(featureVectors, featureVector);
+        std::vector<T> featureVector;
+        Engine<T>::transformOutput(featureVectors, featureVector);
 
         const auto &outputDims = m_trtEngine->getOutputDims();
         int numChannels = outputDims[outputDims.size() - 1].d[1];
@@ -98,14 +98,14 @@ std::vector<Object> YoloV8::detectObjects(const cv::cuda::GpuMat &inputImageBGR)
     } else {
         // Segmentation
         // Since we have a batch size of 1 and 2 outputs, we must convert the output from a 3D array to a 2D array.
-        std::vector<std::vector<float>> featureVector;
-        Engine<float>::transformOutput(featureVectors, featureVector);
+        std::vector<std::vector<T>> featureVector;
+        Engine<T>::transformOutput(featureVectors, featureVector);
         ret = postProcessSegmentation(featureVector);
     }
     return ret;
 }
 
-std::vector<Object> YoloV8::detectObjects(const cv::Mat &inputImageBGR) {
+template <typename T> std::vector<Object> YoloV8<T>::detectObjects(const cv::Mat &inputImageBGR) {
     // Upload the image to GPU memory
     cv::cuda::GpuMat gpuImg;
     gpuImg.upload(inputImageBGR);
@@ -114,7 +114,7 @@ std::vector<Object> YoloV8::detectObjects(const cv::Mat &inputImageBGR) {
     return detectObjects(gpuImg);
 }
 
-std::vector<Object> YoloV8::postProcessSegmentation(std::vector<std::vector<float>> &featureVectors) {
+template <typename T> std::vector<Object> YoloV8<T>::postProcessSegmentation(std::vector<std::vector<T>> &featureVectors) {
     const auto &outputDims = m_trtEngine->getOutputDims();
 
     int numChannels = outputDims[0].d[1];
@@ -227,7 +227,7 @@ std::vector<Object> YoloV8::postProcessSegmentation(std::vector<std::vector<floa
     return objs;
 }
 
-std::vector<Object> YoloV8::postprocessPose(std::vector<float> &featureVector) {
+template <typename T> std::vector<Object> YoloV8<T>::postprocessPose(std::vector<T> &featureVector) {
     const auto &outputDims = m_trtEngine->getOutputDims();
     auto numChannels = outputDims[0].d[1];
     auto numAnchors = outputDims[0].d[2];
@@ -309,7 +309,7 @@ std::vector<Object> YoloV8::postprocessPose(std::vector<float> &featureVector) {
     return objects;
 }
 
-std::vector<Object> YoloV8::postprocessDetect(std::vector<float> &featureVector) {
+template <typename T> std::vector<Object> YoloV8<T>::postprocessDetect(std::vector<T> &featureVector) {
     const auto &outputDims = m_trtEngine->getOutputDims();
     auto numChannels = outputDims[0].d[1];
     auto numAnchors = outputDims[0].d[2];
@@ -379,22 +379,18 @@ std::vector<Object> YoloV8::postprocessDetect(std::vector<float> &featureVector)
     return objects;
 }
 
-void YoloV8::drawObjectLabels(cv::Mat &image, const std::vector<Object> &objects, unsigned int scale, int squareHalfSize) {
+template <typename T> void YoloV8<T>::drawObjectLabels(cv::Mat &image, const std::vector<Object> &objects, unsigned int scale, int squareHalfSize) {
     // Get the center of the screen
     int screenCenterX = image.cols / 2;
     int screenCenterY = image.rows / 2;
-
-    cv::rectangle(image, cv::Point(screenCenterX - squareHalfSize, screenCenterY - squareHalfSize),
-                  cv::Point(screenCenterX + squareHalfSize, screenCenterY + squareHalfSize), cv::Scalar(255, 0, 0),
-                  scale); // Drawing with a blue color
 
     // If segmentation information is present, start with that
     if (!objects.empty() && !objects[0].boxMask.empty()) {
         cv::Mat mask = image.clone();
         for (const auto &object : objects) {
             // Choose the color
-            int colorIndex = object.label % COLOR_LIST.size(); // We have only defined 80 unique colors
-            cv::Scalar color = cv::Scalar(COLOR_LIST[colorIndex][0], COLOR_LIST[colorIndex][1], COLOR_LIST[colorIndex][2]);
+            int colorIndex = object.label % CS2_COLORS.size(); // We have only defined 80 unique colors
+            cv::Scalar color = cv::Scalar(CS2_COLORS[colorIndex][0], CS2_COLORS[colorIndex][1], CS2_COLORS[colorIndex][2]);
 
             // Add the mask for said object
             mask(object.rect).setTo(color * 255, object.boxMask);
@@ -406,20 +402,13 @@ void YoloV8::drawObjectLabels(cv::Mat &image, const std::vector<Object> &objects
     // Bounding boxes and annotations
     for (auto &object : objects) {
         // Choose the color
-        int colorIndex = object.label % COLOR_LIST.size(); // We have only defined 80 unique colors
-        cv::Scalar color = cv::Scalar(COLOR_LIST[colorIndex][0], COLOR_LIST[colorIndex][1], COLOR_LIST[colorIndex][2]);
+        int colorIndex = object.label % CS2_COLORS.size(); // We have only defined 80 unique colors
+        cv::Scalar color = cv::Scalar(CS2_COLORS[colorIndex][0], CS2_COLORS[colorIndex][1], CS2_COLORS[colorIndex][2]);
 
         const auto &rect = object.rect;
 
         // Draw rectangles
         cv::rectangle(image, rect, color * 255, scale + 1);
-
-        // Draw a line from the center of the screen to the center of the CH/TH box
-        if (object.label == 1 || object.label == 3) { // Replace CH_LABEL and TH_LABEL with actual label values
-            int boxCenterX = rect.x + rect.width / 2;
-            int boxCenterY = rect.y + rect.height / 2;
-            cv::line(image, cv::Point(screenCenterX, screenCenterY), cv::Point(boxCenterX, boxCenterY), color * 255, scale);
-        }
 
         // Pose estimation
         if (!object.kps.empty()) {
@@ -452,3 +441,7 @@ void YoloV8::drawObjectLabels(cv::Mat &image, const std::vector<Object> &objects
         }
     }
 }
+
+// Explicit instantiation of the template
+template class YoloV8<float>;
+template class YoloV8<__half>;

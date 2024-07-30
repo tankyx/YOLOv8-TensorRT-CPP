@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(YOLOv8_TensorRT_CPP)
+project(YOLOv8_TensorRT_CPP LANGUAGES CXX)
 
 # Use ccache to speed up rebuilds
 include(cmake/ccache.cmake)
@@ -13,24 +13,78 @@ endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# CMake Options
-option(ENABLE_BENCHMARKS "Benchmark the preprocessing, inference, and post processing" OFF)
-if (ENABLE_BENCHMARKS)
-    add_compile_definitions(ENABLE_BENCHMARKS)
+# Set the runtime library for MSVC
+if (MSVC)
+  set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /MDd")
+  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /MD")
 endif()
+
+# Add the debug and release directories of the custom OpenCV build
+# set(OpenCV_DIR_DEBUG "C:/Users/Administrator/Documents/GitHub/opencv-install/install/x64/vc17")
+# set(OpenCV_DIR_RELEASE "C:/Users/Administrator/Documents/GitHub/opencv-install/x64/vc17")
+
+#if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+#  set(OpenCV_DIR ${OpenCV_DIR_DEBUG})
+#else ()
+#  set(OpenCV_DIR ${OpenCV_DIR_RELEASE})
+#endif()
 
 find_package(OpenCV REQUIRED)
 find_package(CUDA REQUIRED)
 
 include_directories(${OpenCV_INCLUDE_DIRS} ${CUDA_INCLUDE_DIRS})
 
-# Build and link the executables
-add_executable(detect_object_image src/object_detection_image.cpp src/yolov8.cpp src/engine.cpp "src/MouseController.h")
-target_link_libraries(detect_object_image PUBLIC ${OpenCV_LIBS} ${CUDA_LIBRARIES}
+# Function to compile HLSL shaders
+function(compile_shader shader_file target profile entry_point)
+    get_filename_component(shader_name ${shader_file} NAME_WE)
+    set(output_file ${CMAKE_BINARY_DIR}/${shader_name}_${entry_point}.cso)
+    add_custom_command(
+        OUTPUT ${output_file}
+        COMMAND fxc.exe /T ${profile} /E ${entry_point} /Fo ${output_file} ${CMAKE_SOURCE_DIR}/${shader_file}
+        MAIN_DEPENDENCY ${CMAKE_SOURCE_DIR}/${shader_file}
+        COMMENT "Compiling ${shader_file} (${entry_point})..."
+        VERBATIM
+    )
+    set(${target} ${${target}} ${output_file} PARENT_SCOPE)
+endfunction()
+
+# Compile vertex and pixel shaders
+set(SHADERS)
+compile_shader("src/shader.hlsl" SHADERS "vs_5_0" "VS")
+compile_shader("src/shader.hlsl" SHADERS "ps_5_0" "PS")
+
+# Add custom target to build shaders
+add_custom_target(Shaders ALL DEPENDS ${SHADERS})
+
+# Find DirectX libraries
+find_path(D3D_COMPILER_DIR NAMES d3dcompiler.lib PATHS "C:/Program Files (x86)/Windows Kits/10/Lib/10.0.22621.0/um/x64")
+
+# Set the library paths
+if(D3D_COMPILER_DIR)
+    set(D3D11_LIB ${D3D_COMPILER_DIR}/d3d11.lib)
+    set(D3DCOMPILER_LIB ${D3D_COMPILER_DIR}/d3dcompiler.lib)
+    set(DXGI_LIB ${D3D_COMPILER_DIR}/dxgi.lib)
+else()
+    message(FATAL_ERROR "Could not find DirectX libraries. Make sure the DirectX SDK is installed.")
+endif()
+
+# Add main executable
+add_executable(detect_object_image 
+    src/object_detection_image_mt.cpp 
+    src/yolov8.cpp 
+    src/engine.cpp 
+    src/MouseController.cpp
+    src/GDIOverlay.cpp
+)
+
+add_dependencies(detect_object_image Shaders)
+
+target_link_libraries(detect_object_image 
+    ${OpenCV_LIBS} ${CUDA_LIBRARIES}
     "${CUDA_TOOLKIT_ROOT_DIR}/lib/nvinfer_10.lib"
     "${CUDA_TOOLKIT_ROOT_DIR}/lib/nvonnxparser_10.lib"
-    "${CUDA_TOOLKIT_ROOT_DIR}/lib/nvinfer_plugin_10.lib")
-
-
-# Add /NODEFAULTLIB to avoid conflicts
-set_target_properties(detect_object_image PROPERTIES LINK_FLAGS "/NODEFAULTLIB:LIBCMT")
+    "${CUDA_TOOLKIT_ROOT_DIR}/lib/nvinfer_plugin_10.lib"
+    setupapi hid d3d11 dxgi Dwmapi.lib
+    ${D3D11_LIB}
+    ${D3DCOMPILER_LIB}
+    ${DXGI_LIB})
