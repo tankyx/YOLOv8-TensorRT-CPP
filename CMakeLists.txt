@@ -19,16 +19,6 @@ if (MSVC)
   set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /MD")
 endif()
 
-# Add the debug and release directories of the custom OpenCV build
-# set(OpenCV_DIR_DEBUG "C:/Users/Administrator/Documents/GitHub/opencv-install/install/x64/vc17")
-# set(OpenCV_DIR_RELEASE "C:/Users/Administrator/Documents/GitHub/opencv-install/x64/vc17")
-
-#if (CMAKE_BUILD_TYPE STREQUAL "Debug")
-#  set(OpenCV_DIR ${OpenCV_DIR_DEBUG})
-#else ()
-#  set(OpenCV_DIR ${OpenCV_DIR_RELEASE})
-#endif()
-
 find_package(OpenCV REQUIRED)
 find_package(CUDA REQUIRED)
 
