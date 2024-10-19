@@ -22,12 +22,15 @@ MouseController::MouseController(int screenWidth, int screenHeight, int detectio
     smoothedTargetY = 0.0f;
 
     ConnectToDevice();
+    running = true;
+    std::thread(&MouseController::processHIDReports, this).detach();
 }
 
 MouseController::~MouseController() {
     if (hidDevice) {
         CloseHandle(hidDevice);
     }
+    running = false;
 }
 
 bool MouseController::ConnectToDevice() {
@@ -47,7 +50,8 @@ bool MouseController::ConnectToDevice() {
     deviceInterfaceData.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
     DWORD deviceIndex = 0;
 
-    while (SetupDiEnumDeviceInterfaces(deviceInfoSet, NULL, &hidGuid, deviceIndex++, &deviceInterfaceData)) {
+    while (SetupDiEnumDeviceInterfaces(deviceInfoSet, NULL, &hidGuid, deviceIndex, &deviceInterfaceData)) {
+        std::cout << "Enumerating device at index: " << deviceIndex++ << std::endl;
         // Get the size of the device interface detail data
         DWORD requiredSize = 0;
         SetupDiGetDeviceInterfaceDetail(deviceInfoSet, &deviceInterfaceData, NULL, 0, &requiredSize, NULL);
@@ -58,6 +62,7 @@ bool MouseController::ConnectToDevice() {
         // Get the device interface detail data
         if (SetupDiGetDeviceInterfaceDetail(deviceInfoSet, &deviceInterfaceData, deviceInterfaceDetailData, requiredSize, NULL, NULL)) {
             // Open a handle to the device
+            std::wcout << L"Device path: " << deviceInterfaceDetailData->DevicePath << std::endl;
             HANDLE deviceHandle = CreateFile(deviceInterfaceDetailData->DevicePath, GENERIC_WRITE | GENERIC_READ,
                                              FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
             if (deviceHandle != INVALID_HANDLE_VALUE) {
@@ -68,33 +73,32 @@ bool MouseController::ConnectToDevice() {
                 attributes.Size = sizeof(HIDD_ATTRIBUTES);
                 if (HidD_GetAttributes(deviceHandle, &attributes)) {
                     if (attributes.VendorID == VENDOR_ID && attributes.ProductID == PRODUCT_ID) {
-                        std::cout << "Found HIDVendor device" << std::endl;
+                        std::cout << "Found matching device: Vendor ID: " << std::hex << attributes.VendorID
+                                  << ", Product ID: " << attributes.ProductID << std::dec << std::endl;
 
-                        // Get the serial number
                         wchar_t serialNumber[256];
                         if (HidD_GetSerialNumberString(deviceHandle, serialNumber, sizeof(serialNumber))) {
+                            std::wcout << L"Device serial number: " << serialNumber << std::endl;
                             if (wcscmp(serialNumber, TARGET_SERIAL) == 0) {
-                                // Check interface descriptor for vendor-defined usage page and usage
+                                std::wcout << L"Serial number matches: " << serialNumber << std::endl;
+
+                                // Check the usage page and usage (optional, based on your needs)
                                 PHIDP_PREPARSED_DATA preparsedData;
                                 HIDP_CAPS caps;
                                 if (HidD_GetPreparsedData(deviceHandle, &preparsedData)) {
                                     if (HidP_GetCaps(preparsedData, &caps) == HIDP_STATUS_SUCCESS) {
                                         if (caps.UsagePage == TARGET_USAGE_PAGE && caps.Usage == TARGET_USAGE) {
                                             hidDevice = deviceHandle;
+                                            std::cout << "Device has the correct UsagePage and Usage." << std::endl;
                                             HidD_FreePreparsedData(preparsedData);
-                                            std::wcout << L"Found HIDVendor device with serial number: " << serialNumber << std::endl;
-                                            std::cout << "Vendor ID: " << std::hex << attributes.VendorID << std::endl;
-                                            std::cout << "Product ID: " << std::hex << attributes.ProductID << std::dec << std::endl;
-                                            SetupDiDestroyDeviceInfoList(deviceInfoSet);
-                                            return true; // Successfully connected to the device
+                                            break;
                                         }
                                     }
                                     HidD_FreePreparsedData(preparsedData);
-                                } else {
-                                    std::cerr << "Failed to get preparsed data" << std::endl;
                                 }
                             } else {
-                                std::cerr << "Serial number does not match" << std::endl;
+                                std::wcout << L"Serial number does not match. Expected: " << TARGET_SERIAL << L", Received: "
+                                           << serialNumber << std::endl;
                             }
                         } else {
                             std::cerr << "Failed to get serial number" << std::endl;
@@ -104,6 +108,8 @@ bool MouseController::ConnectToDevice() {
                     std::cerr << "Failed to get device attributes" << std::endl;
                 }
                 CloseHandle(deviceHandle);
+            } else {
+                std::cerr << "Failed to open device: " << GetLastError() << std::endl;
             }
         }
     }
@@ -140,42 +146,52 @@ void MouseController::processHIDReports() {
     while (running) {
         auto report = reportQueue.pop();
         processHIDReport(report);
+        Sleep(2);
     }
 }
 
 bool MouseController::processHIDReport(std::vector<uint8_t> &report) {
     if (hidDevice != nullptr) {
-        BOOL res = HidD_SetOutputReport(hidDevice, report.data(), report.size());
-        if (!res) {
+        DWORD bytesWritten = 0;
+        BOOL res = WriteFile(hidDevice, report.data(), report.size(), &bytesWritten, NULL);
+
+        if (!res || bytesWritten != report.size()) {
             int err = GetLastError();
-            std::cerr << "Failed to send HID report using HidD_SetOutputReport: " << err << std::endl;
-            if (err == 995 || err == 1167) {
+            std::cerr << "Failed to send HID report using WriteFile: " << err << std::endl;
+
+            if (err == 995 || err == 1167) { // Device disconnected errors
                 std::cerr << "Device disconnected" << std::endl;
                 CloseHandle(hidDevice);
                 hidDevice = nullptr;
                 std::this_thread::sleep_for(std::chrono::seconds(2)); // Wait for device to reconnect
                 ConnectToDevice();
-                std::cout << "\033[2J\033[H";
+                std::cout << "\033[2J\033[H"; // Clear terminal (optional)
             } else {
-                exit(1);
+                exit(1); // Handle the error appropriately
             }
         }
     } else {
-        ConnectToDevice();
+        ConnectToDevice(); // Reconnect if the device is not available
     }
     return true;
 }
 
 void MouseController::sendHIDReport(int16_t dx, int16_t dy) {
-    std::vector<uint8_t> report(5, 0);
+    // Create a 64-byte report
+    std::vector<uint8_t> report(65, 0);
 
-    report[0] = 0x06; // Report ID
-    report[1] = dx & 0xFF;
-    report[2] = (dx >> 8) & 0xFF;
-    report[3] = dy & 0xFF;
-    report[4] = (dy >> 8) & 0xFF;
+    // The first byte could be the Report ID, as per your descriptor
+    report[0] = 0x02; // Report ID, this is arbitrary but should match your device's expectations
 
-   processHIDReport(report);
+    // Assuming dx and dy are data you want to send as part of the report
+    report[1] = dx & 0xFF;        // Low byte of dx
+    report[2] = (dx >> 8) & 0xFF; // High byte of dx
+    report[3] = dy & 0xFF;        // Low byte of dy
+    report[4] = (dy >> 8) & 0xFF; // High byte of dy
+
+    // Send the report for processing
+    reportQueue.push(report);
+    //processHIDReport(report);
 }
 
 float MouseController::calculateSpeedScaling(const cv::Rect &rect) {
@@ -328,7 +344,7 @@ void MouseController::triggerLeftClickIfCenterWithinDetection(const std::vector<
         int centerY = crosshairY;
 
         for (const auto &detection : detections) {
-            if (detection.label == 1 || detection.label == 3) { // Replace with actual label values
+            if (detection.label == headLabel1 || detection.label == headLabel2) { // Replace with actual label values
                 if (centerX >= detection.rect.x && centerX <= detection.rect.x + detection.rect.width && centerY >= detection.rect.y &&
                     centerY <= detection.rect.y + detection.rect.height) {
                     leftClick();

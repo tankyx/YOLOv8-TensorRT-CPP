@@ -9,6 +9,7 @@
 
 #include "DXGICapture.h"
 #include "GDIOverlay.h"
+#include "INIParser.h" // Make sure to include the INI parser we created earlier
 #include "MouseController.h"
 #include "threadsafe_queue.h"
 #include "yolov8.h"
@@ -24,146 +25,152 @@
 using namespace std::chrono;
 using YoloV8Variant = std::variant<YoloV8<float>, YoloV8<__half>>;
 
-// Function prototypes
-LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
-cv::Point detectCrosshairCPU(const cv::Mat &frame, const cv::Mat &templ);
-void moveToTop();
-void clearScreen();
-void logAverageLatencies(LatencyQueue &captureLatency, LatencyQueue &detectionLatency, LatencyQueue &overlayLatency,
-                         SafeQueue<std::string> &logQueue);
-
-class Runners {
+class ObjectDetectionSystem {
 public:
-    void captureThread(FrameQueue &captureQueue, LatencyQueue &latencyQueue, DXGICapture &capture, HWND targetWnd, int captureWidth,
-                       int captureHeight, std::atomic<bool> &running);
-    void detectionThread(FrameQueue &captureQueue, DetectionQueue &detectionQueue, LatencyQueue &latencyQueue, YoloV8Variant &yoloV8,
-                         MouseController &mouseController, cv::Mat &templateImg, int captureWidth, int captureHeight,
-                         std::atomic<bool> &running);
-    void overlayThread(DetectionQueue &detectionQueue, LatencyQueue &latencyQueue, SafeQueue<std::string> &logQueue, GDIOverlay &overlay,
-                       std::atomic<bool> &running);
+    ObjectDetectionSystem(const std::string &iniFile);
+    void run();
+
+private:
+    void loadConfigFromINI(const std::string &iniFile);
+    void initializeSystem();
+    void startThreads();
+    void mainLoop();
+    void cleanup();
+
+    static cv::Point detectCrosshairCPU(const cv::Mat &frame, const cv::Mat &templ);
+    static void moveToTop();
+    static void clearScreen();
+    static void logAverageLatencies(LatencyQueue &captureLatency, LatencyQueue &detectionLatency, LatencyQueue &overlayLatency,
+                                    SafeQueue<std::string> &logQueue);
+
+    void captureThread();
+    void detectionThread();
+    void overlayThread();
+
+    INIParser config;
+    std::unique_ptr<YoloV8Variant> yoloV8;
+    std::unique_ptr<DXGICapture> capture;
+    std::unique_ptr<GDIOverlay> overlay;
+    std::unique_ptr<MouseController> mouseController;
+
+    cv::Mat templateImg;
+    int captureWidth;
+    int captureHeight;
+    int screenWidth;
+    int screenHeight;
+    HWND targetWnd;
+
+    SafeQueue<std::string> logQueue;
+    LatencyQueue captureLatency, detectionLatency, overlayLatency;
+    std::atomic<bool> running;
+    FrameQueue captureQueue;
+    DetectionQueue detectionQueue;
+
+    std::thread captureThreadObj;
+    std::thread detectionThreadObj;
+    std::thread overlayThreadObj;
+
+    bool useOverlay;
+    bool trackCrosshair;
 };
 
-// Main function
-int main(int argc, char *argv[]) {
-    try {
-        // Parse command line arguments
-        if (argc != 7) {
-            std::cerr << "Usage: " << argv[0]
-                      << " <path to TensorRT engine file> <width> <height> <float/half> [Head Label ID 1] [Head Label ID 2]" << std::endl;
-            return -1;
-        }
+ObjectDetectionSystem::ObjectDetectionSystem(const std::string &iniFile) : running(true) {
+    loadConfigFromINI(iniFile);
+    initializeSystem();
+}
 
-        std::string onnxModelPath = argv[1];
-        int captureHeight = std::stoi(argv[2]);
-        int captureWidth = std::stoi(argv[3]);
-        std::string precision = argv[4];
-        int HL1 = std::stoi(argv[5]);
-        int HL2 = std::stoi(argv[6]);
+void ObjectDetectionSystem::loadConfigFromINI(const std::string &iniFile) {
+    if (!config.loadFile(iniFile)) {
+        throw std::runtime_error("Failed to load INI file: " + iniFile);
+    }
 
-        // Setup YoloV8 model
-        YoloV8Config config;
-        std::unique_ptr<YoloV8Variant> yoloV8;
+    captureWidth = config.getInt("CaptureWidth", 640);
+    captureHeight = config.getInt("CaptureHeight", 640);
+    useOverlay = config.getBool("UseOverlay", true);
+    trackCrosshair = config.getBool("TrackCrosshair", true);
+}
 
-        if (precision == "float") {
-            config.precision = Precision::FP32;
-            yoloV8 = std::make_unique<YoloV8Variant>(YoloV8<float>(onnxModelPath, config));
-        } else if (precision == "half") {
-            config.precision = Precision::FP16;
-            yoloV8 = std::make_unique<YoloV8Variant>(YoloV8<__half>(onnxModelPath, config));
-        } else {
-            throw std::runtime_error("Invalid precision: " + precision + ". Use 'float' or 'half'.");
-        }
+void ObjectDetectionSystem::initializeSystem() {
+    YoloV8Config yoloConfig;
 
-        // Setup screen capture and mouse control
-        int screenWidth = GetSystemMetrics(SM_CXSCREEN);
-        int screenHeight = GetSystemMetrics(SM_CYSCREEN);
-        MouseController mouseController(screenWidth, screenHeight, captureWidth, captureHeight, 0.80f, 55, 0.25f, 0.65f, 15, HL1, HL2,
-                                        3000);
+    yoloConfig.classNames = config.getStringArray("Labels");
+    std::string precision = config.getString("Precision", "float");
+    if (precision == "float") {
+        yoloConfig.precision = Precision::FP32;
+        yoloV8 = std::make_unique<YoloV8Variant>(YoloV8<float>(config.getString("ModelPath"), yoloConfig));
+    } else if (precision == "half") {
+        yoloConfig.precision = Precision::FP16;
+        yoloV8 = std::make_unique<YoloV8Variant>(YoloV8<__half>(config.getString("ModelPath"), yoloConfig));
+    } else {
+        throw std::runtime_error("Invalid precision in INI file. Use 'float' or 'half'.");
+    }
 
-        // Load crosshair template
-        cv::Mat templateImg = cv::imread("crosshair.png", cv::IMREAD_COLOR);
+    screenWidth = GetSystemMetrics(SM_CXSCREEN);
+    screenHeight = GetSystemMetrics(SM_CYSCREEN);
+    mouseController = std::make_unique<MouseController>(
+        screenWidth, screenHeight, captureWidth, captureHeight, config.getFloat("MouseSensitivity", 0.80f), config.getInt("AimFOV", 55),
+        config.getFloat("MinGain", 0.25f), config.getFloat("MaxGain", 0.65f), config.getInt("MaxSpeed", 15),
+        config.getInt("HeadLabelID1", 0), config.getInt("HeadLabelID2", 1), config.getInt("CPI", 3000));
+
+    if (trackCrosshair) {
+        templateImg = cv::imread(config.getString("CrosshairTemplate", "crosshair.png"), cv::IMREAD_COLOR);
         if (templateImg.empty()) {
             throw std::runtime_error("Failed to load template image");
         }
-
-        // Setup queues and flags
-        SafeQueue<std::string> logQueue;
-        LatencyQueue captureLatency, detectionLatency, overlayLatency;
-        std::atomic<bool> running(true);
-        FrameQueue captureQueue;
-        DetectionQueue detectionQueue;
-
-        // Find target window
-        HWND targetWnd = FindWindow(NULL, "Counter-Strike 2");
-        if (!targetWnd) {
-            throw std::runtime_error("Failed to find target window.");
-        }
-
-        // Initialize capture and overlay
-        DXGICapture capture(targetWnd);
-        // GDIOverlay overlay(targetWnd, screenWidth, screenHeight);
-
-        // Start threads
-        Runners runners;
-        std::thread captureThreadObj(
-            [&]() { runners.captureThread(captureQueue, captureLatency, capture, targetWnd, captureWidth, captureHeight, running); });
-
-        std::thread detectionThreadObj([&]() {
-            runners.detectionThread(captureQueue, detectionQueue, detectionLatency, *yoloV8, mouseController, templateImg, captureWidth,
-                                    captureHeight, running);
-        });
-
-        // std::thread overlayThreadObj([&]() {
-        //     runners.overlayThread(detectionQueue, overlayLatency, logQueue, overlay, running);
-        // });
-
-        // Main loop
-        clearScreen();
-        while (running) {
-            MSG msg;
-            if (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-                if (msg.message == WM_QUIT) {
-                    running = false;
-                }
-                TranslateMessage(&msg);
-                DispatchMessage(&msg);
-            }
-
-            if (GetAsyncKeyState(VK_INSERT) & 0x8000) {
-                running = false;
-            }
-
-            logAverageLatencies(captureLatency, detectionLatency, overlayLatency, logQueue);
-        }
-
-        // Cleanup
-        logQueue.push("exit");
-        cv::destroyAllWindows();
-        if (captureThreadObj.joinable())
-            captureThreadObj.join();
-        if (detectionThreadObj.joinable())
-            detectionThreadObj.join();
-        // if (overlayThreadObj.joinable()) overlayThreadObj.join();
-
-    } catch (const std::exception &e) {
-        std::cerr << "Error: " << e.what() << std::endl;
-        return -1;
     }
 
-    return 0;
-}
+    capture = std::make_unique<DXGICapture>();
 
-// Window procedure implementation
-LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-    if (uMsg == WM_DESTROY) {
-        PostQuitMessage(0);
-        return 0;
+    if (useOverlay) {
+        overlay = std::make_unique<GDIOverlay>(captureWidth, captureHeight);
     }
-    return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
 
-// Crosshair detection function
-cv::Point detectCrosshairCPU(const cv::Mat &frame, const cv::Mat &templ) {
+void ObjectDetectionSystem::startThreads() {
+    captureThreadObj = std::thread(&ObjectDetectionSystem::captureThread, this);
+    detectionThreadObj = std::thread(&ObjectDetectionSystem::detectionThread, this);
+    if (useOverlay) {
+        overlayThreadObj = std::thread(&ObjectDetectionSystem::overlayThread, this);
+    }
+}
+
+void ObjectDetectionSystem::mainLoop() {
+    clearScreen();
+    while (running) {
+        MSG msg = {};
+
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+
+        if (GetAsyncKeyState(VK_INSERT) & 0x8000) {
+            running = false;
+        }
+
+        logAverageLatencies(captureLatency, detectionLatency, overlayLatency, logQueue);
+        Sleep(100);
+    }
+}
+
+void ObjectDetectionSystem::cleanup() {
+    logQueue.push("exit");
+    cv::destroyAllWindows();
+    if (captureThreadObj.joinable())
+        captureThreadObj.join();
+    if (detectionThreadObj.joinable())
+        detectionThreadObj.join();
+    if (useOverlay && overlayThreadObj.joinable())
+        overlayThreadObj.join();
+}
+
+void ObjectDetectionSystem::run() {
+    startThreads();
+    mainLoop();
+    cleanup();
+}
+
+cv::Point ObjectDetectionSystem::detectCrosshairCPU(const cv::Mat &frame, const cv::Mat &templ) {
     cv::Mat result;
     cv::matchTemplate(frame, templ, result, cv::TM_CCOEFF_NORMED);
 
@@ -177,27 +184,23 @@ cv::Point detectCrosshairCPU(const cv::Mat &frame, const cv::Mat &templ) {
     return crosshairCenter;
 }
 
-// Console utility functions
-void moveToTop() { std::cout << "\033[H"; }
+void ObjectDetectionSystem::moveToTop() { std::cout << "\033[H"; }
 
-void clearScreen() { std::cout << "\033[2J\033[H"; }
+void ObjectDetectionSystem::clearScreen() { std::cout << "\033[2J\033[H"; }
 
-void logAverageLatencies(LatencyQueue &captureLatency, LatencyQueue &detectionLatency, LatencyQueue &overlayLatency,
-                         SafeQueue<std::string> &logQueue) {
-    moveToTop();
+void ObjectDetectionSystem::logAverageLatencies(LatencyQueue &captureLatency, LatencyQueue &detectionLatency, LatencyQueue &overlayLatency,
+                                                SafeQueue<std::string> &logQueue) {
     double avgCaptureLatency = captureLatency.getAverageLatency();
     double avgDetectionLatency = detectionLatency.getAverageLatency();
     double avgOverlayLatency = overlayLatency.getAverageLatency();
 
-    std::cout << "Average Capture Latency (last 500ms): " << avgCaptureLatency << "ms\n"
-              << "Average Detection Latency (last 500ms): " << avgDetectionLatency << "ms\n"
-              << "Average Overlay Latency (last 500ms): " << avgOverlayLatency << "ms\n";
+    std::cout << "\rAverage Capture Latency: " << avgCaptureLatency << "ms | "
+              << "Detection Latency: " << avgDetectionLatency << "ms | "
+              << "Overlay Latency: " << avgOverlayLatency << "ms" << std::flush;
 }
 
-// Runners class method implementations
-void Runners::captureThread(FrameQueue &captureQueue, LatencyQueue &latencyQueue, DXGICapture &capture, HWND targetWnd, int captureWidth,
-                            int captureHeight, std::atomic<bool> &running) {
-    const int targetFPS = 1000;
+void ObjectDetectionSystem::captureThread() {
+    const int targetFPS = config.getInt("CaptureFPS", 1000);
     const std::chrono::nanoseconds frameDuration(1000000000 / targetFPS);
     cv::Mat frame1(captureHeight, captureWidth, CV_8UC3);
     cv::Mat frame2(captureHeight, captureWidth, CV_8UC3);
@@ -207,7 +210,7 @@ void Runners::captureThread(FrameQueue &captureQueue, LatencyQueue &latencyQueue
     while (running) {
         auto start = std::chrono::high_resolution_clock::now();
 
-        capture.CaptureScreen(*currentFrame);
+        capture->CaptureScreen(*currentFrame);
 
         if (!currentFrame->empty()) {
             captureQueue.push(std::move(*currentFrame));
@@ -218,13 +221,11 @@ void Runners::captureThread(FrameQueue &captureQueue, LatencyQueue &latencyQueue
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = end - start;
 
-        latencyQueue.push(std::chrono::duration_cast<std::chrono::milliseconds>(duration).count());
+        captureLatency.push(std::chrono::duration_cast<std::chrono::milliseconds>(duration).count());
     }
 }
 
-void Runners::detectionThread(FrameQueue &captureQueue, DetectionQueue &detectionQueue, LatencyQueue &latencyQueue, YoloV8Variant &yoloV8,
-                              MouseController &mouseController, cv::Mat &templateImg, int captureWidth, int captureHeight,
-                              std::atomic<bool> &running) {
+void ObjectDetectionSystem::detectionThread() {
     while (running) {
         cv::Mat frame = captureQueue.pop();
 
@@ -241,63 +242,96 @@ void Runners::detectionThread(FrameQueue &captureQueue, DetectionQueue &detectio
         y = std::min(y, frame.rows - roiHeight);
         cv::Rect roi(x, y, roiWidth, roiHeight);
 
-        int smallRoiSize = 160;
-        int smallX = std::max(centerX - smallRoiSize / 2, 0);
-        int smallY = std::max(centerY - smallRoiSize / 2, 0);
-        smallX = std::min(smallX, frame.cols - smallRoiSize);
-        smallY = std::min(smallY, frame.rows - smallRoiSize);
-        cv::Rect smallRoi(smallX, smallY, smallRoiSize, smallRoiSize);
-
         cv::Mat croppedFrame = frame(roi);
-        cv::Mat smallCroppedFrame = frame(smallRoi);
 
-        cv::Point crosshairPos = detectCrosshairCPU(smallCroppedFrame, templateImg);
+        cv::Point crosshairPos;
+        if (trackCrosshair) {
+            int smallRoiSize = config.getInt("SmallRoiSize", 160);
+            int smallX = std::max(centerX - smallRoiSize / 2, 0);
+            int smallY = std::max(centerY - smallRoiSize / 2, 0);
+            smallX = std::min(smallX, frame.cols - smallRoiSize);
+            smallY = std::min(smallY, frame.rows - smallRoiSize);
+            cv::Rect smallRoi(smallX, smallY, smallRoiSize, smallRoiSize);
 
-        crosshairPos.x += smallX - x;
-        crosshairPos.y += smallY - y;
+            cv::Mat smallCroppedFrame = frame(smallRoi);
+            crosshairPos = detectCrosshairCPU(smallCroppedFrame, templateImg);
+            crosshairPos.x += smallX - x;
+            crosshairPos.y += smallY - y;
+        } else {
+            crosshairPos = cv::Point(roiWidth / 2, roiHeight / 2);
+        }
 
         std::vector<Object> detections;
-        std::visit([&](auto &yolo) { detections = yolo.detectObjects(croppedFrame); }, yoloV8);
+        std::visit([&](auto &yolo) { 
+                detections = yolo.detectObjects(croppedFrame);
+                yolo.drawObjectLabels(croppedFrame, detections, 1, 1);
+            }, *yoloV8);
 
-        mouseController.setCrosshairPosition(crosshairPos.x, crosshairPos.y);
-        mouseController.aim(detections);
-        mouseController.triggerLeftClickIfCenterWithinDetection(detections);
+        mouseController->setCrosshairPosition(crosshairPos.x, crosshairPos.y);
+
+        mouseController->aim(detections);
+        mouseController->triggerLeftClickIfCenterWithinDetection(detections);
 
         detectionQueue.push(detections);
 
         auto detectionEndTime = std::chrono::high_resolution_clock::now();
         auto detectionDuration = detectionEndTime - detectionStartTime;
 
-        latencyQueue.push(std::chrono::duration_cast<std::chrono::milliseconds>(detectionDuration).count());
+        detectionLatency.push(std::chrono::duration_cast<std::chrono::milliseconds>(detectionDuration).count());
     }
 }
 
-void Runners::overlayThread(DetectionQueue &detectionQueue, LatencyQueue &latencyQueue, SafeQueue<std::string> &logQueue,
-                            GDIOverlay &overlay, std::atomic<bool> &running) {
-    const int targetFPS = 500;
-    const std::chrono::nanoseconds frameDuration(1000000000 / targetFPS);
+void ObjectDetectionSystem::overlayThread() {
+    if (!useOverlay)
+        return;
 
     MSG msg = {};
-    while (msg.message != WM_QUIT && running) {
-        auto overlayStartTime = std::chrono::high_resolution_clock::now();
+    LARGE_INTEGER frequency, start, end;
+    QueryPerformanceFrequency(&frequency);
 
-        if (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+    while (msg.message != WM_QUIT && running) {
+        QueryPerformanceCounter(&start);
+
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessage(&msg);
-        } else {
-            overlay.cleanScreen();
-            overlay.drawDetectionsPen(detectionQueue.pop());
-            overlay.render();
-            auto overlayEndTime = std::chrono::high_resolution_clock::now();
-            auto overlayDuration = overlayEndTime - overlayStartTime;
+        }
 
-            if (overlayDuration < frameDuration) {
-                std::this_thread::sleep_for(frameDuration - overlayDuration);
-            }
+        const std::vector<Object> &detections = detectionQueue.pop();
 
-            overlayEndTime = std::chrono::high_resolution_clock::now();
-            overlayDuration = overlayEndTime - overlayStartTime;
-            latencyQueue.push(std::chrono::duration_cast<std::chrono::milliseconds>(overlayDuration).count());
+        overlay->drawDetections(detections);
+
+        std::stringstream logMessage;
+        logMessage << "Detections: " << detections.size() << "\n";
+        for (size_t i = 0; i < std::min(detections.size(), size_t(5)); ++i) {
+            logMessage << "D" << i << ": L" << detections[i].label << " C" << std::fixed << std::setprecision(2) << detections[i].probability
+                       << "\n";
+        }
+
+        overlay->drawLog(logMessage.str());
+        overlay->render();
+
+        QueryPerformanceCounter(&end);
+        double elapsedMs = (end.QuadPart - start.QuadPart) * 1000.0 / frequency.QuadPart;
+        overlayLatency.push(static_cast<long long>(elapsedMs));
+
+        if (elapsedMs < 6.94) { // Target ~144 FPS
+            std::this_thread::yield();
         }
     }
+}
+
+int main(int argc, char *argv[]) {
+    try {
+        if (argc != 2) {
+            throw std::runtime_error("Usage: " + std::string(argv[0]) + " <path to INI file>");
+        }
+        ObjectDetectionSystem system(argv[1]);
+        system.run();
+    } catch (const std::exception &e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return -1;
+    }
+
+    return 0;
 }

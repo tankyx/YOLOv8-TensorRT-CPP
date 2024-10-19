@@ -40,3 +40,6 @@ cmake-build-*
 *.ipch
 *.vsidx
 /.vs
+/models/Valorant/valid
+/models/Valorant/train
+/models

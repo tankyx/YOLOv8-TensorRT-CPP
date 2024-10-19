@@ -64,7 +64,7 @@ add_executable(detect_object_image
     src/yolov8.cpp 
     src/engine.cpp 
     src/MouseController.cpp
-    src/GDIOverlay.cpp
+    
 )
 
 add_dependencies(detect_object_image Shaders)

@@ -389,7 +389,7 @@ template <typename T> void YoloV8<T>::drawObjectLabels(cv::Mat &image, const std
         cv::Mat mask = image.clone();
         for (const auto &object : objects) {
             // Choose the color
-            int colorIndex = object.label % CS2_COLORS.size(); // We have only defined 80 unique colors
+            int colorIndex = object.label % CS2_COLORS.size();
             cv::Scalar color = cv::Scalar(CS2_COLORS[colorIndex][0], CS2_COLORS[colorIndex][1], CS2_COLORS[colorIndex][2]);
 
             // Add the mask for said object
@@ -402,13 +402,28 @@ template <typename T> void YoloV8<T>::drawObjectLabels(cv::Mat &image, const std
     // Bounding boxes and annotations
     for (auto &object : objects) {
         // Choose the color
-        int colorIndex = object.label % CS2_COLORS.size(); // We have only defined 80 unique colors
+        int colorIndex = object.label % CS2_COLORS.size();
         cv::Scalar color = cv::Scalar(CS2_COLORS[colorIndex][0], CS2_COLORS[colorIndex][1], CS2_COLORS[colorIndex][2]);
 
         const auto &rect = object.rect;
 
-        // Draw rectangles
+        // Draw rectangles and text
+        char text[256];
+        sprintf(text, "%s %d", CLASS_NAMES[object.label].c_str(), object.label);
+
+        int baseLine = 0;
+        cv::Size labelSize = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, 0.35 * scale, scale, &baseLine);
+
+        cv::Scalar txt_bk_color = color * 0.7 * 255;
+
+        int x = object.rect.x;
+        int y = object.rect.y + 1;
+
         cv::rectangle(image, rect, color * 255, scale + 1);
+
+        cv::rectangle(image, cv::Rect(cv::Point(x, y), cv::Size(labelSize.width, labelSize.height + baseLine)), txt_bk_color, -1);
+
+        cv::putText(image, text, cv::Point(x, y + labelSize.height), cv::FONT_HERSHEY_SIMPLEX, 0.35 * scale, color, scale);
 
         // Pose estimation
         if (!object.kps.empty()) {

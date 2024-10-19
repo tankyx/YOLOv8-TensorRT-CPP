@@ -9,9 +9,9 @@
 #include <hidsdi.h>
 #include <hidclass.h>
 
-#define VENDOR_ID 0x0680
-#define PRODUCT_ID 0x1b39
-#define TARGET_SERIAL L"744DBD976574" // Replace with your target serial number
+#define VENDOR_ID 0x0812
+#define PRODUCT_ID 0x2205
+#define TARGET_SERIAL L"DF625857C74E132B" // Replace with your target serial number
 #define TARGET_USAGE_PAGE 0xFF00      // Vendor-defined usage page
 #define TARGET_USAGE 0x01             // Vendor-defined usage
 

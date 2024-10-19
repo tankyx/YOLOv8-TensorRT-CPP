@@ -3,15 +3,14 @@
 #include <opencv2/opencv.hpp>
 #include <stdexcept>
 #include <vector>
-#include <wrl/client.h>
 #include <windows.h>
-#include <dwmapi.h>
+#include <wrl/client.h>
 
 using Microsoft::WRL::ComPtr;
 
 class DXGICapture {
 public:
-    DXGICapture(HWND hwnd) : targetWnd(hwnd) { Initialize(); }
+    DXGICapture() { Initialize(); }
 
     ~DXGICapture() { Cleanup(); }
 
@@ -32,20 +31,8 @@ public:
             throw std::runtime_error("Failed to query for IDXGISurface interface.");
         }
 
-        // Get the window client area dimensions
-        RECT rect = GetWindowRect(targetWnd);
-        int width = rect.right - rect.left;
-        int height = rect.bottom - rect.top;
-
-        // Copy the specified window region to the CPU accessible texture
-        D3D11_BOX box;
-        box.left = rect.left;
-        box.top = rect.top;
-        box.front = 0;
-        box.right = rect.right;
-        box.bottom = rect.bottom;
-        box.back = 1;
-        d3dDeviceContext->CopySubresourceRegion(cpuImage.Get(), 0, 0, 0, 0, acquiredDesktopImage.Get(), 0, &box);
+        // Copy the entire screen to the CPU accessible texture
+        d3dDeviceContext->CopyResource(cpuImage.Get(), acquiredDesktopImage.Get());
 
         D3D11_MAPPED_SUBRESOURCE mapped;
         hr = d3dDeviceContext->Map(cpuImage.Get(), 0, D3D11_MAP_READ, 0, &mapped);
@@ -53,7 +40,7 @@ public:
             throw std::runtime_error("Failed to map the copied frame.");
         }
 
-        cv::Mat bgraFrame(height, width, CV_8UC4, mapped.pData, mapped.RowPitch);
+        cv::Mat bgraFrame(screenHeight, screenWidth, CV_8UC4, mapped.pData, mapped.RowPitch);
         cv::cvtColor(bgraFrame, frame, cv::COLOR_BGRA2BGR);
         d3dDeviceContext->Unmap(cpuImage.Get(), 0);
 
@@ -100,13 +87,13 @@ private:
             throw std::runtime_error("Failed to create desktop duplication.");
         }
 
-        RECT rect = GetWindowRect(targetWnd);
-        int width = rect.right - rect.left;
-        int height = rect.bottom - rect.top;
+        // Get the screen dimensions
+        screenWidth = GetSystemMetrics(SM_CXSCREEN);
+        screenHeight = GetSystemMetrics(SM_CYSCREEN);
 
         D3D11_TEXTURE2D_DESC desc = {};
-        desc.Width = width;
-        desc.Height = height;
+        desc.Width = screenWidth;
+        desc.Height = screenHeight;
         desc.MipLevels = 1;
         desc.ArraySize = 1;
         desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -126,16 +113,10 @@ private:
         }
     }
 
-    RECT GetWindowRect(HWND hwnd) {
-        RECT rect;
-        GetClientRect(hwnd, &rect);
-        MapWindowPoints(hwnd, nullptr, (LPPOINT)&rect, 2);
-        return rect;
-    }
-
-    HWND targetWnd;
     ComPtr<ID3D11Device> d3dDevice;
     ComPtr<ID3D11DeviceContext> d3dDeviceContext;
     ComPtr<IDXGIOutputDuplication> deskDupl;
     ComPtr<ID3D11Texture2D> cpuImage;
+    int screenWidth;
+    int screenHeight;
 };
