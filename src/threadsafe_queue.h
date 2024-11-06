@@ -6,6 +6,8 @@
 #include <opencv2/opencv.hpp>
 #include <thread>
 
+#include "yolov8.h"
+
 template <typename T> class SafeQueue {
 private:
     std::queue<T> queue;

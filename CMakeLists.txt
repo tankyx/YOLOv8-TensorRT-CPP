@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(YOLOv8_TensorRT_CPP LANGUAGES CXX)
+project(YOLOv8_TensorRT_CPP LANGUAGES CXX CUDA)
 
 # Use ccache to speed up rebuilds
 include(cmake/ccache.cmake)
@@ -12,6 +12,8 @@ endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 # Set the runtime library for MSVC
 if (MSVC)
@@ -19,29 +21,15 @@ if (MSVC)
   set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /MD")
 endif()
 
+# Find required packages
 find_package(OpenCV REQUIRED)
 find_package(CUDA REQUIRED)
+find_package(CUDAToolkit REQUIRED)
 
-include_directories(${OpenCV_INCLUDE_DIRS} ${CUDA_INCLUDE_DIRS})
-
-# Function to compile HLSL shaders
-function(compile_shader shader_file target profile entry_point)
-    get_filename_component(shader_name ${shader_file} NAME_WE)
-    set(output_file ${CMAKE_BINARY_DIR}/${shader_name}_${entry_point}.cso)
-    add_custom_command(
-        OUTPUT ${output_file}
-        COMMAND fxc.exe /T ${profile} /E ${entry_point} /Fo ${output_file} ${CMAKE_SOURCE_DIR}/${shader_file}
-        MAIN_DEPENDENCY ${CMAKE_SOURCE_DIR}/${shader_file}
-        COMMENT "Compiling ${shader_file} (${entry_point})..."
-        VERBATIM
-    )
-    set(${target} ${${target}} ${output_file} PARENT_SCOPE)
-endfunction()
-
-# Compile vertex and pixel shaders
-set(SHADERS)
-compile_shader("src/shader.hlsl" SHADERS "vs_5_0" "VS")
-compile_shader("src/shader.hlsl" SHADERS "ps_5_0" "PS")
+# Include directories
+include_directories(${OpenCV_INCLUDE_DIRS} 
+                   ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+                   ${CUDA_INCLUDE_DIRS})
 
 # Add custom target to build shaders
 add_custom_target(Shaders ALL DEPENDS ${SHADERS})
@@ -58,23 +46,52 @@ else()
     message(FATAL_ERROR "Could not find DirectX libraries. Make sure the DirectX SDK is installed.")
 endif()
 
+# Set CUDA specific flags
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -arch=sm_89")  # Adjust SM architecture as needed
+
+# Create CUDA library for the fusion code
+add_library(fusion_cuda STATIC
+    src/SoftwareFuser.cu
+)
+
+set_target_properties(fusion_cuda PROPERTIES 
+    CUDA_SEPARABLE_COMPILATION ON
+    POSITION_INDEPENDENT_CODE ON
+)
+
+target_link_libraries(fusion_cuda
+    CUDA::cudart
+)
+
 # Add main executable
 add_executable(detect_object_image 
     src/object_detection_image_mt.cpp 
     src/yolov8.cpp 
     src/engine.cpp 
     src/MouseController.cpp
-    
 )
 
 add_dependencies(detect_object_image Shaders)
 
 target_link_libraries(detect_object_image 
-    ${OpenCV_LIBS} ${CUDA_LIBRARIES}
+    fusion_cuda  # Add the CUDA library
+    ${OpenCV_LIBS} 
+    CUDA::cudart
+    CUDA::cuda_driver
     "${CUDA_TOOLKIT_ROOT_DIR}/lib/nvinfer_10.lib"
     "${CUDA_TOOLKIT_ROOT_DIR}/lib/nvonnxparser_10.lib"
     "${CUDA_TOOLKIT_ROOT_DIR}/lib/nvinfer_plugin_10.lib"
-    setupapi hid d3d11 dxgi Dwmapi.lib
+    setupapi 
+    hid 
+    d3d11 
+    dxgi 
+    Dwmapi.lib
     ${D3D11_LIB}
     ${D3DCOMPILER_LIB}
-    ${DXGI_LIB})
+    ${DXGI_LIB}
+)
+
+# Set the output directory for the executable
+set_target_properties(detect_object_image PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+)

@@ -64,6 +64,8 @@ private:
 
     int cpi;
 
+    bool isLeftClicking;
+
     SafeQueue<std::vector<uint8_t>> reportQueue;
     std::thread reportThread;
     std::atomic<bool> running;
@@ -74,8 +76,9 @@ private:
     void moveMouseRelative(int dx, int dy);
     void moveMouseAbsolute(int x, int y);
     void leftClick();
+    void releaseLeftClick();
     Object findClosestDetection(const std::vector<Object> &detections);
-    void sendHIDReport(int16_t dx, int16_t dy);
+    void sendHIDReport(int16_t dx, int16_t dy, uint8_t button);
     bool ConnectToDevice();
     bool processHIDReport(std::vector<uint8_t> &report);
     void processHIDReports();

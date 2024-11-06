@@ -8,11 +8,12 @@
 #include <opencv2/opencv.hpp>
 
 #include "DXGICapture.h"
-#include "GDIOverlay.h"
 #include "INIParser.h" // Make sure to include the INI parser we created earlier
 #include "MouseController.h"
 #include "threadsafe_queue.h"
 #include "yolov8.h"
+#include "SoftwareFuser.h"
+#include "D3D11Overlay.h"
 
 #include <algorithm>
 #include <atomic>
@@ -50,14 +51,19 @@ private:
     INIParser config;
     std::unique_ptr<YoloV8Variant> yoloV8;
     std::unique_ptr<DXGICapture> capture;
-    std::unique_ptr<GDIOverlay> overlay;
     std::unique_ptr<MouseController> mouseController;
 
     cv::Mat templateImg;
     int captureWidth;
     int captureHeight;
+    int overlayX;
+    int overlayY;
+    int captureFPS;
+    int displayFPS;
     int screenWidth;
     int screenHeight;
+    int displayThreadCore;
+    int captureThreadCore;
     HWND targetWnd;
 
     SafeQueue<std::string> logQueue;
@@ -71,6 +77,8 @@ private:
     std::thread overlayThreadObj;
 
     bool useOverlay;
+    bool useFusion;
+    bool pinThreads;
     bool trackCrosshair;
 };
 
@@ -86,8 +94,20 @@ void ObjectDetectionSystem::loadConfigFromINI(const std::string &iniFile) {
 
     captureWidth = config.getInt("CaptureWidth", 640);
     captureHeight = config.getInt("CaptureHeight", 640);
-    useOverlay = config.getBool("UseOverlay", true);
-    trackCrosshair = config.getBool("TrackCrosshair", true);
+    trackCrosshair = config.getBool("TrackCrosshair", false);
+    useOverlay = config.getBool("UseOverlay", false);
+    useFusion = config.getBool("UseFusion", false);
+    captureFPS = config.getInt("CaptureFPS", 240);
+    displayFPS = config.getInt("DisplayFPS", 144);
+
+    // Thread settings
+    pinThreads = config.getBool("PinThreads", false);
+    captureThreadCore = config.getInt("CaptureThreadCore", 0);
+    displayThreadCore = config.getInt("DisplayThreadCore", 1);
+
+    // Display settings
+    overlayX = config.getInt("OverlayX", 0);
+    overlayY = config.getInt("OverlayY", 0);
 }
 
 void ObjectDetectionSystem::initializeSystem() {
@@ -120,10 +140,6 @@ void ObjectDetectionSystem::initializeSystem() {
     }
 
     capture = std::make_unique<DXGICapture>();
-
-    if (useOverlay) {
-        overlay = std::make_unique<GDIOverlay>(captureWidth, captureHeight);
-    }
 }
 
 void ObjectDetectionSystem::startThreads() {
@@ -160,7 +176,7 @@ void ObjectDetectionSystem::cleanup() {
         captureThreadObj.join();
     if (detectionThreadObj.joinable())
         detectionThreadObj.join();
-    if (useOverlay && overlayThreadObj.joinable())
+    if (overlayThreadObj.joinable())
         overlayThreadObj.join();
 }
 
@@ -262,13 +278,14 @@ void ObjectDetectionSystem::detectionThread() {
         }
 
         std::vector<Object> detections;
-        std::visit([&](auto &yolo) { 
+        std::visit(
+            [&](auto &yolo) {
                 detections = yolo.detectObjects(croppedFrame);
                 yolo.drawObjectLabels(croppedFrame, detections, 1, 1);
-            }, *yoloV8);
+            },
+            *yoloV8);
 
         mouseController->setCrosshairPosition(crosshairPos.x, crosshairPos.y);
-
         mouseController->aim(detections);
         mouseController->triggerLeftClickIfCenterWithinDetection(detections);
 
@@ -285,38 +302,68 @@ void ObjectDetectionSystem::overlayThread() {
     if (!useOverlay)
         return;
 
-    MSG msg = {};
-    LARGE_INTEGER frequency, start, end;
-    QueryPerformanceFrequency(&frequency);
+    // Initialize overlay with screen dimensions and position
+    D3D11Overlay overlay(screenWidth, screenHeight);
+    overlay.setPosition(overlayX, overlayY);
+    overlay.setClickthrough(true);
 
-    while (msg.message != WM_QUIT && running) {
-        QueryPerformanceCounter(&start);
+    // Set thread priority and affinity if configured
+    if (pinThreads) {
+        SetThreadAffinityMask(GetCurrentThread(), 1ULL << displayThreadCore);
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    }
 
-        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-        }
+    // Calculate frame timing for desired FPS
+    const auto frameTime = std::chrono::nanoseconds(1000000000 / displayFPS);
+    auto lastFrameTime = std::chrono::steady_clock::now();
 
+    while (running) {
+        auto frameStart = std::chrono::steady_clock::now();
+
+        // Get latest detections
         const std::vector<Object> &detections = detectionQueue.pop();
 
-        overlay->drawDetections(detections);
+        // Draw detections
+        overlay.drawDetections(detections);
 
+        // Prepare and draw log
         std::stringstream logMessage;
         logMessage << "Detections: " << detections.size() << "\n";
         for (size_t i = 0; i < std::min(detections.size(), size_t(5)); ++i) {
-            logMessage << "D" << i << ": L" << detections[i].label << " C" << std::fixed << std::setprecision(2) << detections[i].probability
-                       << "\n";
+            logMessage << "D" << i << ": L" << detections[i].label << " C" << std::fixed << std::setprecision(2)
+                       << detections[i].probability << "\n";
         }
 
-        overlay->drawLog(logMessage.str());
-        overlay->render();
+        // Add performance metrics to log
+        logMessage << "Capture: " << captureLatency.getAverageLatency() << "ms\n"
+                   << "Detection: " << detectionLatency.getAverageLatency() << "ms";
 
-        QueryPerformanceCounter(&end);
-        double elapsedMs = (end.QuadPart - start.QuadPart) * 1000.0 / frequency.QuadPart;
-        overlayLatency.push(static_cast<long long>(elapsedMs));
+        overlay.drawLog(logMessage.str());
+        overlay.render();
 
-        if (elapsedMs < 6.94) { // Target ~144 FPS
-            std::this_thread::yield();
+        // Frame timing and latency tracking
+        auto frameEnd = std::chrono::steady_clock::now();
+        auto workDuration = frameEnd - frameStart;
+        auto elapsed = frameEnd - lastFrameTime;
+
+        overlayLatency.push(std::chrono::duration_cast<std::chrono::milliseconds>(workDuration).count());
+
+        // Precise timing for target FPS
+        if (elapsed < frameTime) {
+            auto sleepTime = frameTime - elapsed;
+            if (sleepTime > std::chrono::microseconds(500)) {
+                std::this_thread::sleep_for(sleepTime - std::chrono::microseconds(500));
+            }
+            while (std::chrono::steady_clock::now() - lastFrameTime < frameTime) {
+                _mm_pause();
+            }
+        }
+
+        lastFrameTime = std::chrono::steady_clock::now();
+
+        // Check for exit condition
+        if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
+            running = false;
         }
     }
 }

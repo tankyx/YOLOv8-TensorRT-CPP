@@ -20,10 +20,11 @@ MouseController::MouseController(int screenWidth, int screenHeight, int detectio
     prevErrorY = 0.0f;
     smoothedTargetX = 0.0f;
     smoothedTargetY = 0.0f;
+    isLeftClicking = false;
 
     ConnectToDevice();
     running = true;
-    std::thread(&MouseController::processHIDReports, this).detach();
+    //std::thread(&MouseController::processHIDReports, this).detach();
 }
 
 MouseController::~MouseController() {
@@ -176,7 +177,7 @@ bool MouseController::processHIDReport(std::vector<uint8_t> &report) {
     return true;
 }
 
-void MouseController::sendHIDReport(int16_t dx, int16_t dy) {
+void MouseController::sendHIDReport(int16_t dx, int16_t dy, uint8_t button) {
     // Create a 64-byte report
     std::vector<uint8_t> report(65, 0);
 
@@ -188,10 +189,11 @@ void MouseController::sendHIDReport(int16_t dx, int16_t dy) {
     report[2] = (dx >> 8) & 0xFF; // High byte of dx
     report[3] = dy & 0xFF;        // Low byte of dy
     report[4] = (dy >> 8) & 0xFF; // High byte of dy
+    report[5] = button;           // Button state
 
     // Send the report for processing
-    reportQueue.push(report);
-    //processHIDReport(report);
+    //reportQueue.push(report);
+    processHIDReport(report);
 }
 
 float MouseController::calculateSpeedScaling(const cv::Rect &rect) {
@@ -217,6 +219,7 @@ void MouseController::aim(const std::vector<Object> &detections) {
     const float deadZoneThreshold = 5.0f;
 
     if (isLeftMouseButtonPressed() || isMouseButton5Pressed()) {
+        isLeftClicking = true;
         Object closestDetection = findClosestDetection(detections);
         if (closestDetection.probability > 0.0f) {
             int targetX = closestDetection.rect.x + closestDetection.rect.width / 2;
@@ -272,10 +275,14 @@ void MouseController::aim(const std::vector<Object> &detections) {
         }
     } else {
         resetSpeed();
+        if (isLeftClicking) {
+            releaseLeftClick();
+            isLeftClicking = false;
+        }
     }
 
     if (_dx != 0 || _dy != 0) {
-        sendHIDReport(_dx, _dy);
+        sendHIDReport(_dx, _dy, 0x01);
     }
 }
 
@@ -304,17 +311,9 @@ void MouseController::moveMouseAbsolute(int x, int y) {
     SendInput(1, &input, sizeof(INPUT));
 }
 
-void MouseController::leftClick() {
-    INPUT input = {0};
-    input.type = INPUT_MOUSE;
-    input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-    SendInput(1, &input, sizeof(INPUT));
+void MouseController::leftClick() { sendHIDReport(0, 0, 0x01); }
 
-    ZeroMemory(&input, sizeof(INPUT));
-    input.type = INPUT_MOUSE;
-    input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
-    SendInput(1, &input, sizeof(INPUT));
-}
+void MouseController::releaseLeftClick() { sendHIDReport(0, 0, 0x00); }
 
 // Modify findClosestDetection to use crosshair position
 Object MouseController::findClosestDetection(const std::vector<Object> &detections) {
@@ -348,7 +347,9 @@ void MouseController::triggerLeftClickIfCenterWithinDetection(const std::vector<
                 if (centerX >= detection.rect.x && centerX <= detection.rect.x + detection.rect.width && centerY >= detection.rect.y &&
                     centerY <= detection.rect.y + detection.rect.height) {
                     leftClick();
-                    Sleep(250);
+                    Sleep(100);
+                    releaseLeftClick();
+                    Sleep(120);
                     break;
                 }
             }
