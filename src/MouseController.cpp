@@ -2,10 +2,10 @@
 
 
 MouseController::MouseController(int screenWidth, int screenHeight, int detectionZoneWidth, int detectionZoneHeight, float sensitivity,
-                                 int centralSquareSize, float minGain, float maxGain, float maxSpeed, int HL1, int HL2, int cpi)
+                                 int centralSquareSize, float minGain, float maxGain, float maxSpeed, int HL1, int HL2, int cpi, int nLab)
     : screenWidth(screenWidth), screenHeight(screenHeight), detectionZoneWidth(detectionZoneWidth),
       detectionZoneHeight(detectionZoneHeight), sensitivity(sensitivity), centralSquareSize(centralSquareSize),
-      minGain(minGain), maxSpeed(maxSpeed), maxGain(maxGain), hidDevice(nullptr), headLabel1(HL1), headLabel2(HL2), cpi(cpi) {
+      minGain(minGain), maxSpeed(maxSpeed), maxGain(maxGain), hidDevice(nullptr), headLabel1(HL1), headLabel2(HL2), cpi(cpi), nLabels(nLab) {
     // Calculate the top-left corner of the detection zone
     detectionZoneX = (screenWidth - detectionZoneWidth) / 2;
     detectionZoneY = (screenHeight - detectionZoneHeight) / 2;
@@ -221,7 +221,7 @@ void MouseController::aim(const std::vector<Object> &detections) {
     if (isLeftMouseButtonPressed() || isMouseButton5Pressed()) {
         isLeftClicking = true;
         Object closestDetection = findClosestDetection(detections);
-        if (closestDetection.probability > 0.0f) {
+        if (closestDetection.probability > 0.25f) {
             int targetX = closestDetection.rect.x + closestDetection.rect.width / 2;
             int targetY = closestDetection.rect.y + closestDetection.rect.height / 2;
 
@@ -343,7 +343,7 @@ void MouseController::triggerLeftClickIfCenterWithinDetection(const std::vector<
         int centerY = crosshairY;
 
         for (const auto &detection : detections) {
-            if (detection.label == headLabel1 || detection.label == headLabel2) { // Replace with actual label values
+            if (detection.label < nLabels) { // Replace with actual label values
                 if (centerX >= detection.rect.x && centerX <= detection.rect.x + detection.rect.width && centerY >= detection.rect.y &&
                     centerY <= detection.rect.y + detection.rect.height) {
                     leftClick();

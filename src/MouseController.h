@@ -18,7 +18,8 @@
 class MouseController {
 public:
     MouseController(int screenWidth, int screenHeight, int detectionZoneWidth, int detectionZoneHeight, float sensitivity,
-                    int centralSquareSize, float minGain, float maxGain, float maxSpeed, int HL1, int HL2, int cpi);
+                    int centralSquareSize, float minGain, float maxGain, float maxSpeed, int HL1, int HL2, int cpi, 
+                    int nLab);
     ~MouseController();
     void aim(const std::vector<Object> &detections);
     void triggerLeftClickIfCenterWithinDetection(const std::vector<Object> &detections);
@@ -29,6 +30,11 @@ public:
     int getMovementY() const { return _dy; }
 
 private:
+    static const int SMOOTHING_WINDOW = 3; // Number of frames to average
+    std::deque<float> speedXHistory;
+    std::deque<float> speedYHistory;
+    float speedDampingFactor;
+    float accelerationLimit;
     int screenWidth;
     int screenHeight;
     int detectionZoneWidth;
@@ -61,6 +67,7 @@ private:
 
     int headLabel1;
     int headLabel2;
+    int nLabels;
 
     int cpi;
 

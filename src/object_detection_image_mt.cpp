@@ -24,7 +24,6 @@
 #include <windows.h>
 
 using namespace std::chrono;
-using YoloV8Variant = std::variant<YoloV8<float>, YoloV8<__half>>;
 
 class ObjectDetectionSystem {
 public:
@@ -49,7 +48,7 @@ private:
     void overlayThread();
 
     INIParser config;
-    std::unique_ptr<YoloV8Variant> yoloV8;
+    std::unique_ptr<YoloV8> yoloV8;
     std::unique_ptr<DXGICapture> capture;
     std::unique_ptr<MouseController> mouseController;
 
@@ -112,25 +111,27 @@ void ObjectDetectionSystem::loadConfigFromINI(const std::string &iniFile) {
 
 void ObjectDetectionSystem::initializeSystem() {
     YoloV8Config yoloConfig;
-
     yoloConfig.classNames = config.getStringArray("Labels");
+
+    // Modify this section
     std::string precision = config.getString("Precision", "float");
     if (precision == "float") {
         yoloConfig.precision = Precision::FP32;
-        yoloV8 = std::make_unique<YoloV8Variant>(YoloV8<float>(config.getString("ModelPath"), yoloConfig));
     } else if (precision == "half") {
         yoloConfig.precision = Precision::FP16;
-        yoloV8 = std::make_unique<YoloV8Variant>(YoloV8<__half>(config.getString("ModelPath"), yoloConfig));
     } else {
         throw std::runtime_error("Invalid precision in INI file. Use 'float' or 'half'.");
     }
+
+    // Create YoloV8 directly - it will use the factory internally
+    yoloV8 = std::make_unique<YoloV8>(config.getString("ModelPath"), yoloConfig);
 
     screenWidth = GetSystemMetrics(SM_CXSCREEN);
     screenHeight = GetSystemMetrics(SM_CYSCREEN);
     mouseController = std::make_unique<MouseController>(
         screenWidth, screenHeight, captureWidth, captureHeight, config.getFloat("MouseSensitivity", 0.80f), config.getInt("AimFOV", 55),
         config.getFloat("MinGain", 0.25f), config.getFloat("MaxGain", 0.65f), config.getInt("MaxSpeed", 15),
-        config.getInt("HeadLabelID1", 0), config.getInt("HeadLabelID2", 1), config.getInt("CPI", 3000));
+        config.getInt("HeadLabelID1", 0), config.getInt("HeadLabelID2", 1), config.getInt("CPI", 3000), config.getStringArray("Labels").size());
 
     if (trackCrosshair) {
         templateImg = cv::imread(config.getString("CrosshairTemplate", "crosshair.png"), cv::IMREAD_COLOR);
@@ -152,6 +153,8 @@ void ObjectDetectionSystem::startThreads() {
 
 void ObjectDetectionSystem::mainLoop() {
     clearScreen();
+    std::cout << "OpenCV CUDA support: " << cv::cuda::getCudaEnabledDeviceCount() << " devices" << std::endl;
+    std::cout << "OpenCV version: " << CV_VERSION << std::endl;
     while (running) {
         MSG msg = {};
 
@@ -278,12 +281,10 @@ void ObjectDetectionSystem::detectionThread() {
         }
 
         std::vector<Object> detections;
-        std::visit(
-            [&](auto &yolo) {
-                detections = yolo.detectObjects(croppedFrame);
-                yolo.drawObjectLabels(croppedFrame, detections, 1, 1);
-            },
-            *yoloV8);
+        detections = yoloV8->detectObjects(croppedFrame);
+        yoloV8->drawObjectLabels(croppedFrame, detections);
+        cv::imshow("Detection", croppedFrame);
+        cv::waitKey(1);
 
         mouseController->setCrosshairPosition(crosshairPos.x, crosshairPos.y);
         mouseController->aim(detections);
