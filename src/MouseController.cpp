@@ -216,78 +216,47 @@ float MouseController::calculateSpeedScaling(const cv::Rect &rect) {
 }
 
 void MouseController::aim(const std::vector<Object> &detections) {
-    const float deadZoneThreshold = 5.0f;
-
-    if (isLeftMouseButtonPressed() || isMouseButton5Pressed()) {
-        isLeftClicking = true;
-        Object closestDetection = findClosestDetection(detections);
-        if (closestDetection.probability > 0.25f) {
-            int targetX = closestDetection.rect.x + closestDetection.rect.width / 2;
-            int targetY = closestDetection.rect.y + closestDetection.rect.height / 2;
-
-            // Convert target coordinates from detection zone to screen coordinates
-            int screenTargetX = detectionZoneX + targetX;
-            int screenTargetY = detectionZoneY + targetY;
-
-            // Convert crosshair coordinates from detection zone to screen coordinates
-            int screenCrosshairX = detectionZoneX + crosshairX;
-            int screenCrosshairY = detectionZoneY + crosshairY;
-
-            // Calculate the relative movement
-            int dx = static_cast<int>(screenTargetX - screenCrosshairX);
-            int dy = static_cast<int>(screenTargetY - screenCrosshairY);
-
-            // Calculate the distance to the target
-            float distance = sqrt(dx * dx + dy * dy);
-
-            // Ignore detections outside the central square or within the dead zone
-            if (distance < deadZoneThreshold || dx < -centralSquareSize || dx > centralSquareSize || dy < -centralSquareSize ||
-                dy > centralSquareSize) {
-                resetSpeed();
-                return;
-            }
-
-            // Calculate the maximum distance within the detection zone (diagonal of the detection zone)
-            float detectionZoneDiagonal = sqrt(centralSquareSize * centralSquareSize + centralSquareSize * centralSquareSize);
-
-            // Apply exponential scaling to the proportional gain
-            float normalizedDistance = distance / detectionZoneDiagonal;
-            float proportionalGain = minGain + (maxGain - minGain) * std::exp(-normalizedDistance);
-
-            // Apply dynamic proportional control
-            currentSpeedX = proportionalGain * dx;
-            currentSpeedY = proportionalGain * dy;
-
-            // Calculate the speed scaling factor based on the detection box size
-            float speedScaling = calculateSpeedScaling(closestDetection.rect);
-
-            // Scale the speed
-            currentSpeedX *= speedScaling;
-            currentSpeedY *= speedScaling;
-
-            // Cap the speed to maxSpeed
-            currentSpeedX = std::clamp(currentSpeedX, -maxSpeed, maxSpeed);
-            currentSpeedY = std::clamp(currentSpeedY, -maxSpeed, maxSpeed);
-
-            // Apply sensitivity and movement
-            _dx = static_cast<int>(currentSpeedX * sensitivity);
-            _dy = static_cast<int>(currentSpeedY * sensitivity);
-        }
-    } else {
-        resetSpeed();
+    if (!isLeftMouseButtonPressed() && !isMouseButton5Pressed()) {
         if (isLeftClicking) {
             releaseLeftClick();
             isLeftClicking = false;
         }
+        return;
     }
 
-    if (_dx != 0 || _dy != 0) {
-        sendHIDReport(_dx, _dy, 0x01);
+    isLeftClicking = true;
+    Object closestDetection = findClosestDetection(detections);
+
+    if (closestDetection.probability > 0.25f) {
+        // Calculate target center
+        int targetX = closestDetection.rect.x + closestDetection.rect.width / 2;
+        int targetY = closestDetection.rect.y + closestDetection.rect.height / 2;
+
+        // Calculate distances
+        int distX = targetX - crosshairX;
+        int distY = targetY - crosshairY;
+
+        // Scale movement based on distance (-4 to 4)
+        // For distances > 20 pixels, use maximum speed
+        // For smaller distances, scale proportionally
+        _dx = (abs(distX) > 20)   ? (distX > 0 ? 4 : -4)
+              : (abs(distX) > 15) ? (distX > 0 ? 3 : -3)
+              : (abs(distX) > 10) ? (distX > 0 ? 2 : -2)
+              : (abs(distX) > 5)  ? (distX > 0 ? 1 : -1)
+                                  : 0;
+
+        _dy = (abs(distY) > 20)   ? (distY > 0 ? 4 : -4)
+              : (abs(distY) > 15) ? (distY > 0 ? 3 : -3)
+              : (abs(distY) > 10) ? (distY > 0 ? 2 : -2)
+              : (abs(distY) > 5)  ? (distY > 0 ? 1 : -1)
+                                  : 0;
+
+        // Send movement if needed
+        if (_dx != 0 || _dy != 0) {
+            sendHIDReport(_dx, _dy, 0x01);
+        }
     }
 }
-
-
-
 
 bool MouseController::isLeftMouseButtonPressed() { return (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0; }
 bool MouseController::isMouseButton4Pressed() { return (GetAsyncKeyState(VK_XBUTTON1) & 0x8000) != 0; } // Mouse Button 4

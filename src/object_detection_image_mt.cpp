@@ -282,9 +282,6 @@ void ObjectDetectionSystem::detectionThread() {
 
         std::vector<Object> detections;
         detections = yoloV8->detectObjects(croppedFrame);
-        yoloV8->drawObjectLabels(croppedFrame, detections);
-        cv::imshow("Detection", croppedFrame);
-        cv::waitKey(1);
 
         mouseController->setCrosshairPosition(crosshairPos.x, crosshairPos.y);
         mouseController->aim(detections);
