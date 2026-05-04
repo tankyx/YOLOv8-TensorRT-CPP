@@ -36,7 +36,6 @@ private:
     void mainLoop();
     void cleanup();
 
-    static cv::Point detectCrosshairCPU(const cv::Mat &frame, const cv::Mat &templ);
     static void moveToTop();
     static void clearScreen();
     static void logAverageLatencies(LatencyQueue &captureLatency, LatencyQueue &detectionLatency, SafeQueue<std::string> &logQueue);
@@ -50,6 +49,12 @@ private:
     std::unique_ptr<MouseController> mouseController;
 
     cv::Mat templateImg;
+    // GPU template-matching state for crosshair tracking (c27). Lives on the detection thread;
+    // single-consumer so no synchronization needed.
+    cv::Ptr<cv::cuda::TemplateMatching> crosshairMatcher;
+    cv::cuda::GpuMat gpuCrosshairTemplate;
+    cv::cuda::GpuMat gpuCrosshairRoi;
+    cv::cuda::GpuMat gpuCrosshairResult;
     int captureWidth;
     int captureHeight;
     int captureFPS;
@@ -131,6 +136,8 @@ void ObjectDetectionSystem::initializeSystem() {
         if (templateImg.empty()) {
             throw std::runtime_error("Failed to load template image");
         }
+        gpuCrosshairTemplate.upload(templateImg);
+        crosshairMatcher = cv::cuda::createTemplateMatching(templateImg.type(), cv::TM_CCOEFF_NORMED);
     }
 
     capture = std::make_unique<DXGICapture>();
@@ -177,20 +184,6 @@ void ObjectDetectionSystem::run() {
     startThreads();
     mainLoop();
     cleanup();
-}
-
-cv::Point ObjectDetectionSystem::detectCrosshairCPU(const cv::Mat &frame, const cv::Mat &templ) {
-    cv::Mat result;
-    cv::matchTemplate(frame, templ, result, cv::TM_CCOEFF_NORMED);
-
-    double minVal, maxVal;
-    cv::Point minLoc, maxLoc;
-    cv::minMaxLoc(result, &minVal, &maxVal, &minLoc, &maxLoc);
-
-    cv::Point crosshairCenter(maxLoc.x + templ.cols / 2, maxLoc.y + templ.rows / 2);
-    cv::rectangle(frame, maxLoc, cv::Point(maxLoc.x + templ.cols, maxLoc.y + templ.rows), cv::Scalar(0, 255, 0), 2);
-
-    return crosshairCenter;
 }
 
 void ObjectDetectionSystem::moveToTop() { std::cout << "\033[H"; }
@@ -269,9 +262,14 @@ void ObjectDetectionSystem::detectionThread() {
                 cv::Rect smallRoi(smallX, smallY, smallRoiSize, smallRoiSize);
 
                 cv::Mat smallCroppedFrame = frame(smallRoi);
-                crosshairPos = detectCrosshairCPU(smallCroppedFrame, templateImg);
-                crosshairPos.x += smallX - x;
-                crosshairPos.y += smallY - y;
+                gpuCrosshairRoi.upload(smallCroppedFrame);
+                crosshairMatcher->match(gpuCrosshairRoi, gpuCrosshairTemplate, gpuCrosshairResult);
+                double maxVal = 0.0;
+                cv::Point maxLoc;
+                cv::cuda::minMaxLoc(gpuCrosshairResult, nullptr, &maxVal, nullptr, &maxLoc);
+
+                crosshairPos.x = maxLoc.x + templateImg.cols / 2 + smallX - x;
+                crosshairPos.y = maxLoc.y + templateImg.rows / 2 + smallY - y;
             } else {
                 crosshairPos = cv::Point(roiWidth / 2, roiHeight / 2);
             }
