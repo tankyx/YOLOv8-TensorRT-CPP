@@ -83,8 +83,6 @@ std::vector<Object> YoloV8::detectObjects(const cv::cuda::GpuMat &inputImageBGR)
         std::vector<float> featureVector;
         m_trtEngine->transformOutput(featureVectors, featureVector);
 
-        const auto &outputDims = m_trtEngine->getOutputDims();
-        int numChannels = outputDims[outputDims.size() - 1].d[1];
         ret = postprocessDetect(featureVector);
     }
     return ret;

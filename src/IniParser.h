@@ -102,10 +102,4 @@ public:
         }
         return std::vector<std::string>();
     }
-
-    // New method to get an array of strings as a single const string
-    std::string getStringArrayAsString(const std::string &key, const std::string &delimiter = ",") const {
-        auto it = data.find(key);
-        return (it != data.end()) ? it->second : "";
-    }
 };
