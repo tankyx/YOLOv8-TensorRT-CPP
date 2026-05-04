@@ -108,19 +108,21 @@ private:
 
 class FrameQueue {
 public:
-    void push(const cv::Mat &frame) {
+    // Take by value so callers can either copy (cv::Mat shallow-ref) or std::move into us;
+    // either way the queue ends up owning a Mat handle without an unnecessary refcount bump.
+    void push(cv::Mat frame) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!queue_.empty()) {
-            queue_.pop(); // Remove the old frame to keep only the latest one
+            queue_.pop(); // Drop the old frame; we only ever surface the latest one.
         }
-        queue_.push(frame); // Directly push without cloning
+        queue_.push(std::move(frame));
         cond_var_.notify_one();
     }
 
     cv::Mat pop() {
         std::unique_lock<std::mutex> lock(mutex_);
         cond_var_.wait(lock, [this] { return !queue_.empty(); });
-        cv::Mat frame = queue_.front();
+        cv::Mat frame = std::move(queue_.front());
         queue_.pop();
         return frame;
     }
