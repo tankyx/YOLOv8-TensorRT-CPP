@@ -196,79 +196,95 @@ void ObjectDetectionSystem::logAverageLatencies(LatencyQueue &captureLatency, La
 }
 
 void ObjectDetectionSystem::captureThread() {
-    const int targetFPS = config.getInt("CaptureFPS", 1000);
-    const std::chrono::nanoseconds frameDuration(1000000000 / targetFPS);
-    cv::Mat frame1(captureHeight, captureWidth, CV_8UC3);
-    cv::Mat frame2(captureHeight, captureWidth, CV_8UC3);
-    cv::Mat *currentFrame = &frame1;
-    cv::Mat *nextFrame = &frame2;
+    try {
+        const int targetFPS = config.getInt("CaptureFPS", 1000);
+        const std::chrono::nanoseconds frameDuration(1000000000 / targetFPS);
+        cv::Mat frame1(captureHeight, captureWidth, CV_8UC3);
+        cv::Mat frame2(captureHeight, captureWidth, CV_8UC3);
+        cv::Mat *currentFrame = &frame1;
+        cv::Mat *nextFrame = &frame2;
 
-    while (running) {
-        auto start = std::chrono::high_resolution_clock::now();
+        while (running) {
+            auto start = std::chrono::high_resolution_clock::now();
 
-        bool got = capture->CaptureScreen(*currentFrame);
+            bool got = capture->CaptureScreen(*currentFrame);
 
-        if (got && !currentFrame->empty()) {
-            captureQueue.push(std::move(*currentFrame));
-            std::swap(currentFrame, nextFrame);
+            if (got && !currentFrame->empty()) {
+                captureQueue.push(std::move(*currentFrame));
+                std::swap(currentFrame, nextFrame);
+            }
+
+            auto end = std::chrono::high_resolution_clock::now();
+            auto duration = end - start;
+
+            captureLatency.push(std::chrono::duration_cast<std::chrono::milliseconds>(duration).count());
         }
-
-        auto end = std::chrono::high_resolution_clock::now();
-        auto duration = end - start;
-
-        captureLatency.push(std::chrono::duration_cast<std::chrono::milliseconds>(duration).count());
+    } catch (const std::exception &e) {
+        std::cerr << "captureThread: fatal exception: " << e.what() << ". Stopping." << std::endl;
+        running = false;
+    } catch (...) {
+        std::cerr << "captureThread: fatal unknown exception. Stopping." << std::endl;
+        running = false;
     }
 }
 
 void ObjectDetectionSystem::detectionThread() {
-    while (running) {
-        cv::Mat frame = captureQueue.pop();
+    try {
+        while (running) {
+            cv::Mat frame = captureQueue.pop();
 
-        auto detectionStartTime = std::chrono::high_resolution_clock::now();
+            auto detectionStartTime = std::chrono::high_resolution_clock::now();
 
-        int centerX = frame.cols / 2;
-        int centerY = frame.rows / 2;
+            int centerX = frame.cols / 2;
+            int centerY = frame.rows / 2;
 
-        int roiWidth = captureWidth;
-        int roiHeight = captureHeight;
-        int x = std::max(centerX - roiWidth / 2, 0);
-        int y = std::max(centerY - roiHeight / 2, 0);
-        x = std::min(x, frame.cols - roiWidth);
-        y = std::min(y, frame.rows - roiHeight);
-        cv::Rect roi(x, y, roiWidth, roiHeight);
+            int roiWidth = captureWidth;
+            int roiHeight = captureHeight;
+            int x = std::max(centerX - roiWidth / 2, 0);
+            int y = std::max(centerY - roiHeight / 2, 0);
+            x = std::min(x, frame.cols - roiWidth);
+            y = std::min(y, frame.rows - roiHeight);
+            cv::Rect roi(x, y, roiWidth, roiHeight);
 
-        cv::Mat croppedFrame = frame(roi);
+            cv::Mat croppedFrame = frame(roi);
 
-        cv::Point crosshairPos;
-        if (trackCrosshair) {
-            int smallRoiSize = config.getInt("SmallRoiSize", 160);
-            int smallX = std::max(centerX - smallRoiSize / 2, 0);
-            int smallY = std::max(centerY - smallRoiSize / 2, 0);
-            smallX = std::min(smallX, frame.cols - smallRoiSize);
-            smallY = std::min(smallY, frame.rows - smallRoiSize);
-            cv::Rect smallRoi(smallX, smallY, smallRoiSize, smallRoiSize);
+            cv::Point crosshairPos;
+            if (trackCrosshair) {
+                int smallRoiSize = config.getInt("SmallRoiSize", 160);
+                int smallX = std::max(centerX - smallRoiSize / 2, 0);
+                int smallY = std::max(centerY - smallRoiSize / 2, 0);
+                smallX = std::min(smallX, frame.cols - smallRoiSize);
+                smallY = std::min(smallY, frame.rows - smallRoiSize);
+                cv::Rect smallRoi(smallX, smallY, smallRoiSize, smallRoiSize);
 
-            cv::Mat smallCroppedFrame = frame(smallRoi);
-            crosshairPos = detectCrosshairCPU(smallCroppedFrame, templateImg);
-            crosshairPos.x += smallX - x;
-            crosshairPos.y += smallY - y;
-        } else {
-            crosshairPos = cv::Point(roiWidth / 2, roiHeight / 2);
+                cv::Mat smallCroppedFrame = frame(smallRoi);
+                crosshairPos = detectCrosshairCPU(smallCroppedFrame, templateImg);
+                crosshairPos.x += smallX - x;
+                crosshairPos.y += smallY - y;
+            } else {
+                crosshairPos = cv::Point(roiWidth / 2, roiHeight / 2);
+            }
+
+            std::vector<Object> detections;
+            detections = yoloV8->detectObjects(croppedFrame);
+
+            mouseController->setCrosshairPosition(crosshairPos.x, crosshairPos.y);
+            mouseController->aim(detections);
+            mouseController->triggerLeftClickIfCenterWithinDetection(detections);
+
+            detectionQueue.push(detections);
+
+            auto detectionEndTime = std::chrono::high_resolution_clock::now();
+            auto detectionDuration = detectionEndTime - detectionStartTime;
+
+            detectionLatency.push(std::chrono::duration_cast<std::chrono::milliseconds>(detectionDuration).count());
         }
-
-        std::vector<Object> detections;
-        detections = yoloV8->detectObjects(croppedFrame);
-
-        mouseController->setCrosshairPosition(crosshairPos.x, crosshairPos.y);
-        mouseController->aim(detections);
-        mouseController->triggerLeftClickIfCenterWithinDetection(detections);
-
-        detectionQueue.push(detections);
-
-        auto detectionEndTime = std::chrono::high_resolution_clock::now();
-        auto detectionDuration = detectionEndTime - detectionStartTime;
-
-        detectionLatency.push(std::chrono::duration_cast<std::chrono::milliseconds>(detectionDuration).count());
+    } catch (const std::exception &e) {
+        std::cerr << "detectionThread: fatal exception: " << e.what() << ". Stopping." << std::endl;
+        running = false;
+    } catch (...) {
+        std::cerr << "detectionThread: fatal unknown exception. Stopping." << std::endl;
+        running = false;
     }
 }
 
