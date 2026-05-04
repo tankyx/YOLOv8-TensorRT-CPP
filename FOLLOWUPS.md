@@ -221,18 +221,23 @@ YOLOv8 was released early 2023. Several newer versions exist; the question is wh
 | YOLOv10      | May 2024    | AGPL-3  | Tsinghua THU-MIG, distributed via Ultralytics | Mature |
 | YOLO11       | Sep 2024    | AGPL-3  | Ultralytics       | First-class |
 | YOLO12       | Feb 2025    | AGPL-3  | Ultralytics       | First-class, marketed as research-oriented |
+| YOLO26       | Jan 2026    | AGPL-3  | Ultralytics       | First-class, two open export bugs (see below) |
 
 ### Nano-tier comparison (640 input, COCO val)
 
-| Model    | Params | FLOPs | mAP-val | RTX 4090 FP16 (est.) |
-|----------|--------|-------|---------|----------------------|
-| YOLOv8n  | 3.2M   | 8.7G  | 37.3    | ~0.6–0.8 ms          |
-| YOLOv9t  | 2.0M   | 7.7G  | 38.3    | ~0.8 ms              |
-| YOLOv10n | 2.3M   | 6.7G  | 39.5    | ~0.7 ms              |
-| **YOLO11n**  | 2.6M | 6.5G  | 39.5    | ~0.6 ms              |
-| YOLO12n  | 2.6M   | 6.5G  | 40.6    | ~0.7 ms              |
+| Model    | Params | FLOPs | mAP-val | T4 TRT10 FP16 (official) |
+|----------|--------|-------|---------|---------------------------|
+| YOLOv8n  | 3.2M   | 8.7G  | 37.3    | ~1.5 ms                   |
+| YOLOv9t  | 2.0M   | 7.7G  | 38.3    | ~2.0 ms                   |
+| YOLOv10n | 2.3M   | 6.7G  | 39.5    | 1.84 ms                   |
+| **YOLO11n** | 2.6M | 6.5G  | 39.5    | **1.5 ms**                |
+| YOLO12n  | 2.6M   | 6.5G  | 40.6    | 1.64 ms                   |
+| YOLO26n (one-to-many) | 2.4M | 5.4G | 40.9 | 1.7 ms     |
+| YOLO26n (end-to-end)  | 2.4M | 5.4G | 40.1 | 1.7 ms     |
 
-YOLO11n is the Pareto winner in the nano tier on RTX 40: matches YOLO12 latency with ~1 mAP less, and ships the smoothest ONNX/TRT 10 path.
+T4 TRT10 numbers come from the official Ultralytics docs pages. RTX 40 numbers scale roughly proportionally — YOLO11n's GPU-FP16 lead over YOLO26n persists. The much-publicized "YOLO26 is 43% faster" headline is **CPU latency**, not GPU — irrelevant for this RTX 40 pipeline.
+
+YOLO11n is the Pareto winner in the nano tier on GPU FP16: lowest latency, identical mAP to v10n, smoothest ONNX/TRT 10 path.
 
 ### Output-shape compatibility with the existing C++ postprocess
 
@@ -242,31 +247,51 @@ YOLO11n is the Pareto winner in the nano tier on RTX 40: matches YOLO12 latency 
 - **YOLOv10** → defaults to NMS-free output shape `[1, 300, 6]` (top-300 detections, each `xyxy + score + class`). The existing postprocess + NMS path **breaks**. You'd either:
   - (a) export with `nms=False` to get the v8-style raw output, losing the latency win that's the point of v10.
   - (b) write a new ~30-line postprocess: iterate the 300 rows, threshold on score, no NMS at all.
+- **YOLO26** → exports either layout, controlled by the `end2end` flag:
+  - `end2end=True` (default): `[1, 300, 6]` xyxy + score + class — like YOLOv10. Breaks `postprocessDetect`.
+  - `end2end=False`: `[1, 4 + nc, 8400]` — same layout as v8/v11. **`yolov8.cpp` is drop-in.**
+  - The flags `end2end` and `nms` are mutually exclusive; passing `nms=True` forces `end2end=False`.
 
 ### Export / training pipeline impact
 
-`scripts/pytorch2onnx.py` currently uses `opset=12, simplify=True`. For v10/v11/v12:
+`scripts/pytorch2onnx.py` currently uses `opset=12, simplify=True`. For v10/v11/v12/v26:
 
-- **Bump opset to 17.** Ultralytics defaults to 17 in 2025+, and YOLO12's attention ops require ≥17.
+- **Bump opset to 17.** Ultralytics defaults to 17 in 2025+, and YOLO12's attention ops require ≥17. No further bumps documented for v26.
 - `simplify=True` still requires `onnxsim` installed — keep it.
 - `dynamic=True` is still incompatible with `half=True`; the existing FP16 export path which forces `dynamic=False` is unchanged.
-- `from ultralytics import YOLO; model.export(format="onnx", ...)` API is unchanged across v8/v9/v10/v11/v12 — same script structure.
-- Training data and INI labels are reusable verbatim — the user's CS2/Valorant datasets transfer to YOLO11 without remapping.
+- `from ultralytics import YOLO; model.export(format="onnx", ...)` API is unchanged across v8/v9/v10/v11/v12/v26 — same script structure.
+- Training data and INI labels are reusable verbatim — datasets transfer without remapping.
+
+### YOLO26-specific export gotchas (early 2026)
+
+YOLO26 has two open Ultralytics issues as of early 2026 that affect ONNX/TRT export:
+
+- **#23645 — `end2end=True, half=True` produces FP32 output0** instead of honoring `half=True`. Workaround: use `end2end=False` (which you'd want anyway for drop-in C++ compat). PR #23759 references a fix; verify your installed version actually contains it.
+- **#23756 — `aten::index` opset-20 warning** on TRT export with `end2end=True`: "If indices include negative values, the exported graph will produce incorrect results." Engine still builds and runs, but the warning is unresolved. Does not appear with `end2end=False`.
+
+Both bugs disappear in the `end2end=False` path. No EfficientNMS plugin required for that path (NMS happens in C++ as today).
+
+### INT8/QAT note for YOLO26
+
+YOLO26's architectural changes (DFL removal, NMS-free decoder option) are **friendly to quantization** — fewer custom ops to wrap, less precision-sensitive logic in the head. Ultralytics markets v26 as "QAT-ready" but there is **no documented native `qat=True` flag** in the export pipeline as of early 2026; INT8 is still post-training-only via TensorRT calibration (the same path the [INT8 section above](#2-int8-inference-path) describes). On TensorRT ≤ 10.3.0, `int8=True` auto-disables `end2end` — another reason to default to `end2end=False`.
 
 ### Recommendation
 
 **Switch to YOLO11n + FP16, retrained on the user's CS2/Valorant datasets.** Reasoning:
 
+- **Lowest GPU FP16 latency** in the nano tier (1.5 ms T4 TRT10 vs 1.7 ms for YOLO26n). For a latency-critical real-time loop this is the load-bearing metric.
 - Output layout is byte-identical to YOLOv8 → `yolov8.cpp`, `EngineFP16`, and the build pipeline keep working with **zero C++ changes**.
-- ~+2 mAP over YOLOv8n at similar or lower latency on RTX 40.
+- ~+2 mAP over YOLOv8n. The +1.4 mAP further bump from YOLO26n is unlikely to matter for a tiny 2-class (Valorant) or 4-class (CS2) detector that's already well-saturated on a fine-tuned dataset.
 - Same Ultralytics API, same training pipeline, same AGPL-3 status as v8 — no license disruption.
-- First-class TensorRT 10 support.
+- First-class TensorRT 10 support, no open export bugs.
 
 **Skip YOLOv10** unless you specifically want NMS-free inference — it forces a postprocess rewrite for marginal gain over YOLO11n.
 
 **Skip YOLO12** unless you need the last mAP point — Ultralytics themselves position it as research-oriented over production-oriented.
 
-If you do INT8 (above) and YOLO11n in the same migration, do them in this order: (1) switch to YOLO11n FP16, validate detection quality with new training, (2) add INT8 path, (3) calibrate INT8 against the YOLO11n model. Don't combine both into a single change — too many variables when something regresses.
+**Skip YOLO26** for now. It's slightly slower at GPU FP16 in the nano tier, the headline wins (CPU latency, edge/INT8 deployment) don't apply to this pipeline, and the export pipeline still has open bugs ~4 months post-release. **Reconsider when:** (a) you want to add a real INT8 path and the DFL removal makes calibration cleaner — verify by testing both v11n-INT8 and v26n-INT8 mAP on your own dataset, or (b) Ultralytics ships a tagged release with #23645 and #23756 closed and a clean changelog.
+
+If you do INT8 ([above](#2-int8-inference-path)) and YOLO11n in the same migration, do them in this order: (1) switch to YOLO11n FP16, validate detection quality with new training, (2) add INT8 path, (3) calibrate INT8 against the YOLO11n model. Don't combine both into a single change — too many variables when something regresses.
 
 ### File-level plan for the YOLO11 migration
 
@@ -277,6 +302,16 @@ If you do INT8 (above) and YOLO11n in the same migration, do them in this order:
 - The c18 ONNX-content hash will automatically rebuild a fresh TensorRT engine plan. No engine-file management needed.
 
 That's the entire migration if everything goes well.
+
+### File-level plan if you ignore the recommendation and try YOLO26
+
+If you want to test YOLO26n anyway:
+
+- Same `pytorch2onnx.py` and `dep/config_*.ini` edits as the YOLO11 plan.
+- **Force `end2end=False`** in the export call. The flag passes straight through `model.export(...)`. This sidesteps both open export bugs and keeps `yolov8.cpp` drop-in.
+- Do not pass `nms=True` (it's mutually exclusive with `end2end`); the project's existing NMS in `postprocessDetect` is the NMS path.
+- If you also want INT8 with YOLO26: don't pass `int8=True` to Ultralytics' export — let TRT calibration in `EngineINT8` handle it (the path described [above](#2-int8-inference-path)). On TRT ≤ 10.3.0, `int8=True` would force `end2end` off anyway.
+- Track Ultralytics issues #23645 and #23756 — if both close before you do this, the constraints relax.
 
 ---
 
