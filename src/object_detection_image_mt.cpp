@@ -13,7 +13,6 @@
 #include "threadsafe_queue.h"
 #include "yolov8.h"
 #include "SoftwareFuser.h"
-#include "D3D11Overlay.h"
 
 #include <algorithm>
 #include <atomic>
@@ -40,12 +39,10 @@ private:
     static cv::Point detectCrosshairCPU(const cv::Mat &frame, const cv::Mat &templ);
     static void moveToTop();
     static void clearScreen();
-    static void logAverageLatencies(LatencyQueue &captureLatency, LatencyQueue &detectionLatency, LatencyQueue &overlayLatency,
-                                    SafeQueue<std::string> &logQueue);
+    static void logAverageLatencies(LatencyQueue &captureLatency, LatencyQueue &detectionLatency, SafeQueue<std::string> &logQueue);
 
     void captureThread();
     void detectionThread();
-    void overlayThread();
 
     INIParser config;
     std::unique_ptr<YoloV8> yoloV8;
@@ -55,27 +52,21 @@ private:
     cv::Mat templateImg;
     int captureWidth;
     int captureHeight;
-    int overlayX;
-    int overlayY;
     int captureFPS;
-    int displayFPS;
     int screenWidth;
     int screenHeight;
-    int displayThreadCore;
     int captureThreadCore;
     HWND targetWnd;
 
     SafeQueue<std::string> logQueue;
-    LatencyQueue captureLatency, detectionLatency, overlayLatency;
+    LatencyQueue captureLatency, detectionLatency;
     std::atomic<bool> running;
     FrameQueue captureQueue;
     DetectionQueue detectionQueue;
 
     std::thread captureThreadObj;
     std::thread detectionThreadObj;
-    std::thread overlayThreadObj;
 
-    bool useOverlay;
     bool useFusion;
     bool pinThreads;
     bool trackCrosshair;
@@ -94,19 +85,12 @@ void ObjectDetectionSystem::loadConfigFromINI(const std::string &iniFile) {
     captureWidth = config.getInt("CaptureWidth", 640);
     captureHeight = config.getInt("CaptureHeight", 640);
     trackCrosshair = config.getBool("TrackCrosshair", false);
-    useOverlay = config.getBool("UseOverlay", false);
     useFusion = config.getBool("UseFusion", false);
     captureFPS = config.getInt("CaptureFPS", 240);
-    displayFPS = config.getInt("DisplayFPS", 144);
 
     // Thread settings
     pinThreads = config.getBool("PinThreads", false);
     captureThreadCore = config.getInt("CaptureThreadCore", 0);
-    displayThreadCore = config.getInt("DisplayThreadCore", 1);
-
-    // Display settings
-    overlayX = config.getInt("OverlayX", 0);
-    overlayY = config.getInt("OverlayY", 0);
 }
 
 void ObjectDetectionSystem::initializeSystem() {
@@ -146,9 +130,6 @@ void ObjectDetectionSystem::initializeSystem() {
 void ObjectDetectionSystem::startThreads() {
     captureThreadObj = std::thread(&ObjectDetectionSystem::captureThread, this);
     detectionThreadObj = std::thread(&ObjectDetectionSystem::detectionThread, this);
-    if (useOverlay) {
-        overlayThreadObj = std::thread(&ObjectDetectionSystem::overlayThread, this);
-    }
 }
 
 void ObjectDetectionSystem::mainLoop() {
@@ -167,7 +148,7 @@ void ObjectDetectionSystem::mainLoop() {
             running = false;
         }
 
-        logAverageLatencies(captureLatency, detectionLatency, overlayLatency, logQueue);
+        logAverageLatencies(captureLatency, detectionLatency, logQueue);
         Sleep(100);
     }
 }
@@ -179,8 +160,6 @@ void ObjectDetectionSystem::cleanup() {
         captureThreadObj.join();
     if (detectionThreadObj.joinable())
         detectionThreadObj.join();
-    if (overlayThreadObj.joinable())
-        overlayThreadObj.join();
 }
 
 void ObjectDetectionSystem::run() {
@@ -207,15 +186,13 @@ void ObjectDetectionSystem::moveToTop() { std::cout << "\033[H"; }
 
 void ObjectDetectionSystem::clearScreen() { std::cout << "\033[2J\033[H"; }
 
-void ObjectDetectionSystem::logAverageLatencies(LatencyQueue &captureLatency, LatencyQueue &detectionLatency, LatencyQueue &overlayLatency,
+void ObjectDetectionSystem::logAverageLatencies(LatencyQueue &captureLatency, LatencyQueue &detectionLatency,
                                                 SafeQueue<std::string> &logQueue) {
     double avgCaptureLatency = captureLatency.getAverageLatency();
     double avgDetectionLatency = detectionLatency.getAverageLatency();
-    double avgOverlayLatency = overlayLatency.getAverageLatency();
 
     std::cout << "\rAverage Capture Latency: " << avgCaptureLatency << "ms | "
-              << "Detection Latency: " << avgDetectionLatency << "ms | "
-              << "Overlay Latency: " << avgOverlayLatency << "ms" << std::flush;
+              << "Detection Latency: " << avgDetectionLatency << "ms" << std::flush;
 }
 
 void ObjectDetectionSystem::captureThread() {
@@ -293,76 +270,6 @@ void ObjectDetectionSystem::detectionThread() {
         auto detectionDuration = detectionEndTime - detectionStartTime;
 
         detectionLatency.push(std::chrono::duration_cast<std::chrono::milliseconds>(detectionDuration).count());
-    }
-}
-
-void ObjectDetectionSystem::overlayThread() {
-    if (!useOverlay)
-        return;
-
-    // Initialize overlay with screen dimensions and position
-    D3D11Overlay overlay(screenWidth, screenHeight);
-    overlay.setPosition(overlayX, overlayY);
-    overlay.setClickthrough(true);
-
-    // Set thread priority and affinity if configured
-    if (pinThreads) {
-        SetThreadAffinityMask(GetCurrentThread(), 1ULL << displayThreadCore);
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-    }
-
-    // Calculate frame timing for desired FPS
-    const auto frameTime = std::chrono::nanoseconds(1000000000 / displayFPS);
-    auto lastFrameTime = std::chrono::steady_clock::now();
-
-    while (running) {
-        auto frameStart = std::chrono::steady_clock::now();
-
-        // Get latest detections
-        const std::vector<Object> &detections = detectionQueue.pop();
-
-        // Draw detections
-        overlay.drawDetections(detections);
-
-        // Prepare and draw log
-        std::stringstream logMessage;
-        logMessage << "Detections: " << detections.size() << "\n";
-        for (size_t i = 0; i < std::min(detections.size(), size_t(5)); ++i) {
-            logMessage << "D" << i << ": L" << detections[i].label << " C" << std::fixed << std::setprecision(2)
-                       << detections[i].probability << "\n";
-        }
-
-        // Add performance metrics to log
-        logMessage << "Capture: " << captureLatency.getAverageLatency() << "ms\n"
-                   << "Detection: " << detectionLatency.getAverageLatency() << "ms";
-
-        overlay.drawLog(logMessage.str());
-        overlay.render();
-
-        // Frame timing and latency tracking
-        auto frameEnd = std::chrono::steady_clock::now();
-        auto workDuration = frameEnd - frameStart;
-        auto elapsed = frameEnd - lastFrameTime;
-
-        overlayLatency.push(std::chrono::duration_cast<std::chrono::milliseconds>(workDuration).count());
-
-        // Precise timing for target FPS
-        if (elapsed < frameTime) {
-            auto sleepTime = frameTime - elapsed;
-            if (sleepTime > std::chrono::microseconds(500)) {
-                std::this_thread::sleep_for(sleepTime - std::chrono::microseconds(500));
-            }
-            while (std::chrono::steady_clock::now() - lastFrameTime < frameTime) {
-                _mm_pause();
-            }
-        }
-
-        lastFrameTime = std::chrono::steady_clock::now();
-
-        // Check for exit condition
-        if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
-            running = false;
-        }
     }
 }
 

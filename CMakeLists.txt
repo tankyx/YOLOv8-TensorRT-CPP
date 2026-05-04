@@ -56,18 +56,6 @@ include_directories(
     ${TENSORRT_INCLUDE_DIRS}
 )
 
-# Find DirectX libraries
-if(WIN32)
-    find_path(D3D_COMPILER_DIR NAMES d3dcompiler.lib PATHS "C:/Program Files (x86)/Windows Kits/10/Lib/10.0.22621.0/um/x64")
-    if(D3D_COMPILER_DIR)
-        set(D3D11_LIB ${D3D_COMPILER_DIR}/d3d11.lib)
-        set(D3DCOMPILER_LIB ${D3D_COMPILER_DIR}/d3dcompiler.lib)
-        set(DXGI_LIB ${D3D_COMPILER_DIR}/dxgi.lib)
-    else()
-        message(FATAL_ERROR "Could not find DirectX libraries. Make sure the DirectX SDK is installed.")
-    endif()
-endif()
-
 # Set CUDA architecture (default sm_89 / RTX 40 series; override with -DCMAKE_CUDA_ARCHITECTURES=XX)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA architectures to build for")
@@ -135,15 +123,11 @@ target_link_libraries(detect_object_image PRIVATE
     ${NVINFER_LIB}
     ${NVONNXPARSER_LIB}
     ${NVINFER_PLUGIN_LIB}
-    # Windows-specific libraries
-    setupapi 
-    hid 
-    d3d11 
-    dxgi 
-    Dwmapi.lib
-    ${D3D11_LIB}
-    ${D3DCOMPILER_LIB}
-    ${DXGI_LIB}
+    # Windows-specific libraries (DXGI + D3D11 used by DXGICapture; HID/setupapi by MouseController)
+    setupapi
+    hid
+    d3d11
+    dxgi
 )
 
 # Set output directories
