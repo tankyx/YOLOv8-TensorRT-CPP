@@ -3,11 +3,11 @@
 
 MouseController::MouseController(int screenWidth, int screenHeight, int detectionZoneWidth, int detectionZoneHeight, float sensitivity,
                                  int centralSquareSize, float minGain, float maxGain, float maxSpeed, int HL1, int HL2, int cpi, int nLab,
-                                 float probabilityThreshold)
+                                 float probabilityThreshold, uint16_t hidVendorId, uint16_t hidProductId, std::wstring hidSerial)
     : screenWidth(screenWidth), screenHeight(screenHeight), detectionZoneWidth(detectionZoneWidth),
       detectionZoneHeight(detectionZoneHeight), sensitivity(sensitivity), centralSquareSize(centralSquareSize),
       minGain(minGain), maxSpeed(maxSpeed), maxGain(maxGain), hidDevice(nullptr), headLabel1(HL1), headLabel2(HL2), cpi(cpi), nLabels(nLab),
-      probabilityThreshold(probabilityThreshold) {
+      probabilityThreshold(probabilityThreshold), hidVendorId(hidVendorId), hidProductId(hidProductId), hidSerial(std::move(hidSerial)) {
     // Calculate the top-left corner of the detection zone
     detectionZoneX = (screenWidth - detectionZoneWidth) / 2;
     detectionZoneY = (screenHeight - detectionZoneHeight) / 2;
@@ -65,14 +65,14 @@ bool MouseController::ConnectToDevice() {
                 HIDD_ATTRIBUTES attributes;
                 attributes.Size = sizeof(HIDD_ATTRIBUTES);
                 if (HidD_GetAttributes(deviceHandle, &attributes)) {
-                    if (attributes.VendorID == VENDOR_ID && attributes.ProductID == PRODUCT_ID) {
+                    if (attributes.VendorID == hidVendorId && attributes.ProductID == hidProductId) {
                         std::cout << "Found matching device: Vendor ID: " << std::hex << attributes.VendorID
                                   << ", Product ID: " << attributes.ProductID << std::dec << std::endl;
 
                         wchar_t serialNumber[256];
                         if (HidD_GetSerialNumberString(deviceHandle, serialNumber, sizeof(serialNumber))) {
                             std::wcout << L"Device serial number: " << serialNumber << std::endl;
-                            if (wcscmp(serialNumber, TARGET_SERIAL) == 0) {
+                            if (wcscmp(serialNumber, hidSerial.c_str()) == 0) {
                                 std::wcout << L"Serial number matches: " << serialNumber << std::endl;
 
                                 // Check the usage page and usage (optional, based on your needs)
@@ -90,7 +90,7 @@ bool MouseController::ConnectToDevice() {
                                     HidD_FreePreparsedData(preparsedData);
                                 }
                             } else {
-                                std::wcout << L"Serial number does not match. Expected: " << TARGET_SERIAL << L", Received: "
+                                std::wcout << L"Serial number does not match. Expected: " << hidSerial << L", Received: "
                                            << serialNumber << std::endl;
                             }
                         } else {

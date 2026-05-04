@@ -112,12 +112,19 @@ void ObjectDetectionSystem::initializeSystem() {
 
     screenWidth = GetSystemMetrics(SM_CXSCREEN);
     screenHeight = GetSystemMetrics(SM_CYSCREEN);
+    // HID identity (c15) — defaults preserve the originally-hardcoded device.
+    const uint16_t hidVid = static_cast<uint16_t>(config.getInt("HidVendorId", 0x0812));
+    const uint16_t hidPid = static_cast<uint16_t>(config.getInt("HidProductId", 0x2205));
+    const std::string hidSerialNarrow = config.getString("HidSerial", "DF625857C74E132B");
+    std::wstring hidSerialWide(hidSerialNarrow.begin(), hidSerialNarrow.end()); // ASCII-only serials
+
     mouseController = std::make_unique<MouseController>(
         screenWidth, screenHeight, captureWidth, captureHeight, config.getFloat("MouseSensitivity", 0.80f), config.getInt("AimFOV", 55),
         config.getFloat("MinGain", 0.25f), config.getFloat("MaxGain", 0.65f), config.getInt("MaxSpeed", 15),
         config.getInt("HeadLabelID1", 0), config.getInt("HeadLabelID2", 1), config.getInt("CPI", 3000),
         static_cast<int>(config.getStringArray("Labels").size()),
-        yoloConfig.probabilityThreshold);
+        yoloConfig.probabilityThreshold,
+        hidVid, hidPid, std::move(hidSerialWide));
 
     if (trackCrosshair) {
         templateImg = cv::imread(config.getString("CrosshairTemplate", "crosshair.png"), cv::IMREAD_COLOR);

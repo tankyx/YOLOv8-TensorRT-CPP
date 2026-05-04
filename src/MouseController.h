@@ -3,24 +3,27 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
+#include <string>
 #include <vector>
 #include <windows.h>
 #include <setupapi.h>
 #include <hidsdi.h>
 #include <hidclass.h>
 
-#define VENDOR_ID 0x0812
-#define PRODUCT_ID 0x2205
-#define TARGET_SERIAL L"DF625857C74E132B" // Replace with your target serial number
-#define TARGET_USAGE_PAGE 0xFF00      // Vendor-defined usage page
-#define TARGET_USAGE 0x01             // Vendor-defined usage
+// HID protocol-level constants — these describe the report format the firmware exposes,
+// not the device identity. Hardcoded on purpose; the per-device VID/PID/serial are now
+// constructor parameters (c15).
+#define TARGET_USAGE_PAGE 0xFF00 // Vendor-defined usage page
+#define TARGET_USAGE 0x01        // Vendor-defined usage
 
 class MouseController {
 public:
     MouseController(int screenWidth, int screenHeight, int detectionZoneWidth, int detectionZoneHeight, float sensitivity,
                     int centralSquareSize, float minGain, float maxGain, float maxSpeed, int HL1, int HL2, int cpi,
-                    int nLab, float probabilityThreshold);
+                    int nLab, float probabilityThreshold,
+                    uint16_t hidVendorId, uint16_t hidProductId, std::wstring hidSerial);
     ~MouseController();
     void aim(const std::vector<Object> &detections);
     void triggerLeftClickIfCenterWithinDetection(const std::vector<Object> &detections);
@@ -52,6 +55,11 @@ private:
     int headLabel2;
     int nLabels;
     float probabilityThreshold;
+
+    // HID device identity (c15)
+    uint16_t hidVendorId;
+    uint16_t hidProductId;
+    std::wstring hidSerial;
 
     int cpi;
 
