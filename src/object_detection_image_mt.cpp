@@ -75,6 +75,7 @@ private:
     bool useFusion;
     bool pinThreads;
     bool trackCrosshair;
+    bool debugView;
 };
 
 ObjectDetectionSystem::ObjectDetectionSystem(const std::string &iniFile) : running(true) {
@@ -96,6 +97,10 @@ void ObjectDetectionSystem::loadConfigFromINI(const std::string &iniFile) {
     // Thread settings
     pinThreads = config.getBool("PinThreads", false);
     captureThreadCore = config.getInt("CaptureThreadCore", 0);
+
+    // Debug viewer (c29) — INI-gated cv::imshow window for verifying detection visually.
+    // Off by default; turning on costs ~1–3 ms per frame on the detection thread.
+    debugView = config.getBool("DebugView", false);
 }
 
 void ObjectDetectionSystem::initializeSystem() {
@@ -282,6 +287,16 @@ void ObjectDetectionSystem::detectionThread() {
             mouseController->triggerLeftClickIfCenterWithinDetection(detections);
 
             detectionQueue.push(detections);
+
+            if (debugView) {
+                // Mutates the underlying frame buffer (croppedFrame is a view), but we drop the
+                // frame after this iteration so it's harmless. Drawing the crosshair as a small
+                // cross helps eyeball whether the GPU template match (c27) is locking on.
+                yoloV8->drawObjectLabels(croppedFrame, detections, 1);
+                cv::drawMarker(croppedFrame, crosshairPos, cv::Scalar(0, 255, 255), cv::MARKER_CROSS, 16, 1);
+                cv::imshow("YOLOv8-TRT debug", croppedFrame);
+                cv::waitKey(1);
+            }
 
             auto detectionEndTime = std::chrono::high_resolution_clock::now();
             auto detectionDuration = detectionEndTime - detectionStartTime;
