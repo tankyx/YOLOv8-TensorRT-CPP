@@ -90,9 +90,6 @@ public:
         m_outputDims.clear();
         m_IOTensorNames.clear();
 
-        cudaStream_t stream;
-        Util::checkCudaErrorCode(cudaStreamCreate(&stream));
-
         for (int i = 0; i < m_engine->getNbIOTensors(); ++i) {
             const auto tensorName = m_engine->getIOTensorName(i);
             m_IOTensorNames.emplace_back(tensorName);
@@ -119,12 +116,11 @@ public:
                 }
 
                 m_outputLengths.push_back(outputLength);
-                Util::checkCudaErrorCode(cudaMallocAsync(&m_buffers[i], outputLength * m_options.maxBatchSize * sizeof(float), stream));
+                Util::checkCudaErrorCode(cudaMallocAsync(&m_buffers[i], outputLength * m_options.maxBatchSize * sizeof(float), m_stream));
             }
         }
 
-        Util::checkCudaErrorCode(cudaStreamSynchronize(stream));
-        Util::checkCudaErrorCode(cudaStreamDestroy(stream));
+        Util::checkCudaErrorCode(cudaStreamSynchronize(m_stream));
 
         return true;
     }
@@ -160,9 +156,6 @@ public:
             }
         }
 
-        cudaStream_t inferenceCudaStream;
-        Util::checkCudaErrorCode(cudaStreamCreate(&inferenceCudaStream));
-
         std::vector<cv::cuda::GpuMat> preprocessedInputs;
         for (size_t i = 0; i < numInputs; ++i) {
             const auto &batchInput = inputs[i];
@@ -192,7 +185,7 @@ public:
             }
         }
 
-        if (!m_context->enqueueV3(inferenceCudaStream)) {
+        if (!m_context->enqueueV3(m_stream)) {
             return false;
         }
 
@@ -204,14 +197,13 @@ public:
                 Util::checkCudaErrorCode(cudaMemcpyAsync(
                     output.data(),
                     static_cast<char *>(m_buffers[outputBinding]) + (batch * sizeof(float) * m_outputLengths[outputBinding - numInputs]),
-                    m_outputLengths[outputBinding - numInputs] * sizeof(float), cudaMemcpyDeviceToHost, inferenceCudaStream));
+                    m_outputLengths[outputBinding - numInputs] * sizeof(float), cudaMemcpyDeviceToHost, m_stream));
                 batchOutputs.emplace_back(std::move(output));
             }
             featureVectors.emplace_back(std::move(batchOutputs));
         }
 
-        Util::checkCudaErrorCode(cudaStreamSynchronize(inferenceCudaStream));
-        Util::checkCudaErrorCode(cudaStreamDestroy(inferenceCudaStream));
+        Util::checkCudaErrorCode(cudaStreamSynchronize(m_stream));
 
         return true;
     }
@@ -229,19 +221,16 @@ protected:
 
 private:
     void clearGpuBuffers() {
-        if (m_buffers.empty() || !m_engine) {
+        if (m_buffers.empty() || !m_engine || !m_stream) {
             return;
         }
-        cudaStream_t stream;
-        Util::checkCudaErrorCode(cudaStreamCreate(&stream));
         const auto numInputs = m_inputDims.size();
         for (int32_t outputBinding = numInputs; outputBinding < m_engine->getNbIOTensors(); ++outputBinding) {
             if (m_buffers[outputBinding]) {
-                Util::checkCudaErrorCode(cudaFreeAsync(m_buffers[outputBinding], stream));
+                Util::checkCudaErrorCode(cudaFreeAsync(m_buffers[outputBinding], m_stream));
             }
         }
-        Util::checkCudaErrorCode(cudaStreamSynchronize(stream));
-        Util::checkCudaErrorCode(cudaStreamDestroy(stream));
+        Util::checkCudaErrorCode(cudaStreamSynchronize(m_stream));
         m_buffers.clear();
     }
 

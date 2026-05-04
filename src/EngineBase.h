@@ -88,10 +88,17 @@ class Logger : public nvinfer1::ILogger {
 
 class EngineBase {
 public:
-    virtual ~EngineBase() = default;
+    virtual ~EngineBase() {
+        if (m_stream) {
+            cudaStreamDestroy(m_stream);
+            m_stream = nullptr;
+        }
+    }
 
 protected:
-    explicit EngineBase(const Options &options) : m_options(options) {}
+    explicit EngineBase(const Options &options) : m_options(options) {
+        Util::checkCudaErrorCode(cudaStreamCreate(&m_stream));
+    }
 
 public:
 
@@ -286,4 +293,6 @@ protected:
     Options m_options;
     Logger m_logger;
     std::string m_onnxHash;
+    // Per-engine CUDA stream reused across inferences (c21). Created in the ctor.
+    cudaStream_t m_stream = nullptr;
 };

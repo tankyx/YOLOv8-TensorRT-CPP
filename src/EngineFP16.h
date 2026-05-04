@@ -88,9 +88,6 @@ public:
         m_outputDims.clear();
         m_IOTensorNames.clear();
 
-        cudaStream_t stream;
-        Util::checkCudaErrorCode(cudaStreamCreate(&stream));
-
         for (int i = 0; i < m_engine->getNbIOTensors(); ++i) {
             const auto tensorName = m_engine->getIOTensorName(i);
             m_IOTensorNames.emplace_back(tensorName);
@@ -122,12 +119,11 @@ public:
                 size_t allocSize = outputLength * m_options.maxBatchSize * sizeof(__half);
                 allocSize = (allocSize + 31) & ~31; // 32-byte alignment
 
-                Util::checkCudaErrorCode(cudaMallocAsync(&m_buffers[i], allocSize, stream));
+                Util::checkCudaErrorCode(cudaMallocAsync(&m_buffers[i], allocSize, m_stream));
             }
         }
 
-        Util::checkCudaErrorCode(cudaStreamSynchronize(stream));
-        Util::checkCudaErrorCode(cudaStreamDestroy(stream));
+        Util::checkCudaErrorCode(cudaStreamSynchronize(m_stream));
 
         return true;
     }
@@ -146,8 +142,6 @@ public:
         }
 
         const auto batchSize = static_cast<int32_t>(inputs[0].size());
-        cudaStream_t inferenceCudaStream;
-        Util::checkCudaErrorCode(cudaStreamCreate(&inferenceCudaStream));
 
         std::vector<cv::cuda::GpuMat> preprocessedInputs;
         for (size_t i = 0; i < numInputs; ++i) {
@@ -158,7 +152,7 @@ public:
             m_context->setInputShape(m_IOTensorNames[i].c_str(), inputDims);
 
             // Process in FP32 then convert to FP16 in one step (custom CUDA kernel).
-            auto processed = blobFromGpuMatsFP16(batchInput, m_subVals, m_divVals, m_normalize);
+            auto processed = blobFromGpuMatsFP16(batchInput, m_subVals, m_divVals, m_normalize, m_stream);
 
             // Ensure 32-byte alignment for FP16 tensor cores.
             size_t pitch = (processed.step + 31) & ~31;
@@ -183,7 +177,7 @@ public:
             }
         }
 
-        if (!m_context->enqueueV3(inferenceCudaStream)) {
+        if (!m_context->enqueueV3(m_stream)) {
             return false;
         }
 
@@ -196,7 +190,7 @@ public:
                 Util::checkCudaErrorCode(cudaMemcpyAsync(
                     fp16Output.data(),
                     static_cast<char *>(m_buffers[outputBinding]) + (batch * sizeof(__half) * m_outputLengths[outputBinding - numInputs]),
-                    m_outputLengths[outputBinding - numInputs] * sizeof(__half), cudaMemcpyDeviceToHost, inferenceCudaStream));
+                    m_outputLengths[outputBinding - numInputs] * sizeof(__half), cudaMemcpyDeviceToHost, m_stream));
 
                 std::vector<float> output(fp16Output.size());
                 for (size_t j = 0; j < fp16Output.size(); ++j) {
@@ -208,8 +202,7 @@ public:
             featureVectors.emplace_back(std::move(batchOutputs));
         }
 
-        Util::checkCudaErrorCode(cudaStreamSynchronize(inferenceCudaStream));
-        Util::checkCudaErrorCode(cudaStreamDestroy(inferenceCudaStream));
+        Util::checkCudaErrorCode(cudaStreamSynchronize(m_stream));
 
         return true;
     }
@@ -233,40 +226,37 @@ protected:
 
 private:
     void clearGpuBuffers() {
-        if (m_buffers.empty() || !m_engine) {
+        if (m_buffers.empty() || !m_engine || !m_stream) {
             return;
         }
-        cudaStream_t stream;
-        Util::checkCudaErrorCode(cudaStreamCreate(&stream));
         const auto numInputs = m_inputDims.size();
         for (int32_t outputBinding = numInputs; outputBinding < m_engine->getNbIOTensors(); ++outputBinding) {
             if (m_buffers[outputBinding]) {
-                Util::checkCudaErrorCode(cudaFreeAsync(m_buffers[outputBinding], stream));
+                Util::checkCudaErrorCode(cudaFreeAsync(m_buffers[outputBinding], m_stream));
             }
         }
-        Util::checkCudaErrorCode(cudaStreamSynchronize(stream));
-        Util::checkCudaErrorCode(cudaStreamDestroy(stream));
+        Util::checkCudaErrorCode(cudaStreamSynchronize(m_stream));
         m_buffers.clear();
     }
 
-    static void convertFP32ToFP16(const cv::cuda::GpuMat &input, cv::cuda::GpuMat &output) {
+    static void convertFP32ToFP16(const cv::cuda::GpuMat &input, cv::cuda::GpuMat &output, cudaStream_t stream) {
         output.create(input.rows, input.cols, CV_16FC3);
         const int numElements = input.rows * input.cols * 3;
-        launchConvertFP32ToFP16Kernel(input.ptr<float>(), output.ptr<__half>(), numElements);
+        launchConvertFP32ToFP16Kernel(input.ptr<float>(), output.ptr<__half>(), numElements, stream);
         cudaError_t error = cudaGetLastError();
         if (error != cudaSuccess) {
             throw std::runtime_error("CUDA error in FP16 conversion: " + std::string(cudaGetErrorString(error)));
         }
-        cudaDeviceSynchronize();
+        Util::checkCudaErrorCode(cudaStreamSynchronize(stream));
     }
 
     // FP16-flavored input prep: build the FP32 blob via the shared base helper, then cast to FP16
-    // via the custom kernel.
+    // via the custom kernel on the engine's stream.
     static cv::cuda::GpuMat blobFromGpuMatsFP16(const std::vector<cv::cuda::GpuMat> &batchInput, const std::array<float, 3> &subVals,
-                                                const std::array<float, 3> &divVals, bool normalize) {
+                                                const std::array<float, 3> &divVals, bool normalize, cudaStream_t stream) {
         cv::cuda::GpuMat mfloat = blobFromGpuMats(batchInput, subVals, divVals, normalize);
         cv::cuda::GpuMat mhalf;
-        convertFP32ToFP16(mfloat, mhalf);
+        convertFP32ToFP16(mfloat, mhalf, stream);
         return mhalf;
     }
 
