@@ -16,15 +16,12 @@ MouseController::MouseController(int screenWidth, int screenHeight, int detectio
     isLeftClicking = false;
 
     ConnectToDevice();
-    running = true;
-    //std::thread(&MouseController::processHIDReports, this).detach();
 }
 
 MouseController::~MouseController() {
     if (hidDevice) {
         CloseHandle(hidDevice);
     }
-    running = false;
 }
 
 bool MouseController::ConnectToDevice() {
@@ -124,14 +121,6 @@ void MouseController::setCrosshairPosition(int x, int y) {
     crosshairY = y;
 }
 
-void MouseController::processHIDReports() {
-    while (running) {
-        auto report = reportQueue.pop();
-        processHIDReport(report);
-        Sleep(2);
-    }
-}
-
 bool MouseController::processHIDReport(std::vector<uint8_t> &report) {
     if (hidDevice != nullptr) {
         DWORD bytesWritten = 0;
@@ -172,8 +161,6 @@ void MouseController::sendHIDReport(int16_t dx, int16_t dy, uint8_t button) {
     report[4] = (dy >> 8) & 0xFF; // High byte of dy
     report[5] = button;           // Button state
 
-    // Send the report for processing
-    //reportQueue.push(report);
     processHIDReport(report);
 }
 

@@ -55,10 +55,6 @@ private:
 
     bool isLeftClicking;
 
-    SafeQueue<std::vector<uint8_t>> reportQueue;
-    std::thread reportThread;
-    std::atomic<bool> running;
-
     bool isLeftMouseButtonPressed();
     bool isMouseButton4Pressed();
     bool isMouseButton5Pressed();
@@ -68,7 +64,6 @@ private:
     void sendHIDReport(int16_t dx, int16_t dy, uint8_t button);
     bool ConnectToDevice();
     bool processHIDReport(std::vector<uint8_t> &report);
-    void processHIDReports();
     float calculateSpeedScaling(const cv::Rect &rect);
 };
 
