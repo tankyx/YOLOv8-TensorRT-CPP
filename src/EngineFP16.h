@@ -6,19 +6,17 @@
 #include "EngineFP16Kernels.h"
 #include <NvInfer.h>
 #include <NvOnnxParser.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
 #include <fstream>
 #include <opencv2/cudaarithm.hpp>
 #include <opencv2/cudaimgproc.hpp>
 #include <opencv2/cudawarping.hpp>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
-
-__global__ void convertFP32ToFP16Kernel(const float *input, __half *output, int size);
 
 class EngineFP16 : public EngineBase {
 public:
-    explicit EngineFP16(const Options &options) : m_options(options) {}
-    ~EngineFP16() { clearGpuBuffers(); }
+    explicit EngineFP16(const Options &options) : EngineBase(options) {}
+    ~EngineFP16() override { clearGpuBuffers(); }
 
     bool buildLoadNetwork(std::string onnxModelPath, const std::array<float, 3> &subVals = {0.f, 0.f, 0.f},
                           const std::array<float, 3> &divVals = {1.f, 1.f, 1.f}, bool normalize = true) override {
@@ -32,10 +30,8 @@ public:
             if (!Util::doesFileExist(onnxModelPath)) {
                 throw std::runtime_error("Could not find onnx model at path: " + onnxModelPath);
             }
-
             std::cout << "Engine not found, generating. This could take a while..." << std::endl;
-            auto ret = build(onnxModelPath, subVals, divVals, normalize);
-            if (!ret) {
+            if (!buildSerialized(onnxModelPath)) {
                 return false;
             }
         }
@@ -95,7 +91,6 @@ public:
         cudaStream_t stream;
         Util::checkCudaErrorCode(cudaStreamCreate(&stream));
 
-        m_outputLengths.clear();
         for (int i = 0; i < m_engine->getNbIOTensors(); ++i) {
             const auto tensorName = m_engine->getIOTensorName(i);
             m_IOTensorNames.emplace_back(tensorName);
@@ -162,11 +157,11 @@ public:
             nvinfer1::Dims4 inputDims = {batchSize, dims.d[0], dims.d[1], dims.d[2]};
             m_context->setInputShape(m_IOTensorNames[i].c_str(), inputDims);
 
-            // Process and convert to FP16 in one step
-            auto processed = blobFromGpuMats(batchInput, m_subVals, m_divVals, m_normalize);
+            // Process in FP32 then convert to FP16 in one step (custom CUDA kernel).
+            auto processed = blobFromGpuMatsFP16(batchInput, m_subVals, m_divVals, m_normalize);
 
-            // Ensure alignment
-            size_t pitch = (processed.step + 31) & ~31; // 32-byte alignment
+            // Ensure 32-byte alignment for FP16 tensor cores.
+            size_t pitch = (processed.step + 31) & ~31;
             if (processed.step != pitch) {
                 cv::cuda::GpuMat aligned(processed.rows, processed.cols, CV_16FC3, pitch);
                 processed.copyTo(aligned);
@@ -196,19 +191,16 @@ public:
         for (int batch = 0; batch < batchSize; ++batch) {
             std::vector<std::vector<float>> batchOutputs;
             for (int32_t outputBinding = numInputs; outputBinding < m_engine->getNbIOTensors(); ++outputBinding) {
-                // Allocate space for FP16 data
+                // Pull the FP16 output to host, then convert to FP32 for the consumer's vector<float> contract.
                 std::vector<__half> fp16Output(m_outputLengths[outputBinding - numInputs]);
-
-                // Copy FP16 data from GPU
                 Util::checkCudaErrorCode(cudaMemcpyAsync(
                     fp16Output.data(),
                     static_cast<char *>(m_buffers[outputBinding]) + (batch * sizeof(__half) * m_outputLengths[outputBinding - numInputs]),
                     m_outputLengths[outputBinding - numInputs] * sizeof(__half), cudaMemcpyDeviceToHost, inferenceCudaStream));
 
-                // Convert FP16 to FP32
                 std::vector<float> output(fp16Output.size());
-                for (size_t i = 0; i < fp16Output.size(); ++i) {
-                    output[i] = __half2float(fp16Output[i]);
+                for (size_t j = 0; j < fp16Output.size(); ++j) {
+                    output[j] = __half2float(fp16Output[j]);
                 }
 
                 batchOutputs.emplace_back(std::move(output));
@@ -226,96 +218,22 @@ public:
 
     [[nodiscard]] const std::vector<nvinfer1::Dims> &getOutputDims() const override { return m_outputDims; }
 
-private:
-    bool build(std::string onnxModelPath, const std::array<float, 3> &subVals, const std::array<float, 3> &divVals, bool normalize) {
-        auto builder = std::unique_ptr<nvinfer1::IBuilder>(nvinfer1::createInferBuilder(m_logger));
-        if (!builder) {
-            return false;
-        }
+protected:
+    const char *precisionSuffix() const override { return "fp16"; }
 
-        if (!builder->platformHasFastFp16()) {
+    void applyPrecisionFlags(nvinfer1::IBuilder &builder, nvinfer1::IBuilderConfig &config) override {
+        if (!builder.platformHasFastFp16()) {
             throw std::runtime_error("GPU does not support FP16");
         }
-
-        auto explicitBatch = 1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
-        auto network = std::unique_ptr<nvinfer1::INetworkDefinition>(builder->createNetworkV2(explicitBatch));
-        if (!network) {
-            return false;
+        config.setFlag(nvinfer1::BuilderFlag::kFP16);
+        if (builder.platformHasTf32()) {
+            config.setFlag(nvinfer1::BuilderFlag::kTF32);
         }
-
-        auto parser = std::unique_ptr<nvonnxparser::IParser>(nvonnxparser::createParser(*network, m_logger));
-        if (!parser) {
-            return false;
-        }
-
-        std::ifstream file(onnxModelPath, std::ios::binary | std::ios::ate);
-        std::streamsize size = file.tellg();
-        file.seekg(0, std::ios::beg);
-
-        std::vector<char> buffer(size);
-        if (!file.read(buffer.data(), size)) {
-            throw std::runtime_error("Unable to read engine file");
-        }
-
-        auto parsed = parser->parse(buffer.data(), buffer.size());
-        if (!parsed) {
-            return false;
-        }
-
-        auto config = std::unique_ptr<nvinfer1::IBuilderConfig>(builder->createBuilderConfig());
-        if (!config) {
-            return false;
-        }
-
-        // Enable FP16 mode
-        config->setFlag(nvinfer1::BuilderFlag::kFP16);
-
-        // Enable TF32 for better numerical stability with FP16
-        if (builder->platformHasTf32()) {
-            config->setFlag(nvinfer1::BuilderFlag::kTF32);
-        }
-
-        auto optProfile = builder->createOptimizationProfile();
-        const auto numInputs = network->getNbInputs();
-
-        for (int32_t i = 0; i < numInputs; ++i) {
-            const auto input = network->getInput(i);
-            const auto inputName = input->getName();
-            const auto inputDims = input->getDimensions();
-            int32_t inputC = inputDims.d[1];
-            int32_t inputH = inputDims.d[2];
-            int32_t inputW = inputDims.d[3];
-
-            optProfile->setDimensions(inputName, nvinfer1::OptProfileSelector::kMIN, nvinfer1::Dims4(1, inputC, inputH, inputW));
-
-            optProfile->setDimensions(inputName, nvinfer1::OptProfileSelector::kOPT,
-                                      nvinfer1::Dims4(m_options.optBatchSize, inputC, inputH, inputW));
-
-            optProfile->setDimensions(inputName, nvinfer1::OptProfileSelector::kMAX,
-                                      nvinfer1::Dims4(m_options.maxBatchSize, inputC, inputH, inputW));
-        }
-
-        config->addOptimizationProfile(optProfile);
-
-        cudaStream_t profileStream;
-        Util::checkCudaErrorCode(cudaStreamCreate(&profileStream));
-        config->setProfileStream(profileStream);
-
-        std::unique_ptr<nvinfer1::IHostMemory> plan{builder->buildSerializedNetwork(*network, *config)};
-        if (!plan) {
-            return false;
-        }
-
-        const auto engineName = serializeEngineOptions(m_options, onnxModelPath);
-        std::ofstream outfile(engineName, std::ofstream::binary);
-        outfile.write(reinterpret_cast<const char *>(plan->data()), plan->size());
-
-        Util::checkCudaErrorCode(cudaStreamDestroy(profileStream));
-        return true;
     }
 
+private:
     void clearGpuBuffers() {
-        if (!m_buffers.empty()) {
+        if (!m_buffers.empty() && m_engine) {
             const auto numInputs = m_inputDims.size();
             for (int32_t outputBinding = numInputs; outputBinding < m_engine->getNbIOTensors(); ++outputBinding) {
                 Util::checkCudaErrorCode(cudaFree(m_buffers[outputBinding]));
@@ -324,112 +242,39 @@ private:
         }
     }
 
-    std::string serializeEngineOptions(const Options &options, const std::string &onnxModelPath) {
-        const auto filenamePos = onnxModelPath.find_last_of('/') + 1;
-        std::string engineName = onnxModelPath.substr(filenamePos, onnxModelPath.find_last_of('.') - filenamePos) + ".engine";
-
-        std::vector<std::string> deviceNames;
-        getDeviceNames(deviceNames);
-
-        if (static_cast<size_t>(options.deviceIndex) >= deviceNames.size()) {
-            throw std::runtime_error("Error, provided device index is out of range!");
-        }
-
-        auto deviceName = deviceNames[options.deviceIndex];
-        deviceName.erase(std::remove_if(deviceName.begin(), deviceName.end(), ::isspace), deviceName.end());
-
-        engineName += "." + deviceName;
-        engineName += ".fp16"; // Always FP16 for this engine
-        engineName += "." + std::to_string(options.maxBatchSize);
-        engineName += "." + std::to_string(options.optBatchSize);
-        if (!m_onnxHash.empty()) {
-            engineName += "." + m_onnxHash;
-        }
-
-        return engineName;
-    }
-
-        static void convertFP32ToFP16(const cv::cuda::GpuMat &input, cv::cuda::GpuMat &output) {
-        // Create output mat for FP16
+    static void convertFP32ToFP16(const cv::cuda::GpuMat &input, cv::cuda::GpuMat &output) {
         output.create(input.rows, input.cols, CV_16FC3);
-
-        const int numElements = input.rows * input.cols * 3; // 3 channels
-
+        const int numElements = input.rows * input.cols * 3;
         launchConvertFP32ToFP16Kernel(input.ptr<float>(), output.ptr<__half>(), numElements);
-
-        // Check for errors
         cudaError_t error = cudaGetLastError();
         if (error != cudaSuccess) {
             throw std::runtime_error("CUDA error in FP16 conversion: " + std::string(cudaGetErrorString(error)));
         }
-
-        // Synchronize
         cudaDeviceSynchronize();
     }
 
-    void getDeviceNames(std::vector<std::string> &deviceNames) {
-        int numGPUs;
-        cudaGetDeviceCount(&numGPUs);
-        for (int device = 0; device < numGPUs; device++) {
-            cudaDeviceProp prop;
-            cudaGetDeviceProperties(&prop, device);
-            deviceNames.push_back(std::string(prop.name));
-        }
-    }
-
-    static cv::cuda::GpuMat blobFromGpuMats(const std::vector<cv::cuda::GpuMat> &batchInput, const std::array<float, 3> &subVals,
-                                            const std::array<float, 3> &divVals, bool normalize) {
-        // Process in FP32 first
-        cv::cuda::GpuMat gpu_dst(1, batchInput[0].rows * batchInput[0].cols * batchInput.size(), CV_8UC3);
-
-        size_t width = batchInput[0].cols * batchInput[0].rows;
-        for (size_t img = 0; img < batchInput.size(); img++) {
-            std::vector<cv::cuda::GpuMat> input_channels{
-                cv::cuda::GpuMat(batchInput[0].rows, batchInput[0].cols, CV_8U, &(gpu_dst.ptr()[0 + width * 3 * img])),
-                cv::cuda::GpuMat(batchInput[0].rows, batchInput[0].cols, CV_8U, &(gpu_dst.ptr()[width + width * 3 * img])),
-                cv::cuda::GpuMat(batchInput[0].rows, batchInput[0].cols, CV_8U, &(gpu_dst.ptr()[width * 2 + width * 3 * img]))};
-            cv::cuda::split(batchInput[img], input_channels);
-        }
-
-        // Do preprocessing in FP32
-        cv::cuda::GpuMat mfloat;
-        if (normalize) {
-            gpu_dst.convertTo(mfloat, CV_32FC3, 1.f / 255.f);
-        } else {
-            gpu_dst.convertTo(mfloat, CV_32FC3);
-        }
-
-        cv::cuda::subtract(mfloat, cv::Scalar(subVals[0], subVals[1], subVals[2]), mfloat, cv::noArray(), -1);
-        cv::cuda::divide(mfloat, cv::Scalar(divVals[0], divVals[1], divVals[2]), mfloat, 1, -1);
-
-        // Convert to FP16 using our custom function
+    // FP16-flavored input prep: build the FP32 blob via the shared base helper, then cast to FP16
+    // via the custom kernel.
+    static cv::cuda::GpuMat blobFromGpuMatsFP16(const std::vector<cv::cuda::GpuMat> &batchInput, const std::array<float, 3> &subVals,
+                                                const std::array<float, 3> &divVals, bool normalize) {
+        cv::cuda::GpuMat mfloat = blobFromGpuMats(batchInput, subVals, divVals, normalize);
         cv::cuda::GpuMat mhalf;
-        try {
-            convertFP32ToFP16(mfloat, mhalf);
-        } catch (const std::runtime_error &e) {
-            std::cerr << "Error in FP16 conversion: " << e.what() << std::endl;
-            throw;
-        }
-
+        convertFP32ToFP16(mfloat, mhalf);
         return mhalf;
     }
 
-    // Member variables
     std::array<float, 3> m_subVals{};
     std::array<float, 3> m_divVals{};
-    bool m_normalize;
+    bool m_normalize{true};
 
     std::vector<void *> m_buffers;
     std::vector<uint32_t> m_outputLengths{};
     std::vector<nvinfer1::Dims3> m_inputDims;
     std::vector<nvinfer1::Dims> m_outputDims;
     std::vector<std::string> m_IOTensorNames;
-    int32_t m_inputBatchSize;
+    int32_t m_inputBatchSize{-1};
 
-    std::unique_ptr<nvinfer1::IRuntime> m_runtime = nullptr;
-    std::unique_ptr<nvinfer1::ICudaEngine> m_engine = nullptr;
-    std::unique_ptr<nvinfer1::IExecutionContext> m_context = nullptr;
-    const Options m_options;
-    Logger m_logger;
-    std::string m_onnxHash;
+    std::unique_ptr<nvinfer1::IRuntime> m_runtime;
+    std::unique_ptr<nvinfer1::ICudaEngine> m_engine;
+    std::unique_ptr<nvinfer1::IExecutionContext> m_context;
 };
