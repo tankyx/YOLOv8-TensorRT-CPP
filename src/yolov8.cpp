@@ -109,38 +109,55 @@ std::vector<Object> YoloV8::postprocessDetect(std::vector<float> &featureVector)
     std::vector<int> labels;
     std::vector<int> indices;
 
-    cv::Mat output = cv::Mat(numChannels, numAnchors, CV_32F, featureVector.data());
-    output = output.t();
+    // featureVector is laid out as numChannels rows × numAnchors columns: channel c at anchor i
+    // is at index `c * numAnchors + i`. Previously we constructed a Mat view + .t() (which
+    // copies) and then iterated row-major over the transposed view. Indexing the original
+    // layout directly drops one full Mat allocation per detection.
+    const float *data = featureVector.data();
+    bboxes.reserve(numAnchors / 16);
+    scores.reserve(numAnchors / 16);
+    labels.reserve(numAnchors / 16);
 
-    // Get all the YOLO proposals
-    for (int i = 0; i < numAnchors; i++) {
-        auto rowPtr = output.row(i).ptr<float>();
-        auto bboxesPtr = rowPtr;
-        auto scoresPtr = rowPtr + 4;
-        auto maxSPtr = std::max_element(scoresPtr, scoresPtr + numClasses);
-        float score = *maxSPtr;
-        if (score > PROBABILITY_THRESHOLD) {
-            float x = *bboxesPtr++;
-            float y = *bboxesPtr++;
-            float w = *bboxesPtr++;
-            float h = *bboxesPtr;
+    for (int i = 0; i < numAnchors; ++i) {
+        const float *xPtr = data + 0 * numAnchors + i;
+        const float *yPtr = data + 1 * numAnchors + i;
+        const float *wPtr = data + 2 * numAnchors + i;
+        const float *hPtr = data + 3 * numAnchors + i;
 
-            float x0 = std::clamp((x - 0.5f * w) * m_ratio, 0.f, m_imgWidth);
-            float y0 = std::clamp((y - 0.5f * h) * m_ratio, 0.f, m_imgHeight);
-            float x1 = std::clamp((x + 0.5f * w) * m_ratio, 0.f, m_imgWidth);
-            float y1 = std::clamp((y + 0.5f * h) * m_ratio, 0.f, m_imgHeight);
-
-            int label = maxSPtr - scoresPtr;
-            cv::Rect_<float> bbox;
-            bbox.x = x0;
-            bbox.y = y0;
-            bbox.width = x1 - x0;
-            bbox.height = y1 - y0;
-
-            bboxes.push_back(bbox);
-            labels.push_back(label);
-            scores.push_back(score);
+        // Find the best class score for this anchor across all numClasses class channels.
+        int bestLabel = 0;
+        float bestScore = data[4 * numAnchors + i];
+        for (int c = 1; c < static_cast<int>(numClasses); ++c) {
+            const float s = data[(4 + c) * numAnchors + i];
+            if (s > bestScore) {
+                bestScore = s;
+                bestLabel = c;
+            }
         }
+
+        if (bestScore <= PROBABILITY_THRESHOLD) {
+            continue;
+        }
+
+        const float x = *xPtr;
+        const float y = *yPtr;
+        const float w = *wPtr;
+        const float h = *hPtr;
+
+        const float x0 = std::clamp((x - 0.5f * w) * m_ratio, 0.f, m_imgWidth);
+        const float y0 = std::clamp((y - 0.5f * h) * m_ratio, 0.f, m_imgHeight);
+        const float x1 = std::clamp((x + 0.5f * w) * m_ratio, 0.f, m_imgWidth);
+        const float y1 = std::clamp((y + 0.5f * h) * m_ratio, 0.f, m_imgHeight);
+
+        cv::Rect_<float> bbox;
+        bbox.x = x0;
+        bbox.y = y0;
+        bbox.width = x1 - x0;
+        bbox.height = y1 - y0;
+
+        bboxes.push_back(bbox);
+        labels.push_back(bestLabel);
+        scores.push_back(bestScore);
     }
 
     // Run NMS
