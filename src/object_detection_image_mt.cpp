@@ -134,6 +134,8 @@ void ObjectDetectionSystem::initializeSystem() {
     }
 
     capture = std::make_unique<DXGICapture>();
+
+    detectionQueue.setMoveThresholdPx(config.getInt("DetectionMoveThresholdPx", 5));
 }
 
 void ObjectDetectionSystem::startThreads() {

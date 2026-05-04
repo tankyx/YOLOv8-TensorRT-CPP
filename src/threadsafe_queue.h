@@ -38,9 +38,17 @@ public:
 
 class DetectionQueue {
 public:
+    DetectionQueue() : moveThresholdPx_(5) {}
+    explicit DetectionQueue(int moveThresholdPx) : moveThresholdPx_(moveThresholdPx) {}
+
+    void setMoveThresholdPx(int threshold) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        moveThresholdPx_ = threshold;
+    }
+
     void push(const std::vector<Object> &detections) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (hasMovedMoreThanThreshold(detections, 5)) {
+        if (hasMovedMoreThanThreshold(detections, moveThresholdPx_)) {
             detections_ = detections;
         }
     }
@@ -67,6 +75,7 @@ private:
 
     std::vector<Object> detections_;
     std::mutex mutex_;
+    int moveThresholdPx_;
 };
 
 class LatencyQueue {
