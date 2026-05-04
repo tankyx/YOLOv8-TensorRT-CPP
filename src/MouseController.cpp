@@ -122,29 +122,35 @@ void MouseController::setCrosshairPosition(int x, int y) {
 }
 
 bool MouseController::processHIDReport(std::vector<uint8_t> &report) {
-    if (hidDevice != nullptr) {
-        DWORD bytesWritten = 0;
-        BOOL res = WriteFile(hidDevice, report.data(), report.size(), &bytesWritten, NULL);
-
-        if (!res || bytesWritten != report.size()) {
-            int err = GetLastError();
-            std::cerr << "Failed to send HID report using WriteFile: " << err << std::endl;
-
-            if (err == 995 || err == 1167) { // Device disconnected errors
-                std::cerr << "Device disconnected" << std::endl;
-                CloseHandle(hidDevice);
-                hidDevice = nullptr;
-                std::this_thread::sleep_for(std::chrono::seconds(2)); // Wait for device to reconnect
-                ConnectToDevice();
-                std::cout << "\033[2J\033[H"; // Clear terminal (optional)
-            } else {
-                exit(1); // Handle the error appropriately
-            }
+    if (hidDevice == nullptr) {
+        if (!hidWarningLogged) {
+            std::cerr << "MouseController: HID device unavailable; aim/click suppressed until reconnect." << std::endl;
+            hidWarningLogged = true;
         }
-    } else {
-        ConnectToDevice(); // Reconnect if the device is not available
+        ConnectToDevice();
+        return false;
     }
-    return true;
+
+    DWORD bytesWritten = 0;
+    BOOL res = WriteFile(hidDevice, report.data(), report.size(), &bytesWritten, NULL);
+    if (res && bytesWritten == report.size()) {
+        hidWarningLogged = false; // back to healthy — re-arm the one-shot
+        return true;
+    }
+
+    int err = GetLastError();
+    std::cerr << "MouseController: WriteFile failed (err=" << err << ")." << std::endl;
+
+    if (err == 995 || err == 1167) { // device removed / pending I/O cancelled
+        std::cerr << "MouseController: device disconnected; will retry on next call." << std::endl;
+        CloseHandle(hidDevice);
+        hidDevice = nullptr;
+        return false;
+    }
+
+    // Any other write failure: don't exit(1); let the caller keep running. The device may still
+    // be present but transiently unavailable (e.g. USB suspend). Drop the report this tick.
+    return false;
 }
 
 void MouseController::sendHIDReport(int16_t dx, int16_t dy, uint8_t button) {

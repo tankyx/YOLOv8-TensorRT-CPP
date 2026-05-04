@@ -54,6 +54,7 @@ private:
     int cpi;
 
     bool isLeftClicking;
+    bool hidWarningLogged = false;
 
     bool isLeftMouseButtonPressed();
     bool isMouseButton4Pressed();
