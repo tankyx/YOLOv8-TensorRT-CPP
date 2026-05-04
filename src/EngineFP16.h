@@ -185,24 +185,25 @@ public:
         for (int batch = 0; batch < batchSize; ++batch) {
             std::vector<std::vector<float>> batchOutputs;
             for (int32_t outputBinding = numInputs; outputBinding < m_engine->getNbIOTensors(); ++outputBinding) {
-                // Pull the FP16 output to host, then convert to FP32 for the consumer's vector<float> contract.
-                std::vector<__half> fp16Output(m_outputLengths[outputBinding - numInputs]);
-                Util::checkCudaErrorCode(cudaMemcpyAsync(
-                    fp16Output.data(),
-                    static_cast<char *>(m_buffers[outputBinding]) + (batch * sizeof(__half) * m_outputLengths[outputBinding - numInputs]),
-                    m_outputLengths[outputBinding - numInputs] * sizeof(__half), cudaMemcpyDeviceToHost, m_stream));
+                const uint32_t length = m_outputLengths[outputBinding - numInputs];
 
-                std::vector<float> output(fp16Output.size());
-                for (size_t j = 0; j < fp16Output.size(); ++j) {
-                    output[j] = __half2float(fp16Output[j]);
-                }
+                // FP16 -> FP32 on the GPU, then a single host transfer. Replaces the previous
+                // scalar host-side __half2float loop (c23).
+                ensureFp32StagingCapacity(length);
 
+                const __half *deviceFp16 = reinterpret_cast<const __half *>(static_cast<char *>(m_buffers[outputBinding]) +
+                                                                            (batch * sizeof(__half) * length));
+                launchConvertFP16ToFP32Kernel(deviceFp16, m_fp32Staging, static_cast<int>(length), m_stream);
+
+                std::vector<float> output(length);
+                Util::checkCudaErrorCode(
+                    cudaMemcpyAsync(output.data(), m_fp32Staging, length * sizeof(float), cudaMemcpyDeviceToHost, m_stream));
+
+                Util::checkCudaErrorCode(cudaStreamSynchronize(m_stream)); // own each batch's output before the next overwrites the staging buf
                 batchOutputs.emplace_back(std::move(output));
             }
             featureVectors.emplace_back(std::move(batchOutputs));
         }
-
-        Util::checkCudaErrorCode(cudaStreamSynchronize(m_stream));
 
         return true;
     }
@@ -225,7 +226,28 @@ protected:
     }
 
 private:
+    // Reusable device-side FP32 staging buffer for the FP16->FP32 output kernel (c23).
+    // Sized to the largest output binding × batch and reused across calls.
+    void ensureFp32StagingCapacity(uint32_t lengthElems) {
+        if (lengthElems <= m_fp32StagingCapacity) {
+            return;
+        }
+        if (m_fp32Staging) {
+            Util::checkCudaErrorCode(cudaFreeAsync(m_fp32Staging, m_stream));
+            Util::checkCudaErrorCode(cudaStreamSynchronize(m_stream));
+            m_fp32Staging = nullptr;
+        }
+        Util::checkCudaErrorCode(cudaMallocAsync(reinterpret_cast<void **>(&m_fp32Staging), lengthElems * sizeof(float), m_stream));
+        Util::checkCudaErrorCode(cudaStreamSynchronize(m_stream));
+        m_fp32StagingCapacity = lengthElems;
+    }
+
     void clearGpuBuffers() {
+        if (m_stream && m_fp32Staging) {
+            cudaFreeAsync(m_fp32Staging, m_stream);
+            m_fp32Staging = nullptr;
+            m_fp32StagingCapacity = 0;
+        }
         if (m_buffers.empty() || !m_engine || !m_stream) {
             return;
         }
@@ -274,4 +296,8 @@ private:
     std::unique_ptr<nvinfer1::IRuntime> m_runtime;
     std::unique_ptr<nvinfer1::ICudaEngine> m_engine;
     std::unique_ptr<nvinfer1::IExecutionContext> m_context;
+
+    // Staging buffer for the FP16->FP32 output kernel (c23).
+    float *m_fp32Staging = nullptr;
+    uint32_t m_fp32StagingCapacity = 0;
 };
