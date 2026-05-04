@@ -1,20 +1,21 @@
 # Follow-ups
 
-Engineering work deferred from the `cleanup-optim-robustness` branch (24-commit cleanup PR), plus two adjacent investigations the user requested:
+Engineering work deferred from the `cleanup-optim-robustness` branch, plus two adjacent investigations the user requested:
 
 1. [Deferred optimizations](#1-deferred-optimizations)
    - [c25 — fused preprocess CUDA kernel](#c25--fused-preprocess-cuda-kernel)
    - [c26 — CUDA-D3D11 interop capture path](#c26--cuda-d3d11-interop-capture-path)
+   - [c28 — overlap crosshair GPU match with TRT inference](#c28--overlap-crosshair-gpu-match-with-trt-inference)
 2. [INT8 inference path](#2-int8-inference-path)
 3. [Newer YOLO versions](#3-newer-yolo-versions)
 
-Everything below assumes the post-cleanup state of the tree (engines unified under `EngineBase`, persistent `m_stream`, FP16 input/output GPU kernels, no overlay).
+Everything below assumes the post-cleanup state of the tree (engines unified under `EngineBase`, persistent `m_stream`, FP16 input/output GPU kernels, no overlay, **GPU crosshair tracking via `cv::cuda::TemplateMatching`** — c27).
 
 ---
 
 ## 1. Deferred optimizations
 
-Both items were ranked high-value / high-risk in the original plan. They were skipped because the host running development is Linux while the project is Windows-only — both touch correctness in ways that desk-review can't catch (sub-pixel detection drift in c25, format/synchronization gotchas in c26). Land them with smoke-tests on Windows, not blind.
+c25 and c26 were ranked high-value / high-risk in the original plan and skipped because the host running development is Linux while the project is Windows-only — both touch correctness in ways that desk-review can't catch (sub-pixel detection drift in c25, format/synchronization gotchas in c26). c28 is a small follow-on to c27 (GPU crosshair match) that reclaims its remaining latency by stream-overlapping with TRT inference. Land all three with smoke-tests on Windows, not blind.
 
 ### c25 — fused preprocess CUDA kernel
 
@@ -121,6 +122,71 @@ This eliminates the CPU mapping, the CPU `cvtColor` (BGRA → RGB happens inside
 - **Format compatibility**: `DXGI_FORMAT_B8G8R8A8_UNORM` is supported by the CUDA-D3D11 interop API; the resulting `cudaArray_t` is read via `cudaArrayLayered` semantics. No surprises on this format specifically.
 - **Synchronization**: D3D11 work queue and CUDA stream are separate. Either insert `cudaWaitExternalSemaphoresAsync` (TRT 10 / CUDA 12 has the API) or accept that the unmap/release boundary is the sync point. Implicit sync via map/unmap is what most reference implementations use; that's fine for this project's per-frame cadence.
 - **Read-only flag**: register the resource with `cudaGraphicsRegisterFlagsReadOnly` so CUDA never tries to write back. Faster too.
+
+---
+
+### c28 — overlap crosshair GPU match with TRT inference
+
+#### Why
+
+c27 (already landed) moved CS2 crosshair tracking from CPU `cv::matchTemplate` to `cv::cuda::TemplateMatching`. The match runs **synchronously on the default CUDA stream** before `YoloV8::detectObjects()` is called, so it still serializes against TRT inference even though the data dependency is independent — the matcher reads the small ROI and writes a result map; inference reads the full ROI and writes detection logits; they share no inputs and no outputs. They could run concurrently and only sync where the consumer needs the result (`MouseController::aim`, which reads `crosshairPos`).
+
+Estimated win: the entire ~0.2–0.3 ms cost of the GPU match disappears into the inference shadow. Smaller absolute number than c25/c26 since c27 already cut the CPU cost; this is the remainder.
+
+#### Design
+
+Use a separate `cv::cuda::Stream` for the matcher so it runs concurrently with the engine's `m_stream`. Sync only at the consumer site — just before `mouseController->aim(detections)`.
+
+```cpp
+// new member of ObjectDetectionSystem
+cv::cuda::Stream crosshairStream;
+
+// in detectionThread, replace the synchronous match block:
+gpuCrosshairRoi.upload(smallCroppedFrame, crosshairStream);
+crosshairMatcher->match(gpuCrosshairRoi, gpuCrosshairTemplate, gpuCrosshairResult, crosshairStream);
+// (cv::cuda::minMaxLoc has a stream overload too)
+double maxVal = 0.0;
+cv::Point maxLoc;
+cv::cuda::minMaxLoc(gpuCrosshairResult, nullptr, &maxVal, nullptr, &maxLoc);  // need to wait first
+
+// ... yoloV8->detectObjects(croppedFrame) runs on engine's m_stream concurrently ...
+
+crosshairStream.waitForCompletion();  // sync here, just before consumer
+mouseController->setCrosshairPosition(crosshairPos.x, crosshairPos.y);
+mouseController->aim(detections);
+```
+
+`cv::cuda::minMaxLoc` does not have a documented stream overload in OpenCV's CUDA module — the practical pattern is to have it sync the stream itself (default behavior when called without a stream) and accept that the sync point lands here rather than at the consumer. To get true overlap, use the lower-level `cv::cuda::minMaxLocAsync` (if available in your OpenCV build) or replicate the reduction with a small custom kernel on the same stream.
+
+If c26 has already landed, you can skip the upload entirely — the small ROI becomes a sub-rect view of the GPU frame already mapped from DXGI:
+
+```cpp
+// post-c26: frame is already a cv::cuda::GpuMat
+cv::cuda::GpuMat gpuSmallRoi = gpuFrame(smallRoi);  // O(1) view, no copy
+crosshairMatcher->match(gpuSmallRoi, gpuCrosshairTemplate, gpuCrosshairResult, crosshairStream);
+```
+
+That's another ~0.05–0.1 ms saved (the upload).
+
+#### File-level plan
+
+- `src/object_detection_image_mt.cpp`:
+  - Add `cv::cuda::Stream crosshairStream` member to `ObjectDetectionSystem`.
+  - In `detectionThread()`, pass `crosshairStream` to `gpuCrosshairRoi.upload(...)` and `crosshairMatcher->match(...)`.
+  - Move the synchronization (either via `crosshairStream.waitForCompletion()` or via the implicit sync in `cv::cuda::minMaxLoc`) to immediately before the `mouseController->setCrosshairPosition` / `mouseController->aim` calls.
+  - Verify `gpuCrosshairResult` lives long enough that the async match completes before the next iteration overwrites it (since `cv::cuda::GpuMat` doesn't refcount per stream, the safe pattern is one result buffer per outstanding match, or sync at the end of the loop).
+
+#### Verification
+
+- Detection latency on CS2 drops by ~0.2–0.3 ms vs c27.
+- Crosshair coords identical to c27 within ±1 px on a fixed scene (same matcher, same data, just a different stream).
+- No regression during recoil patterns — the sync point is before `mouseController->aim()`, so the aim path always sees a fresh result.
+
+#### Risk register
+
+- **Stream lifetime + result buffer reuse**: if you don't sync per iteration the next iteration's `match()` write races with the current iteration's `minMaxLoc` read. Easy bug — pin the loop to one outstanding match by syncing at the end if you prefer simplicity over maximum overlap.
+- **Diminishing return**: this commit is small (~0.2–0.3 ms). If you've also landed c25 and c26, consider whether the overlap is worth the extra stream complexity vs. just leaving c27 synchronous. For this project, latency is the goal so the answer is yes — but it's the smallest win in the deferred set.
+- **OpenCV `minMaxLoc` stream support**: verify the `cv::cuda::minMaxLoc` overload your OpenCV build exposes. Older builds had a `cv::cuda::Stream` parameter; newer builds may have moved it to a separate `Async` variant. If neither overlaps cleanly, write a 20-line reduction kernel that reads `gpuCrosshairResult` on `crosshairStream` and writes the peak's `(x, y)` to a 2-int device buffer, then `cudaMemcpyAsync` to host.
 
 ---
 
