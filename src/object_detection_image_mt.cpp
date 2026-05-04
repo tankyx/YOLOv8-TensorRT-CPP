@@ -206,13 +206,12 @@ void ObjectDetectionSystem::captureThread() {
     while (running) {
         auto start = std::chrono::high_resolution_clock::now();
 
-        capture->CaptureScreen(*currentFrame);
+        bool got = capture->CaptureScreen(*currentFrame);
 
-        if (!currentFrame->empty()) {
+        if (got && !currentFrame->empty()) {
             captureQueue.push(std::move(*currentFrame));
+            std::swap(currentFrame, nextFrame);
         }
-
-        std::swap(currentFrame, nextFrame);
 
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = end - start;
