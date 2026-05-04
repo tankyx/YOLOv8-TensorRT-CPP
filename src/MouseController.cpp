@@ -2,10 +2,12 @@
 
 
 MouseController::MouseController(int screenWidth, int screenHeight, int detectionZoneWidth, int detectionZoneHeight, float sensitivity,
-                                 int centralSquareSize, float minGain, float maxGain, float maxSpeed, int HL1, int HL2, int cpi, int nLab)
+                                 int centralSquareSize, float minGain, float maxGain, float maxSpeed, int HL1, int HL2, int cpi, int nLab,
+                                 float probabilityThreshold)
     : screenWidth(screenWidth), screenHeight(screenHeight), detectionZoneWidth(detectionZoneWidth),
       detectionZoneHeight(detectionZoneHeight), sensitivity(sensitivity), centralSquareSize(centralSquareSize),
-      minGain(minGain), maxSpeed(maxSpeed), maxGain(maxGain), hidDevice(nullptr), headLabel1(HL1), headLabel2(HL2), cpi(cpi), nLabels(nLab) {
+      minGain(minGain), maxSpeed(maxSpeed), maxGain(maxGain), hidDevice(nullptr), headLabel1(HL1), headLabel2(HL2), cpi(cpi), nLabels(nLab),
+      probabilityThreshold(probabilityThreshold) {
     // Calculate the top-left corner of the detection zone
     detectionZoneX = (screenWidth - detectionZoneWidth) / 2;
     detectionZoneY = (screenHeight - detectionZoneHeight) / 2;
@@ -201,7 +203,7 @@ void MouseController::aim(const std::vector<Object> &detections) {
     isLeftClicking = true;
     Object closestDetection = findClosestDetection(detections);
 
-    if (closestDetection.probability > 0.25f) {
+    if (closestDetection.probability > probabilityThreshold) {
         // Calculate target center
         int targetX = closestDetection.rect.x + closestDetection.rect.width / 2;
         int targetY = closestDetection.rect.y + closestDetection.rect.height / 2;

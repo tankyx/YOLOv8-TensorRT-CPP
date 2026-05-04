@@ -115,7 +115,9 @@ void ObjectDetectionSystem::initializeSystem() {
     mouseController = std::make_unique<MouseController>(
         screenWidth, screenHeight, captureWidth, captureHeight, config.getFloat("MouseSensitivity", 0.80f), config.getInt("AimFOV", 55),
         config.getFloat("MinGain", 0.25f), config.getFloat("MaxGain", 0.65f), config.getInt("MaxSpeed", 15),
-        config.getInt("HeadLabelID1", 0), config.getInt("HeadLabelID2", 1), config.getInt("CPI", 3000), config.getStringArray("Labels").size());
+        config.getInt("HeadLabelID1", 0), config.getInt("HeadLabelID2", 1), config.getInt("CPI", 3000),
+        static_cast<int>(config.getStringArray("Labels").size()),
+        yoloConfig.probabilityThreshold);
 
     if (trackCrosshair) {
         templateImg = cv::imread(config.getString("CrosshairTemplate", "crosshair.png"), cv::IMREAD_COLOR);

@@ -19,8 +19,8 @@
 class MouseController {
 public:
     MouseController(int screenWidth, int screenHeight, int detectionZoneWidth, int detectionZoneHeight, float sensitivity,
-                    int centralSquareSize, float minGain, float maxGain, float maxSpeed, int HL1, int HL2, int cpi, 
-                    int nLab);
+                    int centralSquareSize, float minGain, float maxGain, float maxSpeed, int HL1, int HL2, int cpi,
+                    int nLab, float probabilityThreshold);
     ~MouseController();
     void aim(const std::vector<Object> &detections);
     void triggerLeftClickIfCenterWithinDetection(const std::vector<Object> &detections);
@@ -51,6 +51,7 @@ private:
     int headLabel1;
     int headLabel2;
     int nLabels;
+    float probabilityThreshold;
 
     int cpi;
 
