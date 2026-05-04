@@ -1,6 +1,7 @@
 #include "yolov8.h"
 #include "threadsafe_queue.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <iostream>
 #include <vector>
@@ -55,6 +56,11 @@ private:
 
     bool isLeftClicking;
     bool hidWarningLogged = false;
+
+    // Non-blocking trigger-click state machine (c12)
+    bool triggerPressed = false;
+    std::chrono::steady_clock::time_point triggerReleaseAt{};
+    std::chrono::steady_clock::time_point triggerNextAllowedAt{};
 
     bool isLeftMouseButtonPressed();
     bool isMouseButton4Pressed();

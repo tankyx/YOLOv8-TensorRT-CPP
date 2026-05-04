@@ -263,21 +263,37 @@ Object MouseController::findClosestDetection(const std::vector<Object> &detectio
 }
 
 void MouseController::triggerLeftClickIfCenterWithinDetection(const std::vector<Object> &detections) {
-    if (isMouseButton4Pressed()) {
-        int centerX = crosshairX;
-        int centerY = crosshairY;
+    using namespace std::chrono;
+    constexpr auto holdDuration = milliseconds(100);
+    constexpr auto cooldownAfterRelease = milliseconds(120);
 
-        for (const auto &detection : detections) {
-            if (detection.label < nLabels) { // Replace with actual label values
-                if (centerX >= detection.rect.x && centerX <= detection.rect.x + detection.rect.width && centerY >= detection.rect.y &&
-                    centerY <= detection.rect.y + detection.rect.height) {
-                    leftClick();
-                    Sleep(100);
-                    releaseLeftClick();
-                    Sleep(120);
-                    break;
-                }
-            }
+    const auto now = steady_clock::now();
+
+    // If a press is in flight, see whether it's time to release. This runs every detection
+    // tick instead of blocking the thread with Sleep().
+    if (triggerPressed && now >= triggerReleaseAt) {
+        releaseLeftClick();
+        triggerPressed = false;
+        triggerNextAllowedAt = now + cooldownAfterRelease;
+    }
+
+    if (!isMouseButton4Pressed() || triggerPressed || now < triggerNextAllowedAt) {
+        return;
+    }
+
+    const int centerX = crosshairX;
+    const int centerY = crosshairY;
+
+    for (const auto &detection : detections) {
+        if (detection.label >= nLabels) {
+            continue;
+        }
+        if (centerX >= detection.rect.x && centerX <= detection.rect.x + detection.rect.width &&
+            centerY >= detection.rect.y && centerY <= detection.rect.y + detection.rect.height) {
+            leftClick();
+            triggerPressed = true;
+            triggerReleaseAt = now + holdDuration;
+            break;
         }
     }
 }
