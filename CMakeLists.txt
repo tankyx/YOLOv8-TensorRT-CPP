@@ -106,13 +106,6 @@ add_executable(detect_object_image
     src/MouseController.cpp
 )
 
-# Set compile definitions
-target_compile_definitions(detect_object_image PRIVATE
-    CUDA_HAS_FP16=1
-    ENABLE_DEBUG=1
-    USE_CUDA=1
-)
-
 # Link CUDA runtime to libraries
 target_link_libraries(engine_cuda_kernels PUBLIC
     CUDA::cudart
@@ -194,6 +187,3 @@ endif()
 foreach(DEP_FILE ${DEP_FILES})
     message(STATUS "Will copy dependency: ${DEP_FILE}")
 endforeach()
-
-# Optional: Enable testing
-enable_testing()
