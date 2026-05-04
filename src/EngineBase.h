@@ -87,7 +87,7 @@ public:
         return out;
     }
 
-    template <typename T> 
+    template <typename T>
     static void transformOutput(std::vector<std::vector<std::vector<T>>> &input, std::vector<T> &output)
     {
         if (input.size() != 1 || input[0].size() != 1) {
@@ -96,8 +96,6 @@ public:
 
         output = std::move(input[0][0]);
     }
-
-    virtual void setCaptureDimensions(int height, int width) = 0;
 
 protected:
     static cv::cuda::GpuMat blobFromGpuMats(const std::vector<cv::cuda::GpuMat> &batchInput, const std::array<float, 3> &subVals,

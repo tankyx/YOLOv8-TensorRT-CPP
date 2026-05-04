@@ -225,11 +225,6 @@ public:
 
     [[nodiscard]] const std::vector<nvinfer1::Dims> &getOutputDims() const override { return m_outputDims; }
 
-    void setCaptureDimensions(int height, int width) override {
-        captureHeight = height;
-        captureWidth = width;
-    }
-
 private:
     bool build(std::string onnxModelPath, const std::array<float, 3> &subVals, const std::array<float, 3> &divVals, bool normalize) {
         auto builder = std::unique_ptr<nvinfer1::IBuilder>(nvinfer1::createInferBuilder(m_logger));
@@ -432,7 +427,4 @@ private:
     std::unique_ptr<nvinfer1::IExecutionContext> m_context = nullptr;
     const Options m_options;
     Logger m_logger;
-
-    int captureHeight;
-    int captureWidth;
 };
