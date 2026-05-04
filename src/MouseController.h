@@ -62,8 +62,6 @@ private:
     bool isLeftMouseButtonPressed();
     bool isMouseButton4Pressed();
     bool isMouseButton5Pressed();
-    void moveMouseRelative(int dx, int dy);
-    void moveMouseAbsolute(int x, int y);
     void leftClick();
     void releaseLeftClick();
     Object findClosestDetection(const std::vector<Object> &detections);
@@ -71,7 +69,6 @@ private:
     bool ConnectToDevice();
     bool processHIDReport(std::vector<uint8_t> &report);
     void processHIDReports();
-    void resetSpeed();
     float calculateSpeedScaling(const cv::Rect &rect);
 };
 

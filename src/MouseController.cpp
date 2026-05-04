@@ -124,18 +124,6 @@ void MouseController::setCrosshairPosition(int x, int y) {
     crosshairY = y;
 }
 
-// Implementation of resetSpeed method
-void MouseController::resetSpeed() {
-    currentSpeedX = 0.0f;
-    currentSpeedY = 0.0f;
-    integralX = 0.0f;
-    integralY = 0.0f;
-    prevErrorX = 0.0f;
-    prevErrorY = 0.0f;
-    _dx = 0;
-    _dy = 0;
-}
-
 void MouseController::processHIDReports() {
     while (running) {
         auto report = reportQueue.pop();
@@ -254,24 +242,6 @@ void MouseController::aim(const std::vector<Object> &detections) {
 bool MouseController::isLeftMouseButtonPressed() { return (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0; }
 bool MouseController::isMouseButton4Pressed() { return (GetAsyncKeyState(VK_XBUTTON1) & 0x8000) != 0; } // Mouse Button 4
 bool MouseController::isMouseButton5Pressed() { return (GetAsyncKeyState(VK_XBUTTON2) & 0x8000) != 0; } // Mouse Button 5
-
-void MouseController::moveMouseRelative(int dx, int dy) {
-    INPUT input = {0};
-    input.type = INPUT_MOUSE;
-    input.mi.dwFlags = MOUSEEVENTF_MOVE;
-    input.mi.dx = dx;
-    input.mi.dy = dy;
-    SendInput(1, &input, sizeof(INPUT));
-}
-
-void MouseController::moveMouseAbsolute(int x, int y) {
-    INPUT input = {0};
-    input.type = INPUT_MOUSE;
-    input.mi.dwFlags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE;
-    input.mi.dx = static_cast<LONG>((x * 65535) / screenWidth);
-    input.mi.dy = static_cast<LONG>((y * 65535) / screenHeight);
-    SendInput(1, &input, sizeof(INPUT));
-}
 
 void MouseController::leftClick() { sendHIDReport(0, 0, 0x01); }
 
