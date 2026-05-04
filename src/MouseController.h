@@ -30,11 +30,6 @@ public:
     int getMovementY() const { return _dy; }
 
 private:
-    static const int SMOOTHING_WINDOW = 3; // Number of frames to average
-    std::deque<float> speedXHistory;
-    std::deque<float> speedYHistory;
-    float speedDampingFactor;
-    float accelerationLimit;
     int screenWidth;
     int screenHeight;
     int detectionZoneWidth;
@@ -50,20 +45,7 @@ private:
     int maxSpeed;
     float minGain;
     float maxGain;
-    int currentSpeedX;
-    int currentSpeedY;
     HANDLE hidDevice;
-    float alpha; // Smoothing factor (between 0 and 1)
-    float smoothedTargetX;
-    float smoothedTargetY;
-
-    // PID Controller state
-    float integralX;
-    float integralY;
-    float prevErrorX;
-    float prevErrorY;
-
-    DWORD lastTime;
 
     int headLabel1;
     int headLabel2;

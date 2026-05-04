@@ -13,13 +13,6 @@ MouseController::MouseController(int screenWidth, int screenHeight, int detectio
     crosshairX = screenWidth / 2;
     crosshairY = screenHeight / 2;
 
-    integralX = 0.0f;
-    integralY = 0.0f;
-    alpha = 0.35f;
-    prevErrorX= 0.0f;
-    prevErrorY = 0.0f;
-    smoothedTargetX = 0.0f;
-    smoothedTargetY = 0.0f;
     isLeftClicking = false;
 
     ConnectToDevice();
