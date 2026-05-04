@@ -22,6 +22,7 @@ public:
 
     bool buildLoadNetwork(std::string onnxModelPath, const std::array<float, 3> &subVals = {0.f, 0.f, 0.f},
                           const std::array<float, 3> &divVals = {1.f, 1.f, 1.f}, bool normalize = true) override {
+        m_onnxHash = Util::fnv1a64HexOfFile(onnxModelPath);
         const auto engineName = serializeEngineOptions(m_options, onnxModelPath);
         std::cout << "Searching for engine file with name: " << engineName << std::endl;
 
@@ -341,6 +342,9 @@ private:
         engineName += ".fp16"; // Always FP16 for this engine
         engineName += "." + std::to_string(options.maxBatchSize);
         engineName += "." + std::to_string(options.optBatchSize);
+        if (!m_onnxHash.empty()) {
+            engineName += "." + m_onnxHash;
+        }
 
         return engineName;
     }
@@ -427,4 +431,5 @@ private:
     std::unique_ptr<nvinfer1::IExecutionContext> m_context = nullptr;
     const Options m_options;
     Logger m_logger;
+    std::string m_onnxHash;
 };

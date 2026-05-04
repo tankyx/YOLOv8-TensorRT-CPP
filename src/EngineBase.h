@@ -4,15 +4,18 @@
 
 #include <NvInfer.h>
 #include <array>
+#include <cstdint>
 #include <cuda_runtime.h>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
 #include <memory>
 #include <opencv2/core/cuda.hpp>
-#include <vector>
 #include <opencv2/cudaarithm.hpp>
 #include <opencv2/cudaimgproc.hpp>
 #include <opencv2/cudawarping.hpp>
-#include <iostream>
-#include <fstream>
+#include <sstream>
+#include <vector>
 
 namespace Util {
 inline bool doesFileExist(const std::string &filepath) {
@@ -27,6 +30,31 @@ inline void checkCudaErrorCode(cudaError_t code) {
         std::cout << errMsg << std::endl;
         throw std::runtime_error(errMsg);
     }
+}
+
+// 64-bit FNV-1a over the bytes of `path`. Used to invalidate the cached TensorRT engine plan
+// when the source ONNX changes — keying the cache filename on file path + options alone meant
+// editing the .onnx in place silently loaded a stale plan.
+inline std::string fnv1a64HexOfFile(const std::string &path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        return std::string("nohash");
+    }
+    constexpr uint64_t kOffset = 1469598103934665603ULL;
+    constexpr uint64_t kPrime = 1099511628211ULL;
+    uint64_t h = kOffset;
+    char buf[8192];
+    while (f) {
+        f.read(buf, sizeof(buf));
+        std::streamsize n = f.gcount();
+        for (std::streamsize i = 0; i < n; ++i) {
+            h ^= static_cast<uint8_t>(buf[i]);
+            h *= kPrime;
+        }
+    }
+    std::ostringstream oss;
+    oss << std::hex << std::setw(16) << std::setfill('0') << h;
+    return oss.str();
 }
 } // namespace Util
 
