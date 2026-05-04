@@ -233,13 +233,20 @@ protected:
 
 private:
     void clearGpuBuffers() {
-        if (!m_buffers.empty() && m_engine) {
-            const auto numInputs = m_inputDims.size();
-            for (int32_t outputBinding = numInputs; outputBinding < m_engine->getNbIOTensors(); ++outputBinding) {
-                Util::checkCudaErrorCode(cudaFree(m_buffers[outputBinding]));
-            }
-            m_buffers.clear();
+        if (m_buffers.empty() || !m_engine) {
+            return;
         }
+        cudaStream_t stream;
+        Util::checkCudaErrorCode(cudaStreamCreate(&stream));
+        const auto numInputs = m_inputDims.size();
+        for (int32_t outputBinding = numInputs; outputBinding < m_engine->getNbIOTensors(); ++outputBinding) {
+            if (m_buffers[outputBinding]) {
+                Util::checkCudaErrorCode(cudaFreeAsync(m_buffers[outputBinding], stream));
+            }
+        }
+        Util::checkCudaErrorCode(cudaStreamSynchronize(stream));
+        Util::checkCudaErrorCode(cudaStreamDestroy(stream));
+        m_buffers.clear();
     }
 
     static void convertFP32ToFP16(const cv::cuda::GpuMat &input, cv::cuda::GpuMat &output) {
