@@ -9,7 +9,7 @@ Engineering work deferred from the `cleanup-optim-robustness` branch, plus two a
 2. [INT8 inference path](#2-int8-inference-path)
 3. [Newer YOLO versions](#3-newer-yolo-versions)
 
-Everything below assumes the post-cleanup state of the tree (engines unified under `EngineBase`, persistent `m_stream`, FP16 input/output GPU kernels, no overlay, **GPU crosshair tracking via `cv::cuda::TemplateMatching`** — c27).
+Everything below assumes the post-cleanup state of the tree (engines unified under `EngineBase`, persistent `m_stream`, FP16 input/output GPU kernels, GPU crosshair tracking via `cv::cuda::TemplateMatching` — c27, **Discord-shared-memory debug overlay** — c30, no top-level transparent overlay window).
 
 ---
 

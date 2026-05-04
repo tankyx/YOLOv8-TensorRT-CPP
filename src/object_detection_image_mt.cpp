@@ -8,6 +8,7 @@
 #include <opencv2/opencv.hpp>
 
 #include "DXGICapture.h"
+#include "DiscordOverlay.h"
 #include "INIParser.h" // Make sure to include the INI parser we created earlier
 #include "MouseController.h"
 #include "threadsafe_queue.h"
@@ -47,6 +48,8 @@ private:
     std::unique_ptr<YoloV8> yoloV8;
     std::unique_ptr<DXGICapture> capture;
     std::unique_ptr<MouseController> mouseController;
+    std::unique_ptr<DiscordOverlay> debugOverlay;
+    std::vector<std::string> labelNames;
 
     cv::Mat templateImg;
     // GPU template-matching state for crosshair tracking (c27). Lives on the detection thread;
@@ -76,6 +79,7 @@ private:
     bool pinThreads;
     bool trackCrosshair;
     bool debugView;
+    std::string debugOverlayTargetProcess;
 };
 
 ObjectDetectionSystem::ObjectDetectionSystem(const std::string &iniFile) : running(true) {
@@ -98,9 +102,12 @@ void ObjectDetectionSystem::loadConfigFromINI(const std::string &iniFile) {
     pinThreads = config.getBool("PinThreads", false);
     captureThreadCore = config.getInt("CaptureThreadCore", 0);
 
-    // Debug viewer (c29) — INI-gated cv::imshow window for verifying detection visually.
-    // Off by default; turning on costs ~1–3 ms per frame on the detection thread.
-    debugView = config.getBool("DebugView", false);
+    // Debug viewer (c29 -> c30) — INI-gated Discord-overlay debug renderer for verifying
+    // detection visually. Off by default. Requires the legacy Discord in-game overlay
+    // enabled and Discord running. Cost when on: ~50–150 KB/frame memcpy + a render thread
+    // at ~120 Hz; the detection thread itself only does cheap atomics + a mutex'd vector copy.
+    debugView                 = config.getBool("DebugView", false);
+    debugOverlayTargetProcess = config.getString("DebugOverlayTargetProcess", "cs2.exe");
 }
 
 void ObjectDetectionSystem::initializeSystem() {
@@ -148,6 +155,27 @@ void ObjectDetectionSystem::initializeSystem() {
     capture = std::make_unique<DXGICapture>();
 
     detectionQueue.setMoveThresholdPx(config.getInt("DetectionMoveThresholdPx", 5));
+
+    labelNames = config.getStringArray("Labels");
+
+    if (debugView) {
+        const DWORD pid = DiscordOverlay::findProcessIdByName(debugOverlayTargetProcess);
+        if (pid == 0) {
+            std::cerr << "DebugView: target process '" << debugOverlayTargetProcess
+                      << "' not running; overlay disabled. Launch the game first or set"
+                         " DebugOverlayTargetProcess in the INI."
+                      << std::endl;
+        } else {
+            debugOverlay = std::make_unique<DiscordOverlay>(pid);
+            if (!debugOverlay->start()) {
+                std::cerr << "DebugView: Discord overlay failed to start; continuing without overlay."
+                          << std::endl;
+                debugOverlay.reset();
+            } else {
+                debugOverlay->setLabelNames(labelNames);
+            }
+        }
+    }
 }
 
 void ObjectDetectionSystem::startThreads() {
@@ -178,7 +206,10 @@ void ObjectDetectionSystem::mainLoop() {
 
 void ObjectDetectionSystem::cleanup() {
     logQueue.push("exit");
-    cv::destroyAllWindows();
+    if (debugOverlay) {
+        debugOverlay->stop();
+        debugOverlay.reset();
+    }
     if (captureThreadObj.joinable())
         captureThreadObj.join();
     if (detectionThreadObj.joinable())
@@ -288,20 +319,31 @@ void ObjectDetectionSystem::detectionThread() {
 
             detectionQueue.push(detections);
 
-            if (debugView) {
-                // Mutates the underlying frame buffer (croppedFrame is a view), but we drop the
-                // frame after this iteration so it's harmless. Drawing the crosshair as a small
-                // cross helps eyeball whether the GPU template match (c27) is locking on.
-                yoloV8->drawObjectLabels(croppedFrame, detections, 1);
-                cv::drawMarker(croppedFrame, crosshairPos, cv::Scalar(0, 255, 255), cv::MARKER_CROSS, 16, 1);
-                cv::imshow("YOLOv8-TRT debug", croppedFrame);
-                cv::waitKey(1);
-            }
-
             auto detectionEndTime = std::chrono::high_resolution_clock::now();
             auto detectionDuration = detectionEndTime - detectionStartTime;
 
             detectionLatency.push(std::chrono::duration_cast<std::chrono::milliseconds>(detectionDuration).count());
+
+            if (debugOverlay && debugOverlay->isRunning()) {
+                // Translate detections + crosshair from cropped-ROI space to game-framebuffer
+                // space. For fullscreen play at native resolution, framebuffer == screen.
+                std::vector<DiscordOverlay::DetectionBox> boxes;
+                boxes.reserve(detections.size());
+                for (const auto &d : detections) {
+                    DiscordOverlay::DetectionBox b{};
+                    b.x          = d.rect.x + static_cast<float>(x);
+                    b.y          = d.rect.y + static_cast<float>(y);
+                    b.w          = d.rect.width;
+                    b.h          = d.rect.height;
+                    b.label      = d.label;
+                    b.confidence = d.probability;
+                    boxes.push_back(b);
+                }
+                debugOverlay->setDetections(std::move(boxes));
+                debugOverlay->setCrosshair(static_cast<float>(crosshairPos.x + x),
+                                            static_cast<float>(crosshairPos.y + y));
+                debugOverlay->setStats(detectionLatency.getAverageLatency(), 0);
+            }
         }
     } catch (const std::exception &e) {
         std::cerr << "detectionThread: fatal exception: " << e.what() << ". Stopping." << std::endl;
