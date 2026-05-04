@@ -68,8 +68,10 @@ if(WIN32)
     endif()
 endif()
 
-# Set CUDA specific flags
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -arch=sm_89")  # Adjust SM architecture as needed
+# Set CUDA architecture (default sm_89 / RTX 40 series; override with -DCMAKE_CUDA_ARCHITECTURES=XX)
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA architectures to build for")
+endif()
 
 # Create CUDA kernels library
 add_library(engine_cuda_kernels STATIC
