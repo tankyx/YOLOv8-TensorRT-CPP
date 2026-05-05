@@ -12,11 +12,12 @@
 
 class EngineFP32 : public EngineBase {
 public:
-    explicit EngineFP32(const Options &options) : m_options(options) {}
-    ~EngineFP32() { clearGpuBuffers(); }
+    explicit EngineFP32(const Options &options) : EngineBase(options) {}
+    ~EngineFP32() override { clearGpuBuffers(); }
 
     bool buildLoadNetwork(std::string onnxModelPath, const std::array<float, 3> &subVals = {0.f, 0.f, 0.f},
                           const std::array<float, 3> &divVals = {1.f, 1.f, 1.f}, bool normalize = true) override {
+        m_onnxHash = Util::fnv1a64HexOfFile(onnxModelPath);
         const auto engineName = serializeEngineOptions(m_options, onnxModelPath);
         std::cout << "Searching for engine file with name: " << engineName << std::endl;
 
@@ -26,10 +27,8 @@ public:
             if (!Util::doesFileExist(onnxModelPath)) {
                 throw std::runtime_error("Could not find onnx model at path: " + onnxModelPath);
             }
-
             std::cout << "Engine not found, generating. This could take a while..." << std::endl;
-            auto ret = build(onnxModelPath, subVals, divVals, normalize);
-            if (!ret) {
+            if (!buildSerialized(onnxModelPath)) {
                 return false;
             }
         }
@@ -91,10 +90,6 @@ public:
         m_outputDims.clear();
         m_IOTensorNames.clear();
 
-        cudaStream_t stream;
-        Util::checkCudaErrorCode(cudaStreamCreate(&stream));
-
-        m_outputLengths.clear();
         for (int i = 0; i < m_engine->getNbIOTensors(); ++i) {
             const auto tensorName = m_engine->getIOTensorName(i);
             m_IOTensorNames.emplace_back(tensorName);
@@ -121,12 +116,11 @@ public:
                 }
 
                 m_outputLengths.push_back(outputLength);
-                Util::checkCudaErrorCode(cudaMallocAsync(&m_buffers[i], outputLength * m_options.maxBatchSize * sizeof(float), stream));
+                Util::checkCudaErrorCode(cudaMallocAsync(&m_buffers[i], outputLength * m_options.maxBatchSize * sizeof(float), m_stream));
             }
         }
 
-        Util::checkCudaErrorCode(cudaStreamSynchronize(stream));
-        Util::checkCudaErrorCode(cudaStreamDestroy(stream));
+        Util::checkCudaErrorCode(cudaStreamSynchronize(m_stream));
 
         return true;
     }
@@ -162,9 +156,6 @@ public:
             }
         }
 
-        cudaStream_t inferenceCudaStream;
-        Util::checkCudaErrorCode(cudaStreamCreate(&inferenceCudaStream));
-
         std::vector<cv::cuda::GpuMat> preprocessedInputs;
         for (size_t i = 0; i < numInputs; ++i) {
             const auto &batchInput = inputs[i];
@@ -194,7 +185,7 @@ public:
             }
         }
 
-        if (!m_context->enqueueV3(inferenceCudaStream)) {
+        if (!m_context->enqueueV3(m_stream)) {
             return false;
         }
 
@@ -206,14 +197,13 @@ public:
                 Util::checkCudaErrorCode(cudaMemcpyAsync(
                     output.data(),
                     static_cast<char *>(m_buffers[outputBinding]) + (batch * sizeof(float) * m_outputLengths[outputBinding - numInputs]),
-                    m_outputLengths[outputBinding - numInputs] * sizeof(float), cudaMemcpyDeviceToHost, inferenceCudaStream));
+                    m_outputLengths[outputBinding - numInputs] * sizeof(float), cudaMemcpyDeviceToHost, m_stream));
                 batchOutputs.emplace_back(std::move(output));
             }
             featureVectors.emplace_back(std::move(batchOutputs));
         }
 
-        Util::checkCudaErrorCode(cudaStreamSynchronize(inferenceCudaStream));
-        Util::checkCudaErrorCode(cudaStreamDestroy(inferenceCudaStream));
+        Util::checkCudaErrorCode(cudaStreamSynchronize(m_stream));
 
         return true;
     }
@@ -222,184 +212,40 @@ public:
 
     [[nodiscard]] const std::vector<nvinfer1::Dims> &getOutputDims() const override { return m_outputDims; }
 
-    void setCaptureDimensions(int height, int width) override {
-        captureHeight = height;
-        captureWidth = width;
+protected:
+    const char *precisionSuffix() const override { return "fp32"; }
+
+    void applyPrecisionFlags(nvinfer1::IBuilder & /*builder*/, nvinfer1::IBuilderConfig & /*config*/) override {
+        // FP32 is the default; no flags to set.
     }
 
 private:
-    bool build(std::string onnxModelPath, const std::array<float, 3> &subVals, const std::array<float, 3> &divVals, bool normalize) {
-        auto builder = std::unique_ptr<nvinfer1::IBuilder>(nvinfer1::createInferBuilder(m_logger));
-        if (!builder) {
-            return false;
-        }
-
-        auto explicitBatch = 1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
-        auto network = std::unique_ptr<nvinfer1::INetworkDefinition>(builder->createNetworkV2(explicitBatch));
-        if (!network) {
-            return false;
-        }
-
-        auto parser = std::unique_ptr<nvonnxparser::IParser>(nvonnxparser::createParser(*network, m_logger));
-        if (!parser) {
-            return false;
-        }
-
-        std::ifstream file(onnxModelPath, std::ios::binary | std::ios::ate);
-        std::streamsize size = file.tellg();
-        file.seekg(0, std::ios::beg);
-
-        std::vector<char> buffer(size);
-        if (!file.read(buffer.data(), size)) {
-            throw std::runtime_error("Unable to read engine file");
-        }
-
-        auto parsed = parser->parse(buffer.data(), buffer.size());
-        if (!parsed) {
-            return false;
-        }
-
-        const auto numInputs = network->getNbInputs();
-        if (numInputs < 1) {
-            throw std::runtime_error("Error, model needs at least 1 input!");
-        }
-
-        auto config = std::unique_ptr<nvinfer1::IBuilderConfig>(builder->createBuilderConfig());
-        if (!config) {
-            return false;
-        }
-
-        nvinfer1::IOptimizationProfile *optProfile = builder->createOptimizationProfile();
-
-        const auto input0Batch = network->getInput(0)->getDimensions().d[0];
-        bool doesSupportDynamicBatch = (input0Batch == -1);
-
-        for (int32_t i = 0; i < numInputs; ++i) {
-            const auto input = network->getInput(i);
-            const auto inputName = input->getName();
-            const auto inputDims = input->getDimensions();
-            int32_t inputC = inputDims.d[1];
-            int32_t inputH = inputDims.d[2];
-            int32_t inputW = inputDims.d[3];
-
-            if (doesSupportDynamicBatch) {
-                optProfile->setDimensions(inputName, nvinfer1::OptProfileSelector::kMIN, nvinfer1::Dims4(1, inputC, inputH, inputW));
-            } else {
-                optProfile->setDimensions(inputName, nvinfer1::OptProfileSelector::kMIN,
-                                          nvinfer1::Dims4(m_options.optBatchSize, inputC, inputH, inputW));
-            }
-
-            optProfile->setDimensions(inputName, nvinfer1::OptProfileSelector::kOPT,
-                                      nvinfer1::Dims4(m_options.optBatchSize, inputC, inputH, inputW));
-            optProfile->setDimensions(inputName, nvinfer1::OptProfileSelector::kMAX,
-                                      nvinfer1::Dims4(m_options.maxBatchSize, inputC, inputH, inputW));
-        }
-        config->addOptimizationProfile(optProfile);
-
-        // FP32 specific - no precision flags needed as FP32 is default
-
-        cudaStream_t profileStream;
-        Util::checkCudaErrorCode(cudaStreamCreate(&profileStream));
-        config->setProfileStream(profileStream);
-
-        std::unique_ptr<nvinfer1::IHostMemory> plan{builder->buildSerializedNetwork(*network, *config)};
-        if (!plan) {
-            return false;
-        }
-
-        const auto engineName = serializeEngineOptions(m_options, onnxModelPath);
-        std::ofstream outfile(engineName, std::ofstream::binary);
-        outfile.write(reinterpret_cast<const char *>(plan->data()), plan->size());
-
-        Util::checkCudaErrorCode(cudaStreamDestroy(profileStream));
-        return true;
-    }
-
-    std::string serializeEngineOptions(const Options &options, const std::string &onnxModelPath) {
-        const auto filenamePos = onnxModelPath.find_last_of('/') + 1;
-        std::string engineName = onnxModelPath.substr(filenamePos, onnxModelPath.find_last_of('.') - filenamePos) + ".engine";
-
-        std::vector<std::string> deviceNames;
-        getDeviceNames(deviceNames);
-
-        if (static_cast<size_t>(options.deviceIndex) >= deviceNames.size()) {
-            throw std::runtime_error("Error, provided device index is out of range!");
-        }
-
-        auto deviceName = deviceNames[options.deviceIndex];
-        deviceName.erase(std::remove_if(deviceName.begin(), deviceName.end(), ::isspace), deviceName.end());
-        engineName += "." + deviceName;
-        engineName += ".fp32";
-        engineName += "." + std::to_string(options.maxBatchSize);
-        engineName += "." + std::to_string(options.optBatchSize);
-
-        return engineName;
-    }
-
-    void getDeviceNames(std::vector<std::string> &deviceNames) {
-        int numGPUs;
-        cudaGetDeviceCount(&numGPUs);
-        for (int device = 0; device < numGPUs; device++) {
-            cudaDeviceProp prop;
-            cudaGetDeviceProperties(&prop, device);
-            deviceNames.push_back(std::string(prop.name));
-        }
-    }
-
     void clearGpuBuffers() {
-        if (!m_buffers.empty()) {
-            const auto numInputs = m_inputDims.size();
-            for (int32_t outputBinding = numInputs; outputBinding < m_engine->getNbIOTensors(); ++outputBinding) {
-                Util::checkCudaErrorCode(cudaFree(m_buffers[outputBinding]));
+        if (m_buffers.empty() || !m_engine || !m_stream) {
+            return;
+        }
+        const auto numInputs = m_inputDims.size();
+        for (int32_t outputBinding = numInputs; outputBinding < m_engine->getNbIOTensors(); ++outputBinding) {
+            if (m_buffers[outputBinding]) {
+                Util::checkCudaErrorCode(cudaFreeAsync(m_buffers[outputBinding], m_stream));
             }
-            m_buffers.clear();
         }
+        Util::checkCudaErrorCode(cudaStreamSynchronize(m_stream));
+        m_buffers.clear();
     }
 
-    static cv::cuda::GpuMat blobFromGpuMats(const std::vector<cv::cuda::GpuMat> &batchInput, const std::array<float, 3> &subVals,
-                                            const std::array<float, 3> &divVals, bool normalize) {
-        cv::cuda::GpuMat gpu_dst(1, batchInput[0].rows * batchInput[0].cols * batchInput.size(), CV_8UC3);
-
-        size_t width = batchInput[0].cols * batchInput[0].rows;
-        for (size_t img = 0; img < batchInput.size(); img++) {
-            std::vector<cv::cuda::GpuMat> input_channels{
-                cv::cuda::GpuMat(batchInput[0].rows, batchInput[0].cols, CV_8U, &(gpu_dst.ptr()[0 + width * 3 * img])),
-                cv::cuda::GpuMat(batchInput[0].rows, batchInput[0].cols, CV_8U, &(gpu_dst.ptr()[width + width * 3 * img])),
-                cv::cuda::GpuMat(batchInput[0].rows, batchInput[0].cols, CV_8U, &(gpu_dst.ptr()[width * 2 + width * 3 * img]))};
-            cv::cuda::split(batchInput[img], input_channels);
-        }
-
-        cv::cuda::GpuMat mfloat;
-        if (normalize) {
-            gpu_dst.convertTo(mfloat, CV_32FC3, 1.f / 255.f);
-        } else {
-            gpu_dst.convertTo(mfloat, CV_32FC3);
-        }
-
-        cv::cuda::subtract(mfloat, cv::Scalar(subVals[0], subVals[1], subVals[2]), mfloat, cv::noArray(), -1);
-        cv::cuda::divide(mfloat, cv::Scalar(divVals[0], divVals[1], divVals[2]), mfloat, 1, -1);
-
-        return mfloat;
-    }
-
-private:
     std::array<float, 3> m_subVals{};
     std::array<float, 3> m_divVals{};
-    bool m_normalize;
+    bool m_normalize{true};
 
     std::vector<void *> m_buffers;
     std::vector<uint32_t> m_outputLengths{};
     std::vector<nvinfer1::Dims3> m_inputDims;
     std::vector<nvinfer1::Dims> m_outputDims;
     std::vector<std::string> m_IOTensorNames;
-    int32_t m_inputBatchSize;
+    int32_t m_inputBatchSize{-1};
 
-    std::unique_ptr<nvinfer1::IRuntime> m_runtime = nullptr;
-    std::unique_ptr<nvinfer1::ICudaEngine> m_engine = nullptr;
-    std::unique_ptr<nvinfer1::IExecutionContext> m_context = nullptr;
-    const Options m_options;
-    Logger m_logger;
-
-    int captureHeight;
-    int captureWidth;
+    std::unique_ptr<nvinfer1::IRuntime> m_runtime;
+    std::unique_ptr<nvinfer1::ICudaEngine> m_engine;
+    std::unique_ptr<nvinfer1::IExecutionContext> m_context;
 };

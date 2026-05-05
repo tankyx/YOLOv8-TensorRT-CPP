@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <fstream>
+#include <iostream>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -60,16 +61,19 @@ public:
         return (it != data.end()) ? it->second : defaultValue;
     }
 
+    // Accepts decimal and 0x-prefixed hex (base 0). Logs a warning on parse failure.
     int getInt(const std::string &key, int defaultValue = 0) const {
         auto it = data.find(key);
-        if (it != data.end()) {
-            try {
-                return std::stoi(it->second);
-            } catch (...) {
-                return defaultValue;
-            }
+        if (it == data.end()) {
+            return defaultValue;
         }
-        return defaultValue;
+        try {
+            return std::stoi(it->second, nullptr, 0);
+        } catch (const std::exception &e) {
+            std::cerr << "INI: key '" << key << "' value '" << it->second << "' is not a valid int (" << e.what() << "); using default "
+                      << defaultValue << "." << std::endl;
+            return defaultValue;
+        }
     }
 
     bool getBool(const std::string &key, bool defaultValue = false) const {
@@ -84,14 +88,16 @@ public:
 
     float getFloat(const std::string &key, float defaultValue = 0.0f) const {
         auto it = data.find(key);
-        if (it != data.end()) {
-            try {
-                return std::stof(it->second);
-            } catch (...) {
-                return defaultValue;
-            }
+        if (it == data.end()) {
+            return defaultValue;
         }
-        return defaultValue;
+        try {
+            return std::stof(it->second);
+        } catch (const std::exception &e) {
+            std::cerr << "INI: key '" << key << "' value '" << it->second << "' is not a valid float (" << e.what() << "); using default "
+                      << defaultValue << "." << std::endl;
+            return defaultValue;
+        }
     }
 
     // New method to get an array of strings
@@ -101,11 +107,5 @@ public:
             return split(it->second, delimiter[0]);
         }
         return std::vector<std::string>();
-    }
-
-    // New method to get an array of strings as a single const string
-    std::string getStringArrayAsString(const std::string &key, const std::string &delimiter = ",") const {
-        auto it = data.find(key);
-        return (it != data.end()) ? it->second : "";
     }
 };

@@ -15,6 +15,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
 
 # Set the runtime library for MSVC
 if (MSVC)
@@ -31,6 +32,7 @@ find_package(CUDAToolkit REQUIRED)
 set(TENSORRT_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4" CACHE PATH "Path to TensorRT installation")
 set(TENSORRT_INCLUDE_DIRS "${TENSORRT_ROOT}/include")
 set(TENSORRT_LIB_DIR "${TENSORRT_ROOT}/lib")
+set(TENSORRT_BIN_DIR "${TENSORRT_ROOT}/bin")
 
 # Find TensorRT libraries with version numbers
 file(GLOB NVINFER_LIB "${TENSORRT_LIB_DIR}/nvinfer_10.lib")
@@ -56,28 +58,19 @@ include_directories(
     ${TENSORRT_INCLUDE_DIRS}
 )
 
-# Find DirectX libraries
-if(WIN32)
-    find_path(D3D_COMPILER_DIR NAMES d3dcompiler.lib PATHS "C:/Program Files (x86)/Windows Kits/10/Lib/10.0.22621.0/um/x64")
-    if(D3D_COMPILER_DIR)
-        set(D3D11_LIB ${D3D_COMPILER_DIR}/d3d11.lib)
-        set(D3DCOMPILER_LIB ${D3D_COMPILER_DIR}/d3dcompiler.lib)
-        set(DXGI_LIB ${D3D_COMPILER_DIR}/dxgi.lib)
-    else()
-        message(FATAL_ERROR "Could not find DirectX libraries. Make sure the DirectX SDK is installed.")
-    endif()
+# Set CUDA architecture (default sm_89 / RTX 40 series; override with -DCMAKE_CUDA_ARCHITECTURES=XX)
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA architectures to build for")
 endif()
-
-# Set CUDA specific flags
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -arch=sm_89")  # Adjust SM architecture as needed
 
 # Create CUDA kernels library
 add_library(engine_cuda_kernels STATIC
     src/EngineFP16Kernels.cu
 )
 
-set_target_properties(engine_cuda_kernels PROPERTIES 
+set_target_properties(engine_cuda_kernels PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
     POSITION_INDEPENDENT_CODE ON
 )
 
@@ -90,8 +83,9 @@ add_library(fusion_cuda STATIC
     src/SoftwareFuser.cu
 )
 
-set_target_properties(fusion_cuda PROPERTIES 
+set_target_properties(fusion_cuda PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
     POSITION_INDEPENDENT_CODE ON
 )
 
@@ -104,13 +98,6 @@ add_library(yolov8_tensorrt STATIC
 add_executable(detect_object_image
     src/object_detection_image_mt.cpp
     src/MouseController.cpp
-)
-
-# Set compile definitions
-target_compile_definitions(detect_object_image PRIVATE
-    CUDA_HAS_FP16=1
-    ENABLE_DEBUG=1
-    USE_CUDA=1
 )
 
 # Link CUDA runtime to libraries
@@ -140,20 +127,17 @@ target_link_libraries(detect_object_image PRIVATE
     ${NVINFER_LIB}
     ${NVONNXPARSER_LIB}
     ${NVINFER_PLUGIN_LIB}
-    # Windows-specific libraries
-    setupapi 
-    hid 
-    d3d11 
-    dxgi 
-    Dwmapi.lib
-    ${D3D11_LIB}
-    ${D3DCOMPILER_LIB}
-    ${DXGI_LIB}
+    # Windows-specific libraries (DXGI + D3D11 used by DXGICapture; HID/setupapi by MouseController)
+    setupapi
+    hid
+    d3d11
+    dxgi
 )
 
 # Set output directories
 set_target_properties(detect_object_image PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
 
 set_target_properties(yolov8_tensorrt PROPERTIES
@@ -172,13 +156,22 @@ install(TARGETS yolov8_tensorrt
 )
 
 # Copy required DLLs to output directory
+# TensorRT DLLs may live alongside .lib (original NVIDIA zip layout) or in
+# bin/ (when merged into the CUDA toolkit tree).
 if(WIN32)
-    file(GLOB TENSORRT_DLLS "${TENSORRT_LIB_DIR}/*.dll")
-    add_custom_command(TARGET detect_object_image POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${TENSORRT_DLLS}
-            $<TARGET_FILE_DIR:detect_object_image>
+    file(GLOB TENSORRT_DLLS
+        "${TENSORRT_LIB_DIR}/nvinfer*.dll"
+        "${TENSORRT_LIB_DIR}/nvonnx*.dll"
+        "${TENSORRT_BIN_DIR}/nvinfer*.dll"
+        "${TENSORRT_BIN_DIR}/nvonnx*.dll"
     )
+    if(TENSORRT_DLLS)
+        add_custom_command(TARGET detect_object_image POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${TENSORRT_DLLS}
+                $<TARGET_FILE_DIR:detect_object_image>
+        )
+    endif()
 endif()
 
 if(WIN32)
@@ -194,6 +187,3 @@ endif()
 foreach(DEP_FILE ${DEP_FILES})
     message(STATUS "Will copy dependency: ${DEP_FILE}")
 endforeach()
-
-# Optional: Enable testing
-enable_testing()
