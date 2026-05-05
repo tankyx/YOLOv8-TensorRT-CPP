@@ -3,7 +3,8 @@
 
 MouseController::MouseController(int screenWidth, int screenHeight, int detectionZoneWidth, int detectionZoneHeight, float sensitivity,
                                  int centralSquareSize, float minGain, float maxGain, float maxSpeed, int HL1, int HL2, int cpi, int nLab,
-                                 float probabilityThreshold, uint16_t hidVendorId, uint16_t hidProductId, std::wstring hidSerial)
+                                 float probabilityThreshold, uint16_t hidVendorId, uint16_t hidProductId, std::wstring hidSerial,
+                                 float smoothing)
     : screenWidth(screenWidth), screenHeight(screenHeight), detectionZoneWidth(detectionZoneWidth),
       detectionZoneHeight(detectionZoneHeight), sensitivity(sensitivity), centralSquareSize(centralSquareSize),
       minGain(minGain), maxSpeed(maxSpeed), maxGain(maxGain), hidDevice(nullptr), headLabel1(HL1), headLabel2(HL2), cpi(cpi), nLabels(nLab),
@@ -17,7 +18,14 @@ MouseController::MouseController(int screenWidth, int screenHeight, int detectio
 
     isLeftClicking = false;
 
+    setSmoothing(smoothing);
+
     ConnectToDevice();
+}
+
+void MouseController::setSmoothing(float userVal) {
+    _userSmoothing = std::clamp(userVal, 1.0f, 10.0f);
+    _smoothVal = smoothingToInternal(_userSmoothing);
 }
 
 MouseController::~MouseController() {
@@ -192,49 +200,89 @@ float MouseController::calculateSpeedScaling(const cv::Rect &rect) {
 }
 
 void MouseController::aim(const std::vector<Object> &detections) {
-    if (!isLeftMouseButtonPressed() && !isMouseButton5Pressed()) {
-        if (isLeftClicking) {
+    // Hold-to-aim gate: any of LMB, MB5, or RMB activates the aim. RMB is a
+    // debug-only mode — aim runs but the click bit stays 0 so the firmware
+    // never sends a press to the game. clickThrough tracks "the user actually
+    // wants to shoot" (LMB or MB5) and gates both the HID button bit and the
+    // isLeftClicking release-on-deactivation bookkeeping.
+    const bool clickThrough = isLeftMouseButtonPressed() || isMouseButton5Pressed();
+    const bool aimingActive = clickThrough || isRightMouseButtonPressed();
+
+    if (!aimingActive) {
+        // Don't release LMB if the triggerbot is mid-hold — that would cut its
+        // shot short. The trigger's own release path will handle it.
+        if (isLeftClicking && !triggerPressed) {
             releaseLeftClick();
             isLeftClicking = false;
         }
+        _bezier.deactivate();
+        _residX = 0.0f;
+        _residY = 0.0f;
         return;
     }
 
-    isLeftClicking = true;
-    Object closestDetection = findClosestDetection(detections);
+    // Released LMB/MB5 but still aiming via RMB — drop the click bit cleanly.
+    // Same trigger-coexistence rule applies.
+    if (isLeftClicking && !clickThrough && !triggerPressed) {
+        releaseLeftClick();
+        isLeftClicking = false;
+    }
+    if (clickThrough) {
+        isLeftClicking = true;
+    }
 
-    if (closestDetection.probability > probabilityThreshold) {
-        // Calculate target center
-        int targetX = closestDetection.rect.x + closestDetection.rect.width / 2;
-        int targetY = closestDetection.rect.y + closestDetection.rect.height / 2;
+    const Object closest = findClosestDetection(detections);
+    if (closest.probability <= probabilityThreshold) {
+        _bezier.deactivate();
+        return;
+    }
 
-        // Calculate distances
-        int distX = targetX - crosshairX;
-        int distY = targetY - crosshairY;
+    const float targetX = static_cast<float>(closest.rect.x + closest.rect.width / 2);
+    const float targetY = static_cast<float>(closest.rect.y + closest.rect.height / 2);
+    const float deltaX = targetX - static_cast<float>(crosshairX);
+    const float deltaY = targetY - static_cast<float>(crosshairY);
 
-        // Scale movement based on distance (-4 to 4)
-        // For distances > 20 pixels, use maximum speed
-        // For smaller distances, scale proportionally
-        _dx = (abs(distX) > 20)   ? (distX > 0 ? 4 : -4)
-              : (abs(distX) > 15) ? (distX > 0 ? 3 : -3)
-              : (abs(distX) > 10) ? (distX > 0 ? 2 : -2)
-              : (abs(distX) > 5)  ? (distX > 0 ? 1 : -1)
-                                  : 0;
+    // Tracking dead zone — if the crosshair is essentially on target, don't
+    // move (stops jitter from sub-pixel oscillation).
+    if (deltaX * deltaX + deltaY * deltaY < 1.0f) {
+        _bezier.deactivate();
+        return;
+    }
 
-        _dy = (abs(distY) > 20)   ? (distY > 0 ? 4 : -4)
-              : (abs(distY) > 15) ? (distY > 0 ? 3 : -3)
-              : (abs(distY) > 10) ? (distY > 0 ? 2 : -2)
-              : (abs(distY) > 5)  ? (distY > 0 ? 1 : -1)
-                                  : 0;
+    // Bezier-smoothed flick: re-anchored whenever the target jumps more than a
+    // few pixels (new lock-on / different enemy).
+    const cv::Point2f currentTarget(deltaX, deltaY);
+    if (_bezier.shouldReinitialize(currentTarget)) {
+        _bezier.initialize(cv::Point2f(0.0f, 0.0f), currentTarget);
+    }
+    _bezier.update(_smoothVal);
+    cv::Point2f bezierPos = _bezier.getCurrentPosition();
+    float movementX = bezierPos.x;
+    float movementY = bezierPos.y;
+    _bezier.updateStartPosition(cv::Point2f(movementX, movementY));
 
-        // Send movement if needed
-        if (_dx != 0 || _dy != 0) {
-            sendHIDReport(_dx, _dy, 0x01);
-        }
+    // Carry sub-pixel residue across frames so slow tracking doesn't truncate
+    // to zero counts every report.
+    movementX += _residX;
+    movementY += _residY;
+    const int16_t dX = static_cast<int16_t>(movementX);
+    const int16_t dY = static_cast<int16_t>(movementY);
+    _residX = movementX - static_cast<float>(dX);
+    _residY = movementY - static_cast<float>(dY);
+
+    _dx = dX;
+    _dy = dY;
+    // Coexist with the triggerbot: if the trigger is mid-hold this tick, keep
+    // the LMB bit set in our movement report so we don't yank LMB up before
+    // the hold completes.
+    const bool buttonHeld = clickThrough || triggerPressed;
+    if (dX != 0 || dY != 0) {
+        sendHIDReport(dX, dY, buttonHeld ? 0x01 : 0x00);
     }
 }
 
 bool MouseController::isLeftMouseButtonPressed() { return (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0; }
+bool MouseController::isRightMouseButtonPressed() { return (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0; }
 bool MouseController::isMouseButton4Pressed() { return (GetAsyncKeyState(VK_XBUTTON1) & 0x8000) != 0; } // Mouse Button 4
 bool MouseController::isMouseButton5Pressed() { return (GetAsyncKeyState(VK_XBUTTON2) & 0x8000) != 0; } // Mouse Button 5
 
@@ -267,16 +315,24 @@ Object MouseController::findClosestDetection(const std::vector<Object> &detectio
 void MouseController::triggerLeftClickIfCenterWithinDetection(const std::vector<Object> &detections) {
     using namespace std::chrono;
     constexpr auto holdDuration = milliseconds(100);
-    constexpr auto cooldownAfterRelease = milliseconds(120);
+    constexpr int cooldownMeanMs = 200;
+    constexpr int cooldownJitterMs = 35;
 
     const auto now = steady_clock::now();
 
     // If a press is in flight, see whether it's time to release. This runs every detection
-    // tick instead of blocking the thread with Sleep().
+    // tick instead of blocking the thread with Sleep(). Cooldown is sampled fresh per shot
+    // in [mean-jitter, mean+jitter] ms so the trigger cadence isn't a perfect metronome.
+    //
+    // We unconditionally release here. We can't reliably check "is the user physically
+    // holding LMB?" because GetAsyncKeyState(VK_LBUTTON) reflects the aggregate OS state
+    // across all mouse devices — including our own HID, which set LMB high at press time.
+    // If the user really is still holding LMB, aim()'s next iteration will re-assert it.
     if (triggerPressed && now >= triggerReleaseAt) {
         releaseLeftClick();
         triggerPressed = false;
-        triggerNextAllowedAt = now + cooldownAfterRelease;
+        std::uniform_int_distribution<int> jitter(-cooldownJitterMs, cooldownJitterMs);
+        triggerNextAllowedAt = now + milliseconds(cooldownMeanMs + jitter(_triggerRng));
     }
 
     if (!isMouseButton4Pressed() || triggerPressed || now < triggerNextAllowedAt) {

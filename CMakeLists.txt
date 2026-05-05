@@ -15,6 +15,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
 
 # Set the runtime library for MSVC
 if (MSVC)
@@ -31,6 +32,7 @@ find_package(CUDAToolkit REQUIRED)
 set(TENSORRT_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4" CACHE PATH "Path to TensorRT installation")
 set(TENSORRT_INCLUDE_DIRS "${TENSORRT_ROOT}/include")
 set(TENSORRT_LIB_DIR "${TENSORRT_ROOT}/lib")
+set(TENSORRT_BIN_DIR "${TENSORRT_ROOT}/bin")
 
 # Find TensorRT libraries with version numbers
 file(GLOB NVINFER_LIB "${TENSORRT_LIB_DIR}/nvinfer_10.lib")
@@ -66,8 +68,9 @@ add_library(engine_cuda_kernels STATIC
     src/EngineFP16Kernels.cu
 )
 
-set_target_properties(engine_cuda_kernels PROPERTIES 
+set_target_properties(engine_cuda_kernels PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
     POSITION_INDEPENDENT_CODE ON
 )
 
@@ -80,8 +83,9 @@ add_library(fusion_cuda STATIC
     src/SoftwareFuser.cu
 )
 
-set_target_properties(fusion_cuda PROPERTIES 
+set_target_properties(fusion_cuda PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
     POSITION_INDEPENDENT_CODE ON
 )
 
@@ -133,6 +137,7 @@ target_link_libraries(detect_object_image PRIVATE
 # Set output directories
 set_target_properties(detect_object_image PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
 
 set_target_properties(yolov8_tensorrt PROPERTIES
@@ -151,13 +156,22 @@ install(TARGETS yolov8_tensorrt
 )
 
 # Copy required DLLs to output directory
+# TensorRT DLLs may live alongside .lib (original NVIDIA zip layout) or in
+# bin/ (when merged into the CUDA toolkit tree).
 if(WIN32)
-    file(GLOB TENSORRT_DLLS "${TENSORRT_LIB_DIR}/*.dll")
-    add_custom_command(TARGET detect_object_image POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${TENSORRT_DLLS}
-            $<TARGET_FILE_DIR:detect_object_image>
+    file(GLOB TENSORRT_DLLS
+        "${TENSORRT_LIB_DIR}/nvinfer*.dll"
+        "${TENSORRT_LIB_DIR}/nvonnx*.dll"
+        "${TENSORRT_BIN_DIR}/nvinfer*.dll"
+        "${TENSORRT_BIN_DIR}/nvonnx*.dll"
     )
+    if(TENSORRT_DLLS)
+        add_custom_command(TARGET detect_object_image POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${TENSORRT_DLLS}
+                $<TARGET_FILE_DIR:detect_object_image>
+        )
+    endif()
 endif()
 
 if(WIN32)

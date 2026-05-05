@@ -39,7 +39,8 @@ private:
 
     static void moveToTop();
     static void clearScreen();
-    static void logAverageLatencies(LatencyQueue &captureLatency, LatencyQueue &detectionLatency, SafeQueue<std::string> &logQueue);
+    static void logAverageLatencies(LatencyQueue &captureLatency, LatencyQueue &detectionLatency,
+                                    LatencyQueue &renderLatency, SafeQueue<std::string> &logQueue);
 
     void captureThread();
     void detectionThread();
@@ -67,7 +68,7 @@ private:
     HWND targetWnd;
 
     SafeQueue<std::string> logQueue;
-    LatencyQueue captureLatency, detectionLatency;
+    LatencyQueue captureLatency, detectionLatency, renderLatency;
     std::atomic<bool> running;
     FrameQueue captureQueue;
     DetectionQueue detectionQueue;
@@ -141,7 +142,8 @@ void ObjectDetectionSystem::initializeSystem() {
         config.getInt("HeadLabelID1", 0), config.getInt("HeadLabelID2", 1), config.getInt("CPI", 3000),
         static_cast<int>(config.getStringArray("Labels").size()),
         yoloConfig.probabilityThreshold,
-        hidVid, hidPid, std::move(hidSerialWide));
+        hidVid, hidPid, std::move(hidSerialWide),
+        config.getFloat("Smoothing", 5.0f));
 
     if (trackCrosshair) {
         templateImg = cv::imread(config.getString("CrosshairTemplate", "crosshair.png"), cv::IMREAD_COLOR);
@@ -199,7 +201,7 @@ void ObjectDetectionSystem::mainLoop() {
             running = false;
         }
 
-        logAverageLatencies(captureLatency, detectionLatency, logQueue);
+        logAverageLatencies(captureLatency, detectionLatency, renderLatency, logQueue);
         Sleep(100);
     }
 }
@@ -227,12 +229,14 @@ void ObjectDetectionSystem::moveToTop() { std::cout << "\033[H"; }
 void ObjectDetectionSystem::clearScreen() { std::cout << "\033[2J\033[H"; }
 
 void ObjectDetectionSystem::logAverageLatencies(LatencyQueue &captureLatency, LatencyQueue &detectionLatency,
-                                                SafeQueue<std::string> &logQueue) {
+                                                LatencyQueue &renderLatency, SafeQueue<std::string> &logQueue) {
     double avgCaptureLatency = captureLatency.getAverageLatency();
     double avgDetectionLatency = detectionLatency.getAverageLatency();
+    double avgRenderLatency = renderLatency.getAverageLatency();
 
-    std::cout << "\rAverage Capture Latency: " << avgCaptureLatency << "ms | "
-              << "Detection Latency: " << avgDetectionLatency << "ms" << std::flush;
+    std::cout << "\rCapture: " << avgCaptureLatency << "ms | "
+              << "Detection: " << avgDetectionLatency << "ms | "
+              << "Render: " << avgRenderLatency << "ms       " << std::flush;
 }
 
 void ObjectDetectionSystem::captureThread() {
@@ -325,6 +329,7 @@ void ObjectDetectionSystem::detectionThread() {
             detectionLatency.push(std::chrono::duration_cast<std::chrono::milliseconds>(detectionDuration).count());
 
             if (debugOverlay && debugOverlay->isRunning()) {
+                auto renderStart = std::chrono::high_resolution_clock::now();
                 // Translate detections + crosshair from cropped-ROI space to game-framebuffer
                 // space. For fullscreen play at native resolution, framebuffer == screen.
                 std::vector<DiscordOverlay::DetectionBox> boxes;
@@ -343,6 +348,8 @@ void ObjectDetectionSystem::detectionThread() {
                 debugOverlay->setCrosshair(static_cast<float>(crosshairPos.x + x),
                                             static_cast<float>(crosshairPos.y + y));
                 debugOverlay->setStats(detectionLatency.getAverageLatency(), 0);
+                auto renderEnd = std::chrono::high_resolution_clock::now();
+                renderLatency.push(std::chrono::duration_cast<std::chrono::milliseconds>(renderEnd - renderStart).count());
             }
         }
     } catch (const std::exception &e) {
