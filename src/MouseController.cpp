@@ -4,11 +4,13 @@
 MouseController::MouseController(int screenWidth, int screenHeight, int detectionZoneWidth, int detectionZoneHeight, float sensitivity,
                                  int centralSquareSize, float minGain, float maxGain, float maxSpeed, int HL1, int HL2, int cpi, int nLab,
                                  float probabilityThreshold, uint16_t hidVendorId, uint16_t hidProductId, std::wstring hidSerial,
-                                 float smoothing)
+                                 float smoothing, float debugSnapGain, bool debugAimEnabled)
     : screenWidth(screenWidth), screenHeight(screenHeight), detectionZoneWidth(detectionZoneWidth),
       detectionZoneHeight(detectionZoneHeight), sensitivity(sensitivity), centralSquareSize(centralSquareSize),
       minGain(minGain), maxSpeed(maxSpeed), maxGain(maxGain), hidDevice(nullptr), headLabel1(HL1), headLabel2(HL2), cpi(cpi), nLabels(nLab),
       probabilityThreshold(probabilityThreshold), hidVendorId(hidVendorId), hidProductId(hidProductId), hidSerial(std::move(hidSerial)) {
+    setDebugSnapGain(debugSnapGain);
+    setDebugAimEnabled(debugAimEnabled);
     // Calculate the top-left corner of the detection zone
     detectionZoneX = (screenWidth - detectionZoneWidth) / 2;
     detectionZoneY = (screenHeight - detectionZoneHeight) / 2;
@@ -206,7 +208,8 @@ void MouseController::aim(const std::vector<Object> &detections) {
     // wants to shoot" (LMB or MB5) and gates both the HID button bit and the
     // isLeftClicking release-on-deactivation bookkeeping.
     const bool clickThrough = isLeftMouseButtonPressed() || isMouseButton5Pressed();
-    const bool aimingActive = clickThrough || isRightMouseButtonPressed();
+    const bool debugAimHeld = _debugAimEnabled && isRightMouseButtonPressed();
+    const bool aimingActive = clickThrough || debugAimHeld;
 
     if (!aimingActive) {
         // Don't release LMB if the triggerbot is mid-hold — that would cut its
@@ -249,17 +252,27 @@ void MouseController::aim(const std::vector<Object> &detections) {
         return;
     }
 
-    // Bezier-smoothed flick: re-anchored whenever the target jumps more than a
-    // few pixels (new lock-on / different enemy).
-    const cv::Point2f currentTarget(deltaX, deltaY);
-    if (_bezier.shouldReinitialize(currentTarget)) {
-        _bezier.initialize(cv::Point2f(0.0f, 0.0f), currentTarget);
+    float movementX;
+    float movementY;
+    if (clickThrough) {
+        // Real aim path: Bezier-smoothed flick, re-anchored when the target jumps.
+        const cv::Point2f currentTarget(deltaX, deltaY);
+        if (_bezier.shouldReinitialize(currentTarget)) {
+            _bezier.initialize(cv::Point2f(0.0f, 0.0f), currentTarget);
+        }
+        _bezier.update(_smoothVal);
+        cv::Point2f bezierPos = _bezier.getCurrentPosition();
+        movementX = bezierPos.x;
+        movementY = bezierPos.y;
+        _bezier.updateStartPosition(cv::Point2f(movementX, movementY));
+    } else {
+        // Debug aim (RMB-only): no smoothing — snap straight at the target.
+        // _debugSnapGain converts ROI pixels into mouse counts for the user's
+        // in-game sensitivity (1 count ≠ 1 ROI px, so the raw delta under-rotates).
+        _bezier.deactivate();
+        movementX = deltaX * _debugSnapGain;
+        movementY = deltaY * _debugSnapGain;
     }
-    _bezier.update(_smoothVal);
-    cv::Point2f bezierPos = _bezier.getCurrentPosition();
-    float movementX = bezierPos.x;
-    float movementY = bezierPos.y;
-    _bezier.updateStartPosition(cv::Point2f(movementX, movementY));
 
     // Carry sub-pixel residue across frames so slow tracking doesn't truncate
     // to zero counts every report.
@@ -283,7 +296,7 @@ void MouseController::aim(const std::vector<Object> &detections) {
 
 bool MouseController::isLeftMouseButtonPressed() { return (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0; }
 bool MouseController::isRightMouseButtonPressed() { return (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0; }
-bool MouseController::isMouseButton4Pressed() { return (GetAsyncKeyState(VK_XBUTTON1) & 0x8000) != 0; } // Mouse Button 4
+bool MouseController::isTriggerKeyPressed() { return (GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0; } // Triggerbot hold key
 bool MouseController::isMouseButton5Pressed() { return (GetAsyncKeyState(VK_XBUTTON2) & 0x8000) != 0; } // Mouse Button 5
 
 void MouseController::leftClick() { sendHIDReport(0, 0, 0x01); }
@@ -335,7 +348,7 @@ void MouseController::triggerLeftClickIfCenterWithinDetection(const std::vector<
         triggerNextAllowedAt = now + milliseconds(cooldownMeanMs + jitter(_triggerRng));
     }
 
-    if (!isMouseButton4Pressed() || triggerPressed || now < triggerNextAllowedAt) {
+    if (!isTriggerKeyPressed() || triggerPressed || now < triggerNextAllowedAt) {
         return;
     }
 

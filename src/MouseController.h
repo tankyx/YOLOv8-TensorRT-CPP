@@ -86,9 +86,11 @@ public:
                     int centralSquareSize, float minGain, float maxGain, float maxSpeed, int HL1, int HL2, int cpi,
                     int nLab, float probabilityThreshold,
                     uint16_t hidVendorId, uint16_t hidProductId, std::wstring hidSerial,
-                    float smoothing);
+                    float smoothing, float debugSnapGain, bool debugAimEnabled);
 
     void setSmoothing(float userVal);
+    void setDebugSnapGain(float g) { _debugSnapGain = (std::max)(0.1f, g); }
+    void setDebugAimEnabled(bool e) { _debugAimEnabled = e; }
     float getSmoothing() const { return _userSmoothing; }
     ~MouseController();
     void aim(const std::vector<Object> &detections);
@@ -143,16 +145,23 @@ private:
     float _residY = 0.0f;
     BezierCurve2D _bezier;
 
-    static float remapSmoothing(float userVal) {
-        // Smoothing knob 1-10 maps to internal "smoothing percent" 50-100, which
-        // smoothingToInternal() then inverts to a per-frame multiplier in [0.005, 0.50].
-        // Wider than CS2Miam's original 90-100 band — that one capped at 10% per frame
-        // which is too conservative for a ~220 Hz pipeline. Smoothing=1 = snap, =10 = smooth.
-        const float clamped = std::clamp(userVal, 1.0f, 10.0f);
-        return 50.0f + (clamped - 1.0f) * (50.0f / 9.0f);
-    }
+    // Multiplier applied to the raw screen-pixel delta on the RMB-only debug
+    // path. Translates ROI pixels into mouse counts for the user's in-game
+    // sensitivity calibration so the snap actually arrives in one tick.
+    float _debugSnapGain = 3.0f;
+
+    // Gate for the RMB-only debug aim path. When false, RMB does nothing —
+    // only LMB/MB5 trigger the smoothed aim.
+    bool _debugAimEnabled = true;
+
     static float smoothingToInternal(float userVal) {
-        return (std::max)(0.005f, 1.0f - (remapSmoothing(userVal) / 100.0f));
+        // Smoothing knob 1-10 → per-frame multiplier in [0.005, 0.50]. The bezier
+        // consumes this as (1 - multiplier) progress per tick, so userVal=1 yields
+        // multiplier ≈ 0 → progress ≈ 1 → snap, and userVal=10 yields multiplier 0.5
+        // → progress 0.5 → smooth. Wider than CS2Miam's original 90-100 band which
+        // capped progress at 10% per frame — too conservative for a ~220 Hz pipeline.
+        const float clamped = std::clamp(userVal, 1.0f, 10.0f);
+        return (std::max)(0.005f, (clamped - 1.0f) * (0.5f / 9.0f));
     }
 
     // Non-blocking trigger-click state machine (c12). Cooldown between releases
@@ -164,7 +173,7 @@ private:
 
     bool isLeftMouseButtonPressed();
     bool isRightMouseButtonPressed();
-    bool isMouseButton4Pressed();
+    bool isTriggerKeyPressed();
     bool isMouseButton5Pressed();
     void leftClick();
     void releaseLeftClick();

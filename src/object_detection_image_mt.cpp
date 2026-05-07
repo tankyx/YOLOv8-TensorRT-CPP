@@ -130,10 +130,12 @@ void ObjectDetectionSystem::initializeSystem() {
 
     screenWidth = GetSystemMetrics(SM_CXSCREEN);
     screenHeight = GetSystemMetrics(SM_CYSCREEN);
-    // HID identity (c15) — defaults preserve the originally-hardcoded device.
-    const uint16_t hidVid = static_cast<uint16_t>(config.getInt("HidVendorId", 0x0812));
-    const uint16_t hidPid = static_cast<uint16_t>(config.getInt("HidProductId", 0x2205));
-    const std::string hidSerialNarrow = config.getString("HidSerial", "DF625857C74E132B");
+    // HID identity — defaults point at the ESP32-P4 bridge cloned as the OP1
+    // 8K V2 (VID 0x3367 PID 0x1978, no iSerialNumber). To target the old
+    // RP2040 instead, override HidVendorId/HidProductId/HidSerial in the INI.
+    const uint16_t hidVid = static_cast<uint16_t>(config.getInt("HidVendorId", 0x3367));
+    const uint16_t hidPid = static_cast<uint16_t>(config.getInt("HidProductId", 0x1978));
+    const std::string hidSerialNarrow = config.getString("HidSerial", "");
     std::wstring hidSerialWide(hidSerialNarrow.begin(), hidSerialNarrow.end()); // ASCII-only serials
 
     mouseController = std::make_unique<MouseController>(
@@ -143,7 +145,9 @@ void ObjectDetectionSystem::initializeSystem() {
         static_cast<int>(config.getStringArray("Labels").size()),
         yoloConfig.probabilityThreshold,
         hidVid, hidPid, std::move(hidSerialWide),
-        config.getFloat("Smoothing", 5.0f));
+        config.getFloat("Smoothing", 5.0f),
+        config.getFloat("DebugSnapGain", 3.0f),
+        config.getBool("DebugAimEnabled", true));
 
     if (trackCrosshair) {
         templateImg = cv::imread(config.getString("CrosshairTemplate", "crosshair.png"), cv::IMREAD_COLOR);
