@@ -45,10 +45,13 @@ private:
 
     void captureThread();
     void detectionThread();
+    void captureThreadGpu();
+    void detectionThreadGpu();
 
     INIParser config;
     std::unique_ptr<YoloV8> yoloV8;
     std::unique_ptr<DXGICapture> capture;
+    std::unique_ptr<DXGICaptureCUDA> captureCUDA;
     std::unique_ptr<MouseController> mouseController;
     std::unique_ptr<DiscordOverlay> debugOverlay;
     std::vector<std::string> labelNames;
@@ -72,6 +75,7 @@ private:
     LatencyQueue captureLatency, detectionLatency, renderLatency;
     std::atomic<bool> running;
     FrameQueue captureQueue;
+    GpuFrameQueue gpuCaptureQueue;
     DetectionQueue detectionQueue;
 
     std::thread captureThreadObj;
@@ -81,6 +85,7 @@ private:
     bool pinThreads;
     bool trackCrosshair;
     bool debugView;
+    bool useDirectGpuCapture;
     std::string debugOverlayTargetProcess;
 };
 
@@ -110,6 +115,10 @@ void ObjectDetectionSystem::loadConfigFromINI(const std::string &iniFile) {
     // at ~120 Hz; the detection thread itself only does cheap atomics + a mutex'd vector copy.
     debugView                 = config.getBool("DebugView", false);
     debugOverlayTargetProcess = config.getString("DebugOverlayTargetProcess", "cs2.exe");
+
+    // c39c: opt into the DXGI/CUDA-interop capture path. When true the capture stays on the
+    // GPU end-to-end (no CPU map, no cvtColor, no upload). Default false until validated.
+    useDirectGpuCapture = config.getBool("UseDirectGpuCapture", false);
 }
 
 void ObjectDetectionSystem::initializeSystem() {
@@ -159,7 +168,22 @@ void ObjectDetectionSystem::initializeSystem() {
         crosshairMatcher = cv::cuda::createTemplateMatching(templateImg.type(), cv::TM_CCOEFF_NORMED);
     }
 
-    capture = std::make_unique<DXGICapture>();
+    if (useDirectGpuCapture) {
+        // The crosshair tracker and the Discord debug overlay still expect a 3-channel cv::Mat
+        // path; the direct-GPU capture is BGRA on the GPU. Refuse the combination explicitly
+        // rather than silently corrupt or stall.
+        if (trackCrosshair) {
+            throw std::runtime_error(
+                "UseDirectGpuCapture is incompatible with TrackCrosshair (CPU template path). Disable one.");
+        }
+        if (debugView) {
+            throw std::runtime_error(
+                "UseDirectGpuCapture is incompatible with DebugView (overlay snapshot is CPU). Disable one.");
+        }
+        captureCUDA = std::make_unique<DXGICaptureCUDA>();
+    } else {
+        capture = std::make_unique<DXGICapture>();
+    }
 
     detectionQueue.setMoveThresholdPx(config.getInt("DetectionMoveThresholdPx", 5));
 
@@ -186,8 +210,13 @@ void ObjectDetectionSystem::initializeSystem() {
 }
 
 void ObjectDetectionSystem::startThreads() {
-    captureThreadObj = std::thread(&ObjectDetectionSystem::captureThread, this);
-    detectionThreadObj = std::thread(&ObjectDetectionSystem::detectionThread, this);
+    if (useDirectGpuCapture) {
+        captureThreadObj = std::thread(&ObjectDetectionSystem::captureThreadGpu, this);
+        detectionThreadObj = std::thread(&ObjectDetectionSystem::detectionThreadGpu, this);
+    } else {
+        captureThreadObj = std::thread(&ObjectDetectionSystem::captureThread, this);
+        detectionThreadObj = std::thread(&ObjectDetectionSystem::detectionThread, this);
+    }
 }
 
 void ObjectDetectionSystem::mainLoop() {
@@ -362,6 +391,86 @@ void ObjectDetectionSystem::detectionThread() {
         running = false;
     } catch (...) {
         std::cerr << "detectionThread: fatal unknown exception. Stopping." << std::endl;
+        running = false;
+    }
+}
+
+// c39c: GPU capture thread. Owns a private CUDA stream so the cudaMemcpy2DFromArrayAsync
+// inside DXGICaptureCUDA::CaptureScreen runs concurrently with the detection thread's engine
+// stream. Synchronizes the local stream before pushing so the consumer reads stable data.
+void ObjectDetectionSystem::captureThreadGpu() {
+    try {
+        cudaStream_t captureStream = nullptr;
+        cudaStreamCreate(&captureStream);
+
+        cv::cuda::GpuMat frame1;
+        cv::cuda::GpuMat frame2;
+        cv::cuda::GpuMat *currentFrame = &frame1;
+        cv::cuda::GpuMat *nextFrame = &frame2;
+
+        while (running) {
+            auto start = std::chrono::high_resolution_clock::now();
+
+            const bool got = captureCUDA->CaptureScreen(*currentFrame, captureStream);
+            if (got) {
+                cudaStreamSynchronize(captureStream);
+                gpuCaptureQueue.push(std::move(*currentFrame));
+                std::swap(currentFrame, nextFrame);
+            }
+
+            auto end = std::chrono::high_resolution_clock::now();
+            captureLatency.push(std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+        }
+
+        cudaStreamDestroy(captureStream);
+    } catch (const std::exception &e) {
+        std::cerr << "captureThreadGpu: fatal exception: " << e.what() << ". Stopping." << std::endl;
+        running = false;
+    } catch (...) {
+        std::cerr << "captureThreadGpu: fatal unknown exception. Stopping." << std::endl;
+        running = false;
+    }
+}
+
+void ObjectDetectionSystem::detectionThreadGpu() {
+    try {
+        while (running) {
+            cv::cuda::GpuMat frame = gpuCaptureQueue.pop();
+
+            auto detectionStartTime = std::chrono::high_resolution_clock::now();
+
+            const int centerX = frame.cols / 2;
+            const int centerY = frame.rows / 2;
+
+            int x = std::max(centerX - captureWidth / 2, 0);
+            int y = std::max(centerY - captureHeight / 2, 0);
+            x = std::min(x, frame.cols - captureWidth);
+            y = std::min(y, frame.rows - captureHeight);
+            const cv::Rect roi(x, y, captureWidth, captureHeight);
+
+            cv::cuda::GpuMat croppedFrame = frame(roi); // ROI view, no copy
+
+            // Crosshair tracking + DebugView are off by INI assertion in initializeSystem when
+            // direct GPU capture is on. Crosshair stays at ROI center.
+            const cv::Point crosshairPos(captureWidth / 2, captureHeight / 2);
+
+            std::vector<Object> detections = yoloV8->detectObjects(croppedFrame);
+
+            mouseController->setCrosshairPosition(crosshairPos.x, crosshairPos.y);
+            mouseController->aim(detections);
+            mouseController->triggerLeftClickIfCenterWithinDetection(detections);
+
+            detectionQueue.push(detections);
+
+            auto detectionEndTime = std::chrono::high_resolution_clock::now();
+            detectionLatency.push(
+                std::chrono::duration_cast<std::chrono::milliseconds>(detectionEndTime - detectionStartTime).count());
+        }
+    } catch (const std::exception &e) {
+        std::cerr << "detectionThreadGpu: fatal exception: " << e.what() << ". Stopping." << std::endl;
+        running = false;
+    } catch (...) {
+        std::cerr << "detectionThreadGpu: fatal unknown exception. Stopping." << std::endl;
         running = false;
     }
 }

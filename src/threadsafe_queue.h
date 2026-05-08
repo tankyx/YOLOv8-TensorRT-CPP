@@ -142,3 +142,30 @@ private:
     std::mutex mutex_;
     std::condition_variable cond_var_;
 };
+
+// c39c: GPU-side counterpart to FrameQueue, used by the DXGI/CUDA-interop capture path.
+// cv::cuda::GpuMat refcounts its underlying device buffer, so push/pop is shallow.
+class GpuFrameQueue {
+public:
+    void push(cv::cuda::GpuMat frame) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!queue_.empty()) {
+            queue_.pop();
+        }
+        queue_.push(std::move(frame));
+        cond_var_.notify_one();
+    }
+
+    cv::cuda::GpuMat pop() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cond_var_.wait(lock, [this] { return !queue_.empty(); });
+        cv::cuda::GpuMat frame = std::move(queue_.front());
+        queue_.pop();
+        return frame;
+    }
+
+private:
+    std::queue<cv::cuda::GpuMat> queue_;
+    std::mutex mutex_;
+    std::condition_variable cond_var_;
+};
