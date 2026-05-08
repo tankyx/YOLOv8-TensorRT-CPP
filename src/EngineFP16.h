@@ -101,6 +101,18 @@ public:
 
                 m_inputDims.emplace_back(tensorShape.d[1], tensorShape.d[2], tensorShape.d[3]);
                 m_inputBatchSize = tensorShape.d[0];
+
+                // Pre-allocate the FP16 CHW input buffer (c33). The fused preproc kernel writes
+                // directly here, so we no longer need a per-call OpenCV GpuMat for the input.
+                const int inputC = tensorShape.d[1];
+                const int inputH = tensorShape.d[2];
+                const int inputW = tensorShape.d[3];
+                size_t inputBytes = static_cast<size_t>(inputC) * inputH * inputW * m_options.maxBatchSize * sizeof(__half);
+                inputBytes = (inputBytes + 31) & ~31; // 32-byte alignment for FP16 tensor cores
+
+                Util::checkCudaErrorCode(cudaMallocAsync(&m_ownedInputBuffer, inputBytes, m_stream));
+                m_buffers[i] = m_ownedInputBuffer;
+                m_inputBufferIndex = i;
             } else if (tensorType == nvinfer1::TensorIOMode::kOUTPUT) {
                 if (m_engine->getTensorDataType(tensorName) != nvinfer1::DataType::kHALF) {
                     throw std::runtime_error("Error, expected FP16 output in EngineFP16");
@@ -125,6 +137,103 @@ public:
 
         Util::checkCudaErrorCode(cudaStreamSynchronize(m_stream));
 
+        return true;
+    }
+
+    // c33 fast path: take the raw uint8 BGR capture directly, run the fused preproc kernel into the
+    // pre-allocated FP16 input buffer, enqueue inference, and return outputs as fp32 (existing
+    // FP16->FP32 device cast path — narrowed to D2H raw FP16 in a follow-up commit).
+    //
+    // outRatio is the postprocess scale factor: bbox_dst * outRatio = bbox_src. Matches what
+    // YoloV8::preprocess used to set m_ratio to.
+    bool runInferenceFromBGR(const cv::cuda::GpuMat &bgr, std::vector<std::vector<std::vector<float>>> &featureVectors,
+                             float &outRatio, const std::array<float, 3> &subVals, const std::array<float, 3> &divVals,
+                             bool normalize) {
+        if (bgr.empty() || bgr.type() != CV_8UC3) {
+            std::cout << "runInferenceFromBGR expects a non-empty CV_8UC3 GpuMat" << std::endl;
+            return false;
+        }
+        if (m_inputDims.size() != 1 || m_inputBufferIndex < 0) {
+            std::cout << "runInferenceFromBGR requires a single FP16 input binding" << std::endl;
+            return false;
+        }
+
+        const auto &dims = m_inputDims[0];
+        const int dstC = dims.d[0];
+        const int dstH = dims.d[1];
+        const int dstW = dims.d[2];
+        if (dstC != 3) {
+            std::cout << "runInferenceFromBGR only supports 3-channel input" << std::endl;
+            return false;
+        }
+
+        // Letterbox geometry (matches resizeKeepAspectRatioPadRightBottom).
+        const float r = std::min(static_cast<float>(dstW) / static_cast<float>(bgr.cols),
+                                 static_cast<float>(dstH) / static_cast<float>(bgr.rows));
+        const int unpadW = static_cast<int>(r * bgr.cols);
+        const int unpadH = static_cast<int>(r * bgr.rows);
+        outRatio = 1.0f / r;
+
+        // Restore our owned input pointer in case the legacy runInference path has overwritten it
+        // with a transient OpenCV GpuMat pointer (the two paths are mutually exclusive in practice
+        // — YoloV8 dispatches by engine type — but be defensive).
+        m_buffers[m_inputBufferIndex] = m_ownedInputBuffer;
+
+        FusedPreprocParams p{};
+        p.src = bgr.ptr<uint8_t>();
+        p.srcW = bgr.cols;
+        p.srcH = bgr.rows;
+        p.srcPitch = static_cast<int>(bgr.step);
+        p.dst = static_cast<__half *>(m_buffers[m_inputBufferIndex]);
+        p.dstW = dstW;
+        p.dstH = dstH;
+        p.invScale = 1.0f / r;
+        p.unpadW = unpadW;
+        p.unpadH = unpadH;
+        p.scale255 = normalize ? (1.0f / 255.0f) : 1.0f;
+        for (int c = 0; c < 3; ++c) {
+            p.sub[c] = subVals[c];
+            p.div[c] = divVals[c] != 0.0f ? divVals[c] : 1.0f;
+        }
+        launchFusedPreprocBGRtoFP16Kernel(p, m_stream);
+
+        // Bind shapes & addresses. The output buffers were allocated in loadNetwork; the input
+        // buffer is already at m_buffers[m_inputBufferIndex] and we just wrote it on m_stream.
+        const nvinfer1::Dims4 inputDims4{1, dstC, dstH, dstW};
+        m_context->setInputShape(m_IOTensorNames[m_inputBufferIndex].c_str(), inputDims4);
+        if (!m_context->allInputDimensionsSpecified()) {
+            throw std::runtime_error("Not all required dimensions specified");
+        }
+
+        for (size_t i = 0; i < m_buffers.size(); ++i) {
+            if (!m_context->setTensorAddress(m_IOTensorNames[i].c_str(), m_buffers[i])) {
+                return false;
+            }
+        }
+
+        if (!m_context->enqueueV3(m_stream)) {
+            return false;
+        }
+
+        // Output path — same FP16->FP32 device cast + D2H + sync as runInference. This block stays
+        // verbatim until the follow-up commit that copies raw FP16 instead.
+        const auto numInputs = m_inputDims.size();
+        featureVectors.clear();
+        std::vector<std::vector<float>> batchOutputs;
+        for (int32_t outputBinding = numInputs; outputBinding < m_engine->getNbIOTensors(); ++outputBinding) {
+            const uint32_t length = m_outputLengths[outputBinding - numInputs];
+            ensureFp32StagingCapacity(length);
+
+            const __half *deviceFp16 = reinterpret_cast<const __half *>(m_buffers[outputBinding]);
+            launchConvertFP16ToFP32Kernel(deviceFp16, m_fp32Staging, static_cast<int>(length), m_stream);
+
+            std::vector<float> output(length);
+            Util::checkCudaErrorCode(
+                cudaMemcpyAsync(output.data(), m_fp32Staging, length * sizeof(float), cudaMemcpyDeviceToHost, m_stream));
+            Util::checkCudaErrorCode(cudaStreamSynchronize(m_stream));
+            batchOutputs.emplace_back(std::move(output));
+        }
+        featureVectors.emplace_back(std::move(batchOutputs));
         return true;
     }
 
@@ -248,6 +357,11 @@ private:
             m_fp32Staging = nullptr;
             m_fp32StagingCapacity = 0;
         }
+        if (m_stream && m_ownedInputBuffer) {
+            cudaFreeAsync(m_ownedInputBuffer, m_stream);
+            m_ownedInputBuffer = nullptr;
+            m_inputBufferIndex = -1;
+        }
         if (m_buffers.empty() || !m_engine || !m_stream) {
             return;
         }
@@ -300,4 +414,11 @@ private:
     // Staging buffer for the FP16->FP32 output kernel (c23).
     float *m_fp32Staging = nullptr;
     uint32_t m_fp32StagingCapacity = 0;
+
+    // c33: pre-allocated FP16 CHW input buffer used by the fused preproc fast path
+    // (runInferenceFromBGR). Owned by the engine; its address is mirrored into m_buffers at the
+    // input binding index. The legacy runInference path overwrites m_buffers[input] with a
+    // transient OpenCV GpuMat pointer, so the fast path restores from m_ownedInputBuffer on entry.
+    void *m_ownedInputBuffer = nullptr;
+    int m_inputBufferIndex = -1;
 };

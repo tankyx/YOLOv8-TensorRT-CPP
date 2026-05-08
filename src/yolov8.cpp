@@ -65,15 +65,30 @@ std::vector<std::vector<cv::cuda::GpuMat>> YoloV8::preprocess(const cv::cuda::Gp
 }
 
 std::vector<Object> YoloV8::detectObjects(const cv::cuda::GpuMat &inputImageBGR) {
-    // Preprocess the input image
-    const auto input = preprocess(inputImageBGR);
-
-    // Run inference using the TensorRT engine
     std::vector<std::vector<std::vector<float>>> featureVectors;
-    auto succ = m_trtEngine->runInference(input, featureVectors);
-    if (!succ) {
-        throw std::runtime_error("Error: Unable to run inference.");
+
+    // c33 FP16 fast path: skip the OpenCV preprocess pipeline entirely. The engine reads the raw
+    // uint8 BGR capture and runs a single fused kernel (letterbox + BGR->RGB + normalize +
+    // HWC->CHW + u8->fp16) directly into its pre-allocated FP16 input buffer.
+    if (auto *fp16Engine = dynamic_cast<EngineFP16 *>(m_trtEngine.get())) {
+        float ratio = 1.0f;
+        const bool succ = fp16Engine->runInferenceFromBGR(inputImageBGR, featureVectors, ratio,
+                                                          SUB_VALS, DIV_VALS, NORMALIZE);
+        if (!succ) {
+            throw std::runtime_error("Error: Unable to run inference (FP16 fast path).");
+        }
+        m_imgWidth = static_cast<float>(inputImageBGR.cols);
+        m_imgHeight = static_cast<float>(inputImageBGR.rows);
+        m_ratio = ratio;
+    } else {
+        // FP32 / generic fallback: preprocess via OpenCV, then call the legacy runInference.
+        const auto input = preprocess(inputImageBGR);
+        const bool succ = m_trtEngine->runInference(input, featureVectors);
+        if (!succ) {
+            throw std::runtime_error("Error: Unable to run inference.");
+        }
     }
+
     // Check if our model does only object detection or also supports segmentation
     std::vector<Object> ret;
     const auto &numOutputs = m_trtEngine->getOutputDims().size();
