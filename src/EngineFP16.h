@@ -39,12 +39,10 @@ public:
         return loadNetwork(engineName, subVals, divVals, normalize);
     }
 
-    bool loadNetwork(std::string trtModelPath, const std::array<float, 3> &subVals = {0.f, 0.f, 0.f},
-                     const std::array<float, 3> &divVals = {1.f, 1.f, 1.f}, bool normalize = true) override {
-        m_subVals = subVals;
-        m_divVals = divVals;
-        m_normalize = normalize;
-
+    bool loadNetwork(std::string trtModelPath, const std::array<float, 3> & /*subVals*/ = {0.f, 0.f, 0.f},
+                     const std::array<float, 3> & /*divVals*/ = {1.f, 1.f, 1.f}, bool /*normalize*/ = true) override {
+        // c36: subVals/divVals/normalize are no longer stashed on the engine — runInferenceFromBGR
+        // takes them per-call, since the OpenCV-based input prep that consumed them is gone.
         if (!Util::doesFileExist(trtModelPath)) {
             std::cout << "Error, unable to read TensorRT model at path: " + trtModelPath << std::endl;
             return false;
@@ -256,84 +254,14 @@ public:
         return true;
     }
 
-    bool runInference(const std::vector<std::vector<cv::cuda::GpuMat>> &inputs,
-                      std::vector<std::vector<std::vector<float>>> &featureVectors) override {
-        if (inputs.empty() || inputs[0].empty()) {
-            std::cout << "Provided input vector is empty!" << std::endl;
-            return false;
-        }
-
-        const auto numInputs = m_inputDims.size();
-        if (inputs.size() != numInputs) {
-            std::cout << "Incorrect number of inputs provided!" << std::endl;
-            return false;
-        }
-
-        const auto batchSize = static_cast<int32_t>(inputs[0].size());
-
-        std::vector<cv::cuda::GpuMat> preprocessedInputs;
-        for (size_t i = 0; i < numInputs; ++i) {
-            const auto &batchInput = inputs[i];
-            const auto &dims = m_inputDims[i];
-
-            nvinfer1::Dims4 inputDims = {batchSize, dims.d[0], dims.d[1], dims.d[2]};
-            m_context->setInputShape(m_IOTensorNames[i].c_str(), inputDims);
-
-            // Process in FP32 then convert to FP16 in one step (custom CUDA kernel).
-            auto processed = blobFromGpuMatsFP16(batchInput, m_subVals, m_divVals, m_normalize, m_stream);
-
-            // Ensure 32-byte alignment for FP16 tensor cores.
-            size_t pitch = (processed.step + 31) & ~31;
-            if (processed.step != pitch) {
-                cv::cuda::GpuMat aligned(processed.rows, processed.cols, CV_16FC3, pitch);
-                processed.copyTo(aligned);
-                preprocessedInputs.push_back(aligned);
-                m_buffers[i] = aligned.ptr<void>();
-            } else {
-                preprocessedInputs.push_back(processed);
-                m_buffers[i] = processed.ptr<void>();
-            }
-        }
-
-        if (!m_context->allInputDimensionsSpecified()) {
-            throw std::runtime_error("Not all required dimensions specified");
-        }
-
-        for (size_t i = 0; i < m_buffers.size(); ++i) {
-            if (!m_context->setTensorAddress(m_IOTensorNames[i].c_str(), m_buffers[i])) {
-                return false;
-            }
-        }
-
-        if (!m_context->enqueueV3(m_stream)) {
-            return false;
-        }
-
-        featureVectors.clear();
-        for (int batch = 0; batch < batchSize; ++batch) {
-            std::vector<std::vector<float>> batchOutputs;
-            for (int32_t outputBinding = numInputs; outputBinding < m_engine->getNbIOTensors(); ++outputBinding) {
-                const uint32_t length = m_outputLengths[outputBinding - numInputs];
-
-                // FP16 -> FP32 on the GPU, then a single host transfer. Replaces the previous
-                // scalar host-side __half2float loop (c23).
-                ensureFp32StagingCapacity(length);
-
-                const __half *deviceFp16 = reinterpret_cast<const __half *>(static_cast<char *>(m_buffers[outputBinding]) +
-                                                                            (batch * sizeof(__half) * length));
-                launchConvertFP16ToFP32Kernel(deviceFp16, m_fp32Staging, static_cast<int>(length), m_stream);
-
-                std::vector<float> output(length);
-                Util::checkCudaErrorCode(
-                    cudaMemcpyAsync(output.data(), m_fp32Staging, length * sizeof(float), cudaMemcpyDeviceToHost, m_stream));
-
-                Util::checkCudaErrorCode(cudaStreamSynchronize(m_stream)); // own each batch's output before the next overwrites the staging buf
-                batchOutputs.emplace_back(std::move(output));
-            }
-            featureVectors.emplace_back(std::move(batchOutputs));
-        }
-
-        return true;
+    // c36: legacy runInference path retired. EngineFP16 only ships the fast path now —
+    // YoloV8::detectObjects dispatches to runInferenceFromBGR via dynamic_cast for FP16 engines,
+    // and EngineFP32::runInference is the only remaining caller of the OpenCV-based input prep.
+    // Kept as a stub purely to satisfy the EngineBase pure virtual.
+    bool runInference(const std::vector<std::vector<cv::cuda::GpuMat>> & /*inputs*/,
+                      std::vector<std::vector<std::vector<float>>> & /*featureVectors*/) override {
+        std::cout << "EngineFP16::runInference is retired — call runInferenceFromBGR instead." << std::endl;
+        return false;
     }
 
     [[nodiscard]] const std::vector<nvinfer1::Dims3> &getInputDims() const override { return m_inputDims; }
@@ -354,28 +282,7 @@ protected:
     }
 
 private:
-    // Reusable device-side FP32 staging buffer for the FP16->FP32 output kernel (c23).
-    // Sized to the largest output binding × batch and reused across calls.
-    void ensureFp32StagingCapacity(uint32_t lengthElems) {
-        if (lengthElems <= m_fp32StagingCapacity) {
-            return;
-        }
-        if (m_fp32Staging) {
-            Util::checkCudaErrorCode(cudaFreeAsync(m_fp32Staging, m_stream));
-            Util::checkCudaErrorCode(cudaStreamSynchronize(m_stream));
-            m_fp32Staging = nullptr;
-        }
-        Util::checkCudaErrorCode(cudaMallocAsync(reinterpret_cast<void **>(&m_fp32Staging), lengthElems * sizeof(float), m_stream));
-        Util::checkCudaErrorCode(cudaStreamSynchronize(m_stream));
-        m_fp32StagingCapacity = lengthElems;
-    }
-
     void clearGpuBuffers() {
-        if (m_stream && m_fp32Staging) {
-            cudaFreeAsync(m_fp32Staging, m_stream);
-            m_fp32Staging = nullptr;
-            m_fp32StagingCapacity = 0;
-        }
         if (m_stream && m_ownedInputBuffer) {
             cudaFreeAsync(m_ownedInputBuffer, m_stream);
             m_ownedInputBuffer = nullptr;
@@ -394,31 +301,6 @@ private:
         m_buffers.clear();
     }
 
-    static void convertFP32ToFP16(const cv::cuda::GpuMat &input, cv::cuda::GpuMat &output, cudaStream_t stream) {
-        output.create(input.rows, input.cols, CV_16FC3);
-        const int numElements = input.rows * input.cols * 3;
-        launchConvertFP32ToFP16Kernel(input.ptr<float>(), output.ptr<__half>(), numElements, stream);
-        cudaError_t error = cudaGetLastError();
-        if (error != cudaSuccess) {
-            throw std::runtime_error("CUDA error in FP16 conversion: " + std::string(cudaGetErrorString(error)));
-        }
-        Util::checkCudaErrorCode(cudaStreamSynchronize(stream));
-    }
-
-    // FP16-flavored input prep: build the FP32 blob via the shared base helper, then cast to FP16
-    // via the custom kernel on the engine's stream.
-    static cv::cuda::GpuMat blobFromGpuMatsFP16(const std::vector<cv::cuda::GpuMat> &batchInput, const std::array<float, 3> &subVals,
-                                                const std::array<float, 3> &divVals, bool normalize, cudaStream_t stream) {
-        cv::cuda::GpuMat mfloat = blobFromGpuMats(batchInput, subVals, divVals, normalize);
-        cv::cuda::GpuMat mhalf;
-        convertFP32ToFP16(mfloat, mhalf, stream);
-        return mhalf;
-    }
-
-    std::array<float, 3> m_subVals{};
-    std::array<float, 3> m_divVals{};
-    bool m_normalize{true};
-
     std::vector<void *> m_buffers;
     std::vector<uint32_t> m_outputLengths{};
     std::vector<nvinfer1::Dims3> m_inputDims;
@@ -429,12 +311,6 @@ private:
     std::unique_ptr<nvinfer1::IRuntime> m_runtime;
     std::unique_ptr<nvinfer1::ICudaEngine> m_engine;
     std::unique_ptr<nvinfer1::IExecutionContext> m_context;
-
-    // Staging buffer for the FP16->FP32 output kernel (c23). The fast path no longer uses it
-    // (c34: raw FP16 D2H + CPU-side conversion); kept for the legacy runInference path until the
-    // helper itself is removed in the cleanup commit.
-    float *m_fp32Staging = nullptr;
-    uint32_t m_fp32StagingCapacity = 0;
 
     // c34: host-side FP16 staging for the fast path's raw-FP16 D2H copy. Resized lazily.
     std::vector<__half> m_hostFp16Staging;

@@ -10,13 +10,6 @@
 extern "C" {
 #endif
 
-// Input-side cast: FP32 -> FP16 (vectorized over half2 since c22).
-void launchConvertFP32ToFP16Kernel(const float *input, __half *output, int size, cudaStream_t stream = nullptr);
-
-// Output-side cast: FP16 -> FP32 (vectorized over half2). Used by EngineFP16::runInference to
-// avoid the host-side scalar conversion loop.
-void launchConvertFP16ToFP32Kernel(const __half *input, float *output, int size, cudaStream_t stream = nullptr);
-
 // Fused uint8 BGR -> FP16 CHW preprocessing. Reads a packed uint8 BGR source image (with arbitrary
 // row pitch in bytes) and writes a contiguous FP16 CHW tensor in RGB plane order, applying:
 //   - bilinear letterbox resize (top-left aligned, zero-padded right/bottom — matches the previous

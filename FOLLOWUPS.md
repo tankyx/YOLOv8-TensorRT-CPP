@@ -3,7 +3,7 @@
 Engineering work deferred from the `cleanup-optim-robustness` branch, plus two adjacent investigations the user requested:
 
 1. [Deferred optimizations](#1-deferred-optimizations)
-   - [c25 — fused preprocess CUDA kernel](#c25--fused-preprocess-cuda-kernel)
+   - ~~c25 — fused preprocess CUDA kernel~~ — **landed as c33–c36** (FP16 path only).
    - [c26 — CUDA-D3D11 interop capture path](#c26--cuda-d3d11-interop-capture-path)
    - [c28 — overlap crosshair GPU match with TRT inference](#c28--overlap-crosshair-gpu-match-with-trt-inference)
 2. [INT8 inference path](#2-int8-inference-path)
@@ -17,63 +17,15 @@ Everything below assumes the post-cleanup state of the tree (engines unified und
 
 c25 and c26 were ranked high-value / high-risk in the original plan and skipped because the host running development is Linux while the project is Windows-only — both touch correctness in ways that desk-review can't catch (sub-pixel detection drift in c25, format/synchronization gotchas in c26). c28 is a small follow-on to c27 (GPU crosshair match) that reclaims its remaining latency by stream-overlapping with TRT inference. Land all three with smoke-tests on Windows, not blind.
 
-### c25 — fused preprocess CUDA kernel
+### ~~c25 — fused preprocess CUDA kernel~~
 
-#### Why
-
-Current preprocess at `src/yolov8.cpp:37 YoloV8::preprocess()` and `src/EngineBase.h blobFromGpuMats()` chains six OpenCV CUDA calls:
-
-1. `cv::cuda::cvtColor(BGR → RGB)`
-2. `EngineBase::resizeKeepAspectRatioPadRightBottom` (which calls `cv::cuda::resize` + `cv::cuda::GpuMat::copyTo` for the letterbox pad)
-3. `cv::cuda::split` to interleave HWC → CHW
-4. `cv::cuda::GpuMat::convertTo` (uint8 → float, /255)
-5. `cv::cuda::subtract`
-6. `cv::cuda::divide`
-7. (FP16 only) `launchConvertFP32ToFP16Kernel` from `EngineFP16Kernels.cu`
-
-That's six to seven kernel launches per frame, each with launch overhead and a separate global-memory pass. For a 320×320×3 input the math is trivial — it's launch overhead + memory bandwidth that costs.
-
-Estimated win: 1–2 ms per detection on RTX 40 series, depending on input size.
-
-#### Design
-
-Single kernel `preprocessBgrToBlob`:
-
-- Input: source `cv::cuda::GpuMat` (BGR uint8, arbitrary `srcH × srcW × 3`).
-- Output: device pointer to a CHW `float` (or `__half`) blob of shape `1 × 3 × dstH × dstW`.
-- Per-thread work: one output pixel at `(c, dy, dx)` in dst space. Compute the inverse-letterbox source `(sy, sx)` in float, sample the source with bilinear interpolation (or nearest, matching current behavior — `cv::cuda::resize` with default `INTER_LINEAR` is bilinear), apply BGR→RGB swap (`channelSrc = 2 - c` for the YOLO RGB channel order), divide by 255, optional subVals/divVals normalization, optional `__float2half` cast.
-- Threads outside the un-padded region write the letterbox bgcolor (currently `cv::Scalar(0, 0, 0)` so just zero).
-
-The letterbox math reproduces `EngineBase::resizeKeepAspectRatioPadRightBottom` (`src/EngineBase.h:106`):
-
-```
-r = min(dstW / srcW, dstH / srcH)
-unpadW = srcW * r,  unpadH = srcH * r
-sx = dx / r,        sy = dy / r
-out-of-bounds (dx >= unpadW || dy >= unpadH) → write bgcolor
-```
-
-#### File-level plan
-
-- New `src/PreprocessKernels.cu` exporting two `extern "C"` launchers:
-  - `launchPreprocessBgrToBlobFP32(const uint8_t* src, int srcStep, int srcW, int srcH, float* dst, int dstW, int dstH, float subB, float subG, float subR, float divB, float divG, float divR, bool normalize, cudaStream_t stream)`
-  - `launchPreprocessBgrToBlobFP16(...)` — same parameters, `__half* dst`.
-- New `src/PreprocessKernels.h` with the C declarations (mirror `EngineFP16Kernels.h`).
-- `CMakeLists.txt` — add `PreprocessKernels.cu` to a CUDA static lib (or to the existing `engine_cuda_kernels` target).
-- `src/EngineFP32.h::runInference` and `src/EngineFP16.h::runInference` — replace the call to `blobFromGpuMats(...)` (and, for FP16, the FP32→FP16 cast) with a direct call to the new launcher writing into a pre-allocated, persistent device blob owned by the engine. Allocate that blob in `loadNetwork()` once we know `inputDims`.
-- `src/yolov8.cpp::preprocess` collapses into "compute `m_ratio`, hand the source GpuMat directly to the engine"; the engine no longer takes a `vector<vector<GpuMat>>` for input — the API becomes `runInference(const cv::cuda::GpuMat& src, vector<vector<vector<float>>>& out)`. Keep the old API as a deprecated overload if you want the migration to be staged.
-
-#### Verification (mandatory before merge)
-
-- Bit-comparable detection coords on a fixed input video vs the post-c24 baseline (FP32 path: bit-exact; FP16 path: ±1 px tolerance — the float-vs-half summation order may drift sub-pixel).
-- Visual sanity: render a single frame, overlay the detection boxes, eyeball the alignment vs the OpenCV-CUDA pipeline. A bug in the inverse-letterbox math will shift boxes by one or two pixels uniformly — easy to miss in latency numbers, obvious visually.
-- Boundary tests: aspect ratios that produce non-square unpad regions (e.g. 1920×1080 → 640×640 letterbox), tiny inputs, inputs where `srcW == dstW`.
-
-#### Risk register
-
-- **Bilinear sampling vs OpenCV's**: OpenCV's `cv::cuda::resize` with `INTER_LINEAR` follows a specific corner convention. Reproduce it exactly or accept a documented sub-pixel drift.
-- **Normalize semantics**: current code does `gpu_dst.convertTo(mfloat, CV_32FC3, 1.f / 255.f)` then `cv::cuda::subtract` and `cv::cuda::divide`. The kernel must apply these in the same order `(x/255 - sub) / div` and the project currently uses `subVals = {0,0,0}, divVals = {1,1,1}` so most paths are no-ops — but verify for any future configs.
-- **FP16 NaN/Inf**: only an issue if normalize introduces a divide-by-zero. Current divVals are 1, so safe.
+**Landed as c33–c36** (FP16 path only). The fused `launchFusedPreprocBGRtoFP16Kernel` in
+`src/EngineFP16Kernels.cu` reads raw uint8 BGR (arbitrary pitch), letterboxes with bilinear
+sampling, swaps to RGB, normalizes, and writes FP16 CHW directly into the engine input buffer.
+`EngineFP16` exposes the fast path via `runInferenceFromBGR`; `YoloV8::detectObjects` dispatches
+to it via `dynamic_cast`. The OpenCV-based preproc + the FP32 intermediate are gone for FP16. The
+EngineFP32 path still uses the original `blobFromGpuMats` — open question whether it's worth
+porting too (the use-case is FP32 fallback only).
 
 ---
 
