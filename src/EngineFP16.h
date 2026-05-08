@@ -160,14 +160,15 @@ public:
     // YoloV8::preprocess used to set m_ratio to.
     bool runInferenceFromBGR(const cv::cuda::GpuMat &bgr, float &outRatio, const std::array<float, 3> &subVals,
                              const std::array<float, 3> &divVals, bool normalize) {
-        if (bgr.empty() || bgr.type() != CV_8UC3) {
-            std::cout << "runInferenceFromBGR expects a non-empty CV_8UC3 GpuMat" << std::endl;
+        if (bgr.empty() || (bgr.type() != CV_8UC3 && bgr.type() != CV_8UC4)) {
+            std::cout << "runInferenceFromBGR expects a non-empty CV_8UC3 (BGR) or CV_8UC4 (BGRA) GpuMat" << std::endl;
             return false;
         }
         if (m_inputDims.size() != 1 || m_inputBufferIndex < 0) {
             std::cout << "runInferenceFromBGR requires a single FP16 input binding" << std::endl;
             return false;
         }
+        const int srcChannels = bgr.type() == CV_8UC3 ? 3 : 4;
 
         const auto &dims = m_inputDims[0];
         const int dstC = dims.d[0];
@@ -195,6 +196,7 @@ public:
         p.srcW = bgr.cols;
         p.srcH = bgr.rows;
         p.srcPitch = static_cast<int>(bgr.step);
+        p.srcChannels = srcChannels;
         p.dst = static_cast<__half *>(m_buffers[m_inputBufferIndex]);
         p.dstW = dstW;
         p.dstH = dstH;

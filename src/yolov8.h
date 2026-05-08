@@ -86,6 +86,7 @@ private:
     size_t m_captureBufferPitch = 0;
     int m_captureWidth = 0;
     int m_captureHeight = 0;
+    int m_captureChannels = 0; // 3 (CV_8UC3 BGR) or 4 (CV_8UC4 BGRA)
 
     cudaGraph_t m_graph = nullptr;
     cudaGraphExec_t m_graphExec = nullptr;

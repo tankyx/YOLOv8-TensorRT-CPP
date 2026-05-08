@@ -24,7 +24,8 @@ struct FusedPreprocParams {
     const uint8_t *src;
     int srcW;
     int srcH;
-    int srcPitch; // bytes per source row
+    int srcPitch;    // bytes per source row
+    int srcChannels; // 3 (packed BGR) or 4 (packed BGRA — alpha is ignored)
 
     __half *dst;
     int dstW;

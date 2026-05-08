@@ -167,31 +167,41 @@ std::vector<Object> YoloV8::detectObjects(const cv::cuda::GpuMat &inputImageBGR)
 
         // Lazy-init the stable capture buffer on the first call. The detection thread always
         // hands us a constant-size GpuMat (CaptureWidth × CaptureHeight from the INI), so the
-        // buffer is sized once.
+        // buffer is sized once. Channel count is BGR (3) for the cv::Mat -> upload path and
+        // BGRA (4) for the c39 DXGI/CUDA-interop direct-GPU path.
+        const int srcChannels = inputImageBGR.type() == CV_8UC3 ? 3 : (inputImageBGR.type() == CV_8UC4 ? 4 : 0);
+        if (srcChannels == 0) {
+            throw std::runtime_error("Error: detectObjects requires CV_8UC3 (BGR) or CV_8UC4 (BGRA) GpuMat.");
+        }
         if (!m_captureBuffer) {
             m_captureWidth = inputImageBGR.cols;
             m_captureHeight = inputImageBGR.rows;
-            m_captureBufferPitch = static_cast<size_t>(m_captureWidth) * 3;
+            m_captureChannels = srcChannels;
+            m_captureBufferPitch = static_cast<size_t>(m_captureWidth) * m_captureChannels;
             const size_t bytes = m_captureBufferPitch * m_captureHeight;
             cudaMalloc(reinterpret_cast<void **>(&m_captureBuffer), bytes);
-        } else if (inputImageBGR.cols != m_captureWidth || inputImageBGR.rows != m_captureHeight) {
-            // Capture size changed under us. Tear down the graph + buffer and re-init.
+        } else if (inputImageBGR.cols != m_captureWidth || inputImageBGR.rows != m_captureHeight ||
+                   srcChannels != m_captureChannels) {
+            // Capture geometry changed under us. Tear down the graph + buffer and re-init.
             releaseGraph();
             cudaFree(m_captureBuffer);
             m_captureBuffer = nullptr;
             m_captureWidth = inputImageBGR.cols;
             m_captureHeight = inputImageBGR.rows;
-            m_captureBufferPitch = static_cast<size_t>(m_captureWidth) * 3;
+            m_captureChannels = srcChannels;
+            m_captureBufferPitch = static_cast<size_t>(m_captureWidth) * m_captureChannels;
             cudaMalloc(reinterpret_cast<void **>(&m_captureBuffer), m_captureBufferPitch * m_captureHeight);
         }
 
-        // Stage the bgr capture into the stable buffer. Outside the graph (src pointer changes
-        // per frame; only the dst is stable). Tiny — 1.2 MB at 640x640 device-to-device.
+        // Stage the capture into the stable buffer. Outside the graph (src pointer changes per
+        // frame; only the dst is stable). 1.2 MB (BGR) or 1.6 MB (BGRA) at 640x640 D2D.
         cudaMemcpy2DAsync(m_captureBuffer, m_captureBufferPitch, inputImageBGR.ptr<uint8_t>(), inputImageBGR.step,
-                          static_cast<size_t>(m_captureWidth) * 3, m_captureHeight, cudaMemcpyDeviceToDevice, stream);
+                          static_cast<size_t>(m_captureWidth) * m_captureChannels, m_captureHeight,
+                          cudaMemcpyDeviceToDevice, stream);
 
         // Non-owning view over m_captureBuffer for runInferenceFromBGR.
-        cv::cuda::GpuMat captureView(m_captureHeight, m_captureWidth, CV_8UC3, m_captureBuffer, m_captureBufferPitch);
+        const int viewType = m_captureChannels == 3 ? CV_8UC3 : CV_8UC4;
+        cv::cuda::GpuMat captureView(m_captureHeight, m_captureWidth, viewType, m_captureBuffer, m_captureBufferPitch);
 
         if (!m_graphCaptured) {
             // Warmup pass — TRT may make internal allocations on first enqueueV3 which must

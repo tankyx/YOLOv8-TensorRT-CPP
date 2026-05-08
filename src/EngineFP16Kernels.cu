@@ -56,19 +56,22 @@ __global__ void fusedPreprocBGRtoFP16Kernel(FusedPreprocParams p) {
     const uint8_t *row0 = p.src + y0 * p.srcPitch;
     const uint8_t *row1 = p.src + y1 * p.srcPitch;
 
-    // Source is packed BGR uint8: pixel = (B, G, R). Output planes are (R, G, B).
-    const float b00 = static_cast<float>(row0[x0 * 3 + 0]);
-    const float g00 = static_cast<float>(row0[x0 * 3 + 1]);
-    const float r00 = static_cast<float>(row0[x0 * 3 + 2]);
-    const float b01 = static_cast<float>(row0[x1 * 3 + 0]);
-    const float g01 = static_cast<float>(row0[x1 * 3 + 1]);
-    const float r01 = static_cast<float>(row0[x1 * 3 + 2]);
-    const float b10 = static_cast<float>(row1[x0 * 3 + 0]);
-    const float g10 = static_cast<float>(row1[x0 * 3 + 1]);
-    const float r10 = static_cast<float>(row1[x0 * 3 + 2]);
-    const float b11 = static_cast<float>(row1[x1 * 3 + 0]);
-    const float g11 = static_cast<float>(row1[x1 * 3 + 1]);
-    const float r11 = static_cast<float>(row1[x1 * 3 + 2]);
+    // Source is packed BGR (srcChannels==3) or BGRA (srcChannels==4). In both cases the first
+    // three bytes of each pixel are (B, G, R); the fourth byte (alpha) is read but never used.
+    // Output planes are (R, G, B).
+    const int s = p.srcChannels;
+    const float b00 = static_cast<float>(row0[x0 * s + 0]);
+    const float g00 = static_cast<float>(row0[x0 * s + 1]);
+    const float r00 = static_cast<float>(row0[x0 * s + 2]);
+    const float b01 = static_cast<float>(row0[x1 * s + 0]);
+    const float g01 = static_cast<float>(row0[x1 * s + 1]);
+    const float r01 = static_cast<float>(row0[x1 * s + 2]);
+    const float b10 = static_cast<float>(row1[x0 * s + 0]);
+    const float g10 = static_cast<float>(row1[x0 * s + 1]);
+    const float r10 = static_cast<float>(row1[x0 * s + 2]);
+    const float b11 = static_cast<float>(row1[x1 * s + 0]);
+    const float g11 = static_cast<float>(row1[x1 * s + 1]);
+    const float r11 = static_cast<float>(row1[x1 * s + 2]);
 
     float r = bilerp(r00, r01, r10, r11, ax, ay);
     float g = bilerp(g00, g01, g10, g11, ax, ay);
