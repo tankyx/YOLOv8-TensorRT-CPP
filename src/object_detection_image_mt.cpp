@@ -8,6 +8,7 @@
 #include <opencv2/opencv.hpp>
 
 #include "DXGICapture.h"
+#include "DXGICaptureCUDA.h"
 #include "DiscordOverlay.h"
 #include "INIParser.h" // Make sure to include the INI parser we created earlier
 #include "MouseController.h"
