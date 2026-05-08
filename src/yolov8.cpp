@@ -41,7 +41,14 @@ YoloV8::YoloV8(const std::string &onnxModelPath, const YoloV8Config &config)
     }
 }
 
-YoloV8::~YoloV8() { freePostprocBuffers(); }
+YoloV8::~YoloV8() {
+    releaseGraph();
+    if (m_captureBuffer) {
+        cudaFree(m_captureBuffer);
+        m_captureBuffer = nullptr;
+    }
+    freePostprocBuffers();
+}
 
 void YoloV8::allocatePostprocBuffers() {
     if (m_devSurvivorCount) {
@@ -62,6 +69,54 @@ void YoloV8::freePostprocBuffers() {
         cudaFree(m_devSurvivors);
         m_devSurvivors = nullptr;
     }
+}
+
+void YoloV8::releaseGraph() {
+    if (m_graphExec) {
+        cudaGraphExecDestroy(m_graphExec);
+        m_graphExec = nullptr;
+    }
+    if (m_graph) {
+        cudaGraphDestroy(m_graph);
+        m_graph = nullptr;
+    }
+    m_graphCaptured = false;
+}
+
+// c38: the work that gets captured into the graph and replayed every frame. Schedules preproc
+// + enqueueV3 + survivor reset + filter+decode + D2H, all on `stream`. Does NOT synchronize.
+bool YoloV8::runFp16InferenceOnStream(EngineFP16 *fp16Engine, const cv::cuda::GpuMat &captureView, int numAnchors,
+                                      int numClasses, cudaStream_t stream) {
+    float ratio = 1.0f;
+    if (!fp16Engine->runInferenceFromBGR(captureView, ratio, SUB_VALS, DIV_VALS, NORMALIZE)) {
+        return false;
+    }
+    // m_imgWidth/m_imgHeight/m_ratio are stable across frames (capture size is fixed by the INI),
+    // so the ratio computed here at capture time is the same one we want at replay time.
+    m_imgWidth = static_cast<float>(captureView.cols);
+    m_imgHeight = static_cast<float>(captureView.rows);
+    m_ratio = ratio;
+
+    cudaMemsetAsync(m_devSurvivorCount, 0, sizeof(uint32_t), stream);
+
+    YoloFilterParams fp{};
+    fp.output = static_cast<const __half *>(fp16Engine->outputDevicePtr(0));
+    fp.numAnchors = numAnchors;
+    fp.numClasses = numClasses;
+    fp.ratio = m_ratio;
+    fp.imgW = m_imgWidth;
+    fp.imgH = m_imgHeight;
+    fp.probThreshold = PROBABILITY_THRESHOLD;
+    fp.outCount = m_devSurvivorCount;
+    fp.outSurvivors = m_devSurvivors;
+    fp.maxSurvivors = kMaxSurvivors;
+    launchYoloFilterAndDecodeKernel(fp, stream);
+
+    cudaMemcpyAsync(&m_hostSurvivorCount, m_devSurvivorCount, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(m_hostSurvivors.data(), m_devSurvivors,
+                    static_cast<size_t>(kMaxSurvivors) * kYoloSurvivorStride * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    return true;
 }
 
 std::vector<std::vector<cv::cuda::GpuMat>> YoloV8::preprocess(const cv::cuda::GpuMat &gpuImg) {
@@ -95,19 +150,10 @@ std::vector<std::vector<cv::cuda::GpuMat>> YoloV8::preprocess(const cv::cuda::Gp
 }
 
 std::vector<Object> YoloV8::detectObjects(const cv::cuda::GpuMat &inputImageBGR) {
-    // c37 FP16 fast path: engine -> filter+decode kernel -> small D2H -> CPU NMS.
-    // Everything from preproc through the per-anchor scan stays on the GPU; the host only
-    // sees the survivors (≤ kMaxSurvivors records, 24 KB).
+    // c37/c38 FP16 fast path: copy the bgr capture into a stable device buffer, then either
+    // capture the per-frame GPU sequence into a CUDA graph (first call) or replay the captured
+    // graph (every subsequent call). One cudaMemcpy + one cudaGraphLaunch per frame.
     if (auto *fp16Engine = dynamic_cast<EngineFP16 *>(m_trtEngine.get())) {
-        float ratio = 1.0f;
-        const bool succ = fp16Engine->runInferenceFromBGR(inputImageBGR, ratio, SUB_VALS, DIV_VALS, NORMALIZE);
-        if (!succ) {
-            throw std::runtime_error("Error: Unable to run inference (FP16 fast path).");
-        }
-        m_imgWidth = static_cast<float>(inputImageBGR.cols);
-        m_imgHeight = static_cast<float>(inputImageBGR.rows);
-        m_ratio = ratio;
-
         std::vector<Object> ret;
         if (m_trtEngine->getOutputDims().size() != 1 || fp16Engine->numOutputs() != 1) {
             return ret; // multi-output models not supported on the fast path
@@ -119,31 +165,66 @@ std::vector<Object> YoloV8::detectObjects(const cv::cuda::GpuMat &inputImageBGR)
         const int numClasses = numChannels - 4;
         const cudaStream_t stream = fp16Engine->stream();
 
-        // Reset the survivor counter, run the filter+decode kernel on the engine output, then
-        // pull the count + survivors back to host. All on the engine's stream so it serializes
-        // correctly behind enqueueV3.
-        cudaMemsetAsync(m_devSurvivorCount, 0, sizeof(uint32_t), stream);
+        // Lazy-init the stable capture buffer on the first call. The detection thread always
+        // hands us a constant-size GpuMat (CaptureWidth × CaptureHeight from the INI), so the
+        // buffer is sized once.
+        if (!m_captureBuffer) {
+            m_captureWidth = inputImageBGR.cols;
+            m_captureHeight = inputImageBGR.rows;
+            m_captureBufferPitch = static_cast<size_t>(m_captureWidth) * 3;
+            const size_t bytes = m_captureBufferPitch * m_captureHeight;
+            cudaMalloc(reinterpret_cast<void **>(&m_captureBuffer), bytes);
+        } else if (inputImageBGR.cols != m_captureWidth || inputImageBGR.rows != m_captureHeight) {
+            // Capture size changed under us. Tear down the graph + buffer and re-init.
+            releaseGraph();
+            cudaFree(m_captureBuffer);
+            m_captureBuffer = nullptr;
+            m_captureWidth = inputImageBGR.cols;
+            m_captureHeight = inputImageBGR.rows;
+            m_captureBufferPitch = static_cast<size_t>(m_captureWidth) * 3;
+            cudaMalloc(reinterpret_cast<void **>(&m_captureBuffer), m_captureBufferPitch * m_captureHeight);
+        }
 
-        YoloFilterParams fp{};
-        fp.output = static_cast<const __half *>(fp16Engine->outputDevicePtr(0));
-        fp.numAnchors = numAnchors;
-        fp.numClasses = numClasses;
-        fp.ratio = m_ratio;
-        fp.imgW = m_imgWidth;
-        fp.imgH = m_imgHeight;
-        fp.probThreshold = PROBABILITY_THRESHOLD;
-        fp.outCount = m_devSurvivorCount;
-        fp.outSurvivors = m_devSurvivors;
-        fp.maxSurvivors = kMaxSurvivors;
-        launchYoloFilterAndDecodeKernel(fp, stream);
+        // Stage the bgr capture into the stable buffer. Outside the graph (src pointer changes
+        // per frame; only the dst is stable). Tiny — 1.2 MB at 640x640 device-to-device.
+        cudaMemcpy2DAsync(m_captureBuffer, m_captureBufferPitch, inputImageBGR.ptr<uint8_t>(), inputImageBGR.step,
+                          static_cast<size_t>(m_captureWidth) * 3, m_captureHeight, cudaMemcpyDeviceToDevice, stream);
 
-        cudaMemcpyAsync(&m_hostSurvivorCount, m_devSurvivorCount, sizeof(uint32_t),
-                        cudaMemcpyDeviceToHost, stream);
-        cudaMemcpyAsync(m_hostSurvivors.data(), m_devSurvivors,
-                        static_cast<size_t>(kMaxSurvivors) * kYoloSurvivorStride * sizeof(float),
-                        cudaMemcpyDeviceToHost, stream);
+        // Non-owning view over m_captureBuffer for runInferenceFromBGR.
+        cv::cuda::GpuMat captureView(m_captureHeight, m_captureWidth, CV_8UC3, m_captureBuffer, m_captureBufferPitch);
+
+        if (!m_graphCaptured) {
+            // Warmup pass — TRT may make internal allocations on first enqueueV3 which must
+            // happen outside stream capture.
+            if (!runFp16InferenceOnStream(fp16Engine, captureView, numAnchors, numClasses, stream)) {
+                throw std::runtime_error("Error: FP16 warmup pass failed.");
+            }
+            cudaStreamSynchronize(stream);
+
+            // Capture the same sequence into a graph.
+            cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
+            if (!runFp16InferenceOnStream(fp16Engine, captureView, numAnchors, numClasses, stream)) {
+                cudaStreamEndCapture(stream, &m_graph);
+                cudaGraphDestroy(m_graph);
+                m_graph = nullptr;
+                throw std::runtime_error("Error: FP16 graph-capture pass failed.");
+            }
+            cudaStreamEndCapture(stream, &m_graph);
+
+            const cudaError_t instErr = cudaGraphInstantiate(&m_graphExec, m_graph, nullptr, nullptr, 0);
+            if (instErr != cudaSuccess) {
+                cudaGraphDestroy(m_graph);
+                m_graph = nullptr;
+                throw std::runtime_error(std::string("cudaGraphInstantiate failed: ") + cudaGetErrorString(instErr));
+            }
+            m_graphCaptured = true;
+            cudaStreamSynchronize(stream); // own the warmup outputs before returning them
+            return postprocessFromSurvivors(m_hostSurvivorCount);
+        }
+
+        // Steady state: replay the captured graph.
+        cudaGraphLaunch(m_graphExec, stream);
         cudaStreamSynchronize(stream);
-
         return postprocessFromSurvivors(m_hostSurvivorCount);
     }
 

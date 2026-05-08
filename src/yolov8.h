@@ -73,6 +73,24 @@ private:
     void freePostprocBuffers();
     std::vector<Object> postprocessFromSurvivors(uint32_t count);
 
+    // c38: CUDA graph capture for the per-frame GPU sequence (preproc + enqueueV3 + memset +
+    // filter+decode + D2H). Captured once on the first call after a warmup, replayed every
+    // frame. Requires a stable device pointer for the preproc kernel's input — m_captureBuffer
+    // is that stable buffer; per frame, the bgr capture is cudaMemcpy2D'd into it before the
+    // graph is launched.
+    bool runFp16InferenceOnStream(class EngineFP16 *fp16Engine, const cv::cuda::GpuMat &captureView,
+                                  int numAnchors, int numClasses, cudaStream_t stream);
+    void releaseGraph();
+
+    uint8_t *m_captureBuffer = nullptr;
+    size_t m_captureBufferPitch = 0;
+    int m_captureWidth = 0;
+    int m_captureHeight = 0;
+
+    cudaGraph_t m_graph = nullptr;
+    cudaGraphExec_t m_graphExec = nullptr;
+    bool m_graphCaptured = false;
+
     static constexpr int kMaxSurvivors = 1024;
     uint32_t *m_devSurvivorCount = nullptr;
     float *m_devSurvivors = nullptr;
