@@ -1,5 +1,7 @@
 #pragma once
 #include "EngineFactory.h"
+#include <cstdint>
+#include <cuda_runtime.h>
 #include <fstream>
 #include <algorithm>
 #include <opencv2/cudaimgproc.hpp>
@@ -52,6 +54,7 @@ struct YoloV8Config {
 class YoloV8 {
 public:
     YoloV8(const std::string &onnxModelPath, const YoloV8Config &config);
+    ~YoloV8();
 
     std::vector<Object> detectObjects(const cv::Mat &inputImageBGR);
     std::vector<Object> detectObjects(const cv::cuda::GpuMat &inputImageBGR);
@@ -62,6 +65,19 @@ public:
 private:
     std::vector<std::vector<cv::cuda::GpuMat>> preprocess(const cv::cuda::GpuMat &gpuImg);
     std::vector<Object> postprocessDetect(const std::vector<float> &featureVector);
+
+    // c37: GPU postprocess buffers used by the FP16 fast path. The filter+decode kernel writes
+    // up to kMaxSurvivors compacted survivor records into m_devSurvivors and atomically counts
+    // them in m_devSurvivorCount; both are D2H'd before the CPU NMS pass.
+    void allocatePostprocBuffers();
+    void freePostprocBuffers();
+    std::vector<Object> postprocessFromSurvivors(uint32_t count);
+
+    static constexpr int kMaxSurvivors = 1024;
+    uint32_t *m_devSurvivorCount = nullptr;
+    float *m_devSurvivors = nullptr;
+    uint32_t m_hostSurvivorCount = 0;
+    std::vector<float> m_hostSurvivors;
 
     std::unique_ptr<EngineBase> m_trtEngine = nullptr;
 

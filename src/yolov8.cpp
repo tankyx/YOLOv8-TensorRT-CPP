@@ -1,4 +1,5 @@
 #include "yolov8.h"
+#include "YoloPostprocKernels.h"
 
 YoloV8::YoloV8(const std::string &onnxModelPath, const YoloV8Config &config)
     : PROBABILITY_THRESHOLD(config.probabilityThreshold), NMS_THRESHOLD(config.nmsThreshold), TOP_K(config.topK),
@@ -32,6 +33,35 @@ YoloV8::YoloV8(const std::string &onnxModelPath, const YoloV8Config &config)
         throw std::runtime_error(errMsg);
     }
     std::cout << "TensorRT engine built and loaded!" << std::endl;
+
+    // c37: GPU postprocess buffers for the FP16 fast path. Only the FP16 engine uses them;
+    // FP32 still runs the CPU anchor loop in postprocessDetect.
+    if (config.precision == Precision::FP16) {
+        allocatePostprocBuffers();
+    }
+}
+
+YoloV8::~YoloV8() { freePostprocBuffers(); }
+
+void YoloV8::allocatePostprocBuffers() {
+    if (m_devSurvivorCount) {
+        return;
+    }
+    cudaMalloc(reinterpret_cast<void **>(&m_devSurvivorCount), sizeof(uint32_t));
+    cudaMalloc(reinterpret_cast<void **>(&m_devSurvivors),
+               static_cast<size_t>(kMaxSurvivors) * kYoloSurvivorStride * sizeof(float));
+    m_hostSurvivors.resize(static_cast<size_t>(kMaxSurvivors) * kYoloSurvivorStride);
+}
+
+void YoloV8::freePostprocBuffers() {
+    if (m_devSurvivorCount) {
+        cudaFree(m_devSurvivorCount);
+        m_devSurvivorCount = nullptr;
+    }
+    if (m_devSurvivors) {
+        cudaFree(m_devSurvivors);
+        m_devSurvivors = nullptr;
+    }
 }
 
 std::vector<std::vector<cv::cuda::GpuMat>> YoloV8::preprocess(const cv::cuda::GpuMat &gpuImg) {
@@ -65,8 +95,9 @@ std::vector<std::vector<cv::cuda::GpuMat>> YoloV8::preprocess(const cv::cuda::Gp
 }
 
 std::vector<Object> YoloV8::detectObjects(const cv::cuda::GpuMat &inputImageBGR) {
-    // c33/c35 FP16 fast path: the engine writes outputs into its pooled host vectors; no
-    // triple-nested vector and no per-frame allocation.
+    // c37 FP16 fast path: engine -> filter+decode kernel -> small D2H -> CPU NMS.
+    // Everything from preproc through the per-anchor scan stays on the GPU; the host only
+    // sees the survivors (≤ kMaxSurvivors records, 24 KB).
     if (auto *fp16Engine = dynamic_cast<EngineFP16 *>(m_trtEngine.get())) {
         float ratio = 1.0f;
         const bool succ = fp16Engine->runInferenceFromBGR(inputImageBGR, ratio, SUB_VALS, DIV_VALS, NORMALIZE);
@@ -78,10 +109,42 @@ std::vector<Object> YoloV8::detectObjects(const cv::cuda::GpuMat &inputImageBGR)
         m_ratio = ratio;
 
         std::vector<Object> ret;
-        if (m_trtEngine->getOutputDims().size() == 1) {
-            ret = postprocessDetect(fp16Engine->hostOutputs()[0]);
+        if (m_trtEngine->getOutputDims().size() != 1 || fp16Engine->numOutputs() != 1) {
+            return ret; // multi-output models not supported on the fast path
         }
-        return ret;
+
+        const auto &outputDims = m_trtEngine->getOutputDims();
+        const int numChannels = outputDims[0].d[1];
+        const int numAnchors = outputDims[0].d[2];
+        const int numClasses = numChannels - 4;
+        const cudaStream_t stream = fp16Engine->stream();
+
+        // Reset the survivor counter, run the filter+decode kernel on the engine output, then
+        // pull the count + survivors back to host. All on the engine's stream so it serializes
+        // correctly behind enqueueV3.
+        cudaMemsetAsync(m_devSurvivorCount, 0, sizeof(uint32_t), stream);
+
+        YoloFilterParams fp{};
+        fp.output = static_cast<const __half *>(fp16Engine->outputDevicePtr(0));
+        fp.numAnchors = numAnchors;
+        fp.numClasses = numClasses;
+        fp.ratio = m_ratio;
+        fp.imgW = m_imgWidth;
+        fp.imgH = m_imgHeight;
+        fp.probThreshold = PROBABILITY_THRESHOLD;
+        fp.outCount = m_devSurvivorCount;
+        fp.outSurvivors = m_devSurvivors;
+        fp.maxSurvivors = kMaxSurvivors;
+        launchYoloFilterAndDecodeKernel(fp, stream);
+
+        cudaMemcpyAsync(&m_hostSurvivorCount, m_devSurvivorCount, sizeof(uint32_t),
+                        cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyAsync(m_hostSurvivors.data(), m_devSurvivors,
+                        static_cast<size_t>(kMaxSurvivors) * kYoloSurvivorStride * sizeof(float),
+                        cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+
+        return postprocessFromSurvivors(m_hostSurvivorCount);
     }
 
     // FP32 / generic fallback: preprocess via OpenCV, legacy runInference, transformOutput.
@@ -99,6 +162,50 @@ std::vector<Object> YoloV8::detectObjects(const cv::cuda::GpuMat &inputImageBGR)
         ret = postprocessDetect(featureVector);
     }
     return ret;
+}
+
+std::vector<Object> YoloV8::postprocessFromSurvivors(uint32_t count) {
+    // The kernel may have atomically incremented past kMaxSurvivors before bouncing the write —
+    // cap at the buffer size before we trust the data.
+    const uint32_t n = std::min(count, static_cast<uint32_t>(kMaxSurvivors));
+
+    std::vector<cv::Rect> bboxes;
+    std::vector<float> scores;
+    std::vector<int> labels;
+    bboxes.reserve(n);
+    scores.reserve(n);
+    labels.reserve(n);
+
+    for (uint32_t i = 0; i < n; ++i) {
+        const float *s = &m_hostSurvivors[i * kYoloSurvivorStride];
+        const float x0 = s[0], y0 = s[1], x1 = s[2], y1 = s[3];
+        cv::Rect_<float> bbox;
+        bbox.x = x0;
+        bbox.y = y0;
+        bbox.width = x1 - x0;
+        bbox.height = y1 - y0;
+        bboxes.push_back(bbox);
+        scores.push_back(s[4]);
+        labels.push_back(static_cast<int>(s[5]));
+    }
+
+    std::vector<int> indices;
+    cv::dnn::NMSBoxesBatched(bboxes, scores, labels, PROBABILITY_THRESHOLD, NMS_THRESHOLD, indices);
+
+    std::vector<Object> objects;
+    int cnt = 0;
+    for (auto &chosenIdx : indices) {
+        if (cnt >= TOP_K) {
+            break;
+        }
+        Object obj{};
+        obj.probability = scores[chosenIdx];
+        obj.label = labels[chosenIdx];
+        obj.rect = bboxes[chosenIdx];
+        objects.push_back(obj);
+        cnt += 1;
+    }
+    return objects;
 }
 
 std::vector<Object> YoloV8::detectObjects(const cv::Mat &inputImageBGR) {

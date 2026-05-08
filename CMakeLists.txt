@@ -66,6 +66,7 @@ endif()
 # Create CUDA kernels library
 add_library(engine_cuda_kernels STATIC
     src/EngineFP16Kernels.cu
+    src/YoloPostprocKernels.cu
 )
 
 set_target_properties(engine_cuda_kernels PROPERTIES
