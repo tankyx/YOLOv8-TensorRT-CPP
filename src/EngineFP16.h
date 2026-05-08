@@ -135,20 +135,31 @@ public:
             }
         }
 
+        // c35: pre-size the host output pool so the fast path doesn't allocate per frame. One
+        // vector per output binding, sized to that binding's element count.
+        m_hostOutputs.assign(m_outputLengths.size(), std::vector<float>{});
+        for (size_t i = 0; i < m_outputLengths.size(); ++i) {
+            m_hostOutputs[i].resize(m_outputLengths[i]);
+        }
+
         Util::checkCudaErrorCode(cudaStreamSynchronize(m_stream));
 
         return true;
     }
 
-    // c33 fast path: take the raw uint8 BGR capture directly, run the fused preproc kernel into the
-    // pre-allocated FP16 input buffer, enqueue inference, and return outputs as fp32 (existing
-    // FP16->FP32 device cast path — narrowed to D2H raw FP16 in a follow-up commit).
+    // Host-side outputs from the most recent runInferenceFromBGR call. One vector per output
+    // binding. Backing storage is owned and reused across calls (c35).
+    [[nodiscard]] const std::vector<std::vector<float>> &hostOutputs() const { return m_hostOutputs; }
+
+    // c33 fast path: take the raw uint8 BGR capture directly, run the fused preproc kernel into
+    // the pre-allocated FP16 input buffer, enqueue inference, and write outputs into the pooled
+    // host vectors exposed by hostOutputs(). Skips the triple-nested vector allocation that the
+    // legacy runInference path emits.
     //
     // outRatio is the postprocess scale factor: bbox_dst * outRatio = bbox_src. Matches what
     // YoloV8::preprocess used to set m_ratio to.
-    bool runInferenceFromBGR(const cv::cuda::GpuMat &bgr, std::vector<std::vector<std::vector<float>>> &featureVectors,
-                             float &outRatio, const std::array<float, 3> &subVals, const std::array<float, 3> &divVals,
-                             bool normalize) {
+    bool runInferenceFromBGR(const cv::cuda::GpuMat &bgr, float &outRatio, const std::array<float, 3> &subVals,
+                             const std::array<float, 3> &divVals, bool normalize) {
         if (bgr.empty() || bgr.type() != CV_8UC3) {
             std::cout << "runInferenceFromBGR expects a non-empty CV_8UC3 GpuMat" << std::endl;
             return false;
@@ -215,15 +226,12 @@ public:
             return false;
         }
 
-        // Output path (c34): D2H the raw FP16 tensor and convert to FP32 on the CPU. Skips the
-        // device-side FP16->FP32 conversion kernel + its staging buffer, halves the D2H bandwidth,
-        // and removes a kernel-launch's worth of overhead per output. The CPU conversion is a
-        // tight loop over __half2float — at YOLOv8n's ~67k output elements it's well under 100us.
+        // Output path (c34/c35): D2H raw FP16 + CPU-side cast into the pooled host vectors. No
+        // per-call allocation — the host output vectors are sized once at loadNetwork time.
         const auto numInputs = m_inputDims.size();
-        featureVectors.clear();
-        std::vector<std::vector<float>> batchOutputs;
         for (int32_t outputBinding = numInputs; outputBinding < m_engine->getNbIOTensors(); ++outputBinding) {
-            const uint32_t length = m_outputLengths[outputBinding - numInputs];
+            const size_t outIdx = outputBinding - numInputs;
+            const uint32_t length = m_outputLengths[outIdx];
 
             if (m_hostFp16Staging.size() < length) {
                 m_hostFp16Staging.resize(length);
@@ -233,15 +241,18 @@ public:
                                                      cudaMemcpyDeviceToHost, m_stream));
             Util::checkCudaErrorCode(cudaStreamSynchronize(m_stream));
 
-            std::vector<float> output(length);
+            auto &output = m_hostOutputs[outIdx];
+            // Pool already sized in loadNetwork; assert via resize-no-op to keep us safe if a
+            // future engine ever returns dynamic output shapes.
+            if (output.size() != length) {
+                output.resize(length);
+            }
             const __half *src = m_hostFp16Staging.data();
             float *dst = output.data();
             for (uint32_t k = 0; k < length; ++k) {
                 dst[k] = __half2float(src[k]);
             }
-            batchOutputs.emplace_back(std::move(output));
         }
-        featureVectors.emplace_back(std::move(batchOutputs));
         return true;
     }
 
@@ -427,6 +438,10 @@ private:
 
     // c34: host-side FP16 staging for the fast path's raw-FP16 D2H copy. Resized lazily.
     std::vector<__half> m_hostFp16Staging;
+
+    // c35: pooled host outputs. One vector per output binding, sized at loadNetwork. Reused
+    // across runInferenceFromBGR calls so we don't allocate per frame.
+    std::vector<std::vector<float>> m_hostOutputs;
 
     // c33: pre-allocated FP16 CHW input buffer used by the fused preproc fast path
     // (runInferenceFromBGR). Owned by the engine; its address is mirrored into m_buffers at the

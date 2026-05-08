@@ -65,39 +65,37 @@ std::vector<std::vector<cv::cuda::GpuMat>> YoloV8::preprocess(const cv::cuda::Gp
 }
 
 std::vector<Object> YoloV8::detectObjects(const cv::cuda::GpuMat &inputImageBGR) {
-    std::vector<std::vector<std::vector<float>>> featureVectors;
-
-    // c33 FP16 fast path: skip the OpenCV preprocess pipeline entirely. The engine reads the raw
-    // uint8 BGR capture and runs a single fused kernel (letterbox + BGR->RGB + normalize +
-    // HWC->CHW + u8->fp16) directly into its pre-allocated FP16 input buffer.
+    // c33/c35 FP16 fast path: the engine writes outputs into its pooled host vectors; no
+    // triple-nested vector and no per-frame allocation.
     if (auto *fp16Engine = dynamic_cast<EngineFP16 *>(m_trtEngine.get())) {
         float ratio = 1.0f;
-        const bool succ = fp16Engine->runInferenceFromBGR(inputImageBGR, featureVectors, ratio,
-                                                          SUB_VALS, DIV_VALS, NORMALIZE);
+        const bool succ = fp16Engine->runInferenceFromBGR(inputImageBGR, ratio, SUB_VALS, DIV_VALS, NORMALIZE);
         if (!succ) {
             throw std::runtime_error("Error: Unable to run inference (FP16 fast path).");
         }
         m_imgWidth = static_cast<float>(inputImageBGR.cols);
         m_imgHeight = static_cast<float>(inputImageBGR.rows);
         m_ratio = ratio;
-    } else {
-        // FP32 / generic fallback: preprocess via OpenCV, then call the legacy runInference.
-        const auto input = preprocess(inputImageBGR);
-        const bool succ = m_trtEngine->runInference(input, featureVectors);
-        if (!succ) {
-            throw std::runtime_error("Error: Unable to run inference.");
+
+        std::vector<Object> ret;
+        if (m_trtEngine->getOutputDims().size() == 1) {
+            ret = postprocessDetect(fp16Engine->hostOutputs()[0]);
         }
+        return ret;
     }
 
-    // Check if our model does only object detection or also supports segmentation
+    // FP32 / generic fallback: preprocess via OpenCV, legacy runInference, transformOutput.
+    std::vector<std::vector<std::vector<float>>> featureVectors;
+    const auto input = preprocess(inputImageBGR);
+    const bool succ = m_trtEngine->runInference(input, featureVectors);
+    if (!succ) {
+        throw std::runtime_error("Error: Unable to run inference.");
+    }
+
     std::vector<Object> ret;
-    const auto &numOutputs = m_trtEngine->getOutputDims().size();
-    if (numOutputs == 1) {
-        // Object detection
-        // Since we have a batch size of 1 and only 1 output, we must convert the output from a 3D array to a 1D array.
+    if (m_trtEngine->getOutputDims().size() == 1) {
         std::vector<float> featureVector;
         m_trtEngine->transformOutput(featureVectors, featureVector);
-
         ret = postprocessDetect(featureVector);
     }
     return ret;
@@ -112,7 +110,7 @@ std::vector<Object> YoloV8::detectObjects(const cv::Mat &inputImageBGR) {
     return detectObjects(gpuImg);
 }
 
-std::vector<Object> YoloV8::postprocessDetect(std::vector<float> &featureVector) {
+std::vector<Object> YoloV8::postprocessDetect(const std::vector<float> &featureVector) {
     const auto &outputDims = m_trtEngine->getOutputDims();
     auto numChannels = outputDims[0].d[1];
     auto numAnchors = outputDims[0].d[2];

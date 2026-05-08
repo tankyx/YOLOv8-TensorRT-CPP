@@ -61,7 +61,7 @@ public:
 
 private:
     std::vector<std::vector<cv::cuda::GpuMat>> preprocess(const cv::cuda::GpuMat &gpuImg);
-    std::vector<Object> postprocessDetect(std::vector<float> &featureVector);
+    std::vector<Object> postprocessDetect(const std::vector<float> &featureVector);
 
     std::unique_ptr<EngineBase> m_trtEngine = nullptr;
 
