@@ -169,16 +169,14 @@ void ObjectDetectionSystem::initializeSystem() {
     }
 
     if (useDirectGpuCapture) {
-        // The crosshair tracker and the Discord debug overlay still expect a 3-channel cv::Mat
-        // path; the direct-GPU capture is BGRA on the GPU. Refuse the combination explicitly
-        // rather than silently corrupt or stall.
+        // TrackCrosshair runs a CPU-side cv::Mat template match on the small ROI; the direct-GPU
+        // capture path keeps the frame as a BGRA GpuMat throughout, with no CPU snapshot, so the
+        // combination is genuinely broken. The Discord debug overlay, OTOH, only consumes
+        // detection boxes / crosshair coords / latency stats — no frame data — so it composes
+        // cleanly with the GPU path. (c40)
         if (trackCrosshair) {
             throw std::runtime_error(
                 "UseDirectGpuCapture is incompatible with TrackCrosshair (CPU template path). Disable one.");
-        }
-        if (debugView) {
-            throw std::runtime_error(
-                "UseDirectGpuCapture is incompatible with DebugView (overlay snapshot is CPU). Disable one.");
         }
         captureCUDA = std::make_unique<DXGICaptureCUDA>();
     } else {
@@ -450,8 +448,8 @@ void ObjectDetectionSystem::detectionThreadGpu() {
 
             cv::cuda::GpuMat croppedFrame = frame(roi); // ROI view, no copy
 
-            // Crosshair tracking + DebugView are off by INI assertion in initializeSystem when
-            // direct GPU capture is on. Crosshair stays at ROI center.
+            // Crosshair tracking is refused at init when direct GPU capture is on (CPU template
+            // match needs a cv::Mat). The overlay only consumes detection metadata, so it works.
             const cv::Point crosshairPos(captureWidth / 2, captureHeight / 2);
 
             std::vector<Object> detections = yoloV8->detectObjects(croppedFrame);
@@ -465,6 +463,31 @@ void ObjectDetectionSystem::detectionThreadGpu() {
             auto detectionEndTime = std::chrono::high_resolution_clock::now();
             detectionLatency.push(
                 std::chrono::duration_cast<std::chrono::milliseconds>(detectionEndTime - detectionStartTime).count());
+
+            // c40: same overlay-publish block as the legacy detectionThread. Translates from
+            // cropped-ROI coords into game-framebuffer coords (assumes fullscreen-native).
+            if (debugOverlay && debugOverlay->isRunning()) {
+                auto renderStart = std::chrono::high_resolution_clock::now();
+                std::vector<DiscordOverlay::DetectionBox> boxes;
+                boxes.reserve(detections.size());
+                for (const auto &d : detections) {
+                    DiscordOverlay::DetectionBox b{};
+                    b.x          = d.rect.x + static_cast<float>(x);
+                    b.y          = d.rect.y + static_cast<float>(y);
+                    b.w          = d.rect.width;
+                    b.h          = d.rect.height;
+                    b.label      = d.label;
+                    b.confidence = d.probability;
+                    boxes.push_back(b);
+                }
+                debugOverlay->setDetections(std::move(boxes));
+                debugOverlay->setCrosshair(static_cast<float>(crosshairPos.x + x),
+                                            static_cast<float>(crosshairPos.y + y));
+                debugOverlay->setStats(detectionLatency.getAverageLatency(), 0);
+                auto renderEnd = std::chrono::high_resolution_clock::now();
+                renderLatency.push(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(renderEnd - renderStart).count());
+            }
         }
     } catch (const std::exception &e) {
         std::cerr << "detectionThreadGpu: fatal exception: " << e.what() << ". Stopping." << std::endl;
