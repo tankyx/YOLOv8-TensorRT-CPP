@@ -151,7 +151,7 @@ private:
     float _debugSnapGain = 3.0f;
 
     // Gate for the RMB-only debug aim path. When false, RMB does nothing —
-    // only LMB/MB5 trigger the smoothed aim.
+    // only LMB triggers the smoothed aim.
     bool _debugAimEnabled = true;
 
     static float smoothingToInternal(float userVal) {
@@ -174,7 +174,6 @@ private:
     bool isLeftMouseButtonPressed();
     bool isRightMouseButtonPressed();
     bool isTriggerKeyPressed();
-    bool isMouseButton5Pressed();
     void leftClick();
     void releaseLeftClick();
     Object findClosestDetection(const std::vector<Object> &detections);

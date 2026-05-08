@@ -202,12 +202,12 @@ float MouseController::calculateSpeedScaling(const cv::Rect &rect) {
 }
 
 void MouseController::aim(const std::vector<Object> &detections) {
-    // Hold-to-aim gate: any of LMB, MB5, or RMB activates the aim. RMB is a
-    // debug-only mode — aim runs but the click bit stays 0 so the firmware
-    // never sends a press to the game. clickThrough tracks "the user actually
-    // wants to shoot" (LMB or MB5) and gates both the HID button bit and the
-    // isLeftClicking release-on-deactivation bookkeeping.
-    const bool clickThrough = isLeftMouseButtonPressed() || isMouseButton5Pressed();
+    // Hold-to-aim gate: LMB or RMB activates the aim. RMB is a debug-only mode —
+    // aim runs but the click bit stays 0 so the firmware never sends a press to
+    // the game. clickThrough tracks "the user actually wants to shoot" (LMB) and
+    // gates both the HID button bit and the isLeftClicking release-on-
+    // deactivation bookkeeping. (MB5 was previously a second trigger; unbound c41.)
+    const bool clickThrough = isLeftMouseButtonPressed();
     const bool debugAimHeld = _debugAimEnabled && isRightMouseButtonPressed();
     const bool aimingActive = clickThrough || debugAimHeld;
 
@@ -224,8 +224,8 @@ void MouseController::aim(const std::vector<Object> &detections) {
         return;
     }
 
-    // Released LMB/MB5 but still aiming via RMB — drop the click bit cleanly.
-    // Same trigger-coexistence rule applies.
+    // Released LMB but still aiming via RMB — drop the click bit cleanly. Same
+    // trigger-coexistence rule applies.
     if (isLeftClicking && !clickThrough && !triggerPressed) {
         releaseLeftClick();
         isLeftClicking = false;
@@ -297,7 +297,6 @@ void MouseController::aim(const std::vector<Object> &detections) {
 bool MouseController::isLeftMouseButtonPressed() { return (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0; }
 bool MouseController::isRightMouseButtonPressed() { return (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0; }
 bool MouseController::isTriggerKeyPressed() { return (GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0; } // Triggerbot hold key
-bool MouseController::isMouseButton5Pressed() { return (GetAsyncKeyState(VK_XBUTTON2) & 0x8000) != 0; } // Mouse Button 5
 
 void MouseController::leftClick() { sendHIDReport(0, 0, 0x01); }
 
