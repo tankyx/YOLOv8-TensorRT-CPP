@@ -215,22 +215,30 @@ public:
             return false;
         }
 
-        // Output path — same FP16->FP32 device cast + D2H + sync as runInference. This block stays
-        // verbatim until the follow-up commit that copies raw FP16 instead.
+        // Output path (c34): D2H the raw FP16 tensor and convert to FP32 on the CPU. Skips the
+        // device-side FP16->FP32 conversion kernel + its staging buffer, halves the D2H bandwidth,
+        // and removes a kernel-launch's worth of overhead per output. The CPU conversion is a
+        // tight loop over __half2float — at YOLOv8n's ~67k output elements it's well under 100us.
         const auto numInputs = m_inputDims.size();
         featureVectors.clear();
         std::vector<std::vector<float>> batchOutputs;
         for (int32_t outputBinding = numInputs; outputBinding < m_engine->getNbIOTensors(); ++outputBinding) {
             const uint32_t length = m_outputLengths[outputBinding - numInputs];
-            ensureFp32StagingCapacity(length);
 
+            if (m_hostFp16Staging.size() < length) {
+                m_hostFp16Staging.resize(length);
+            }
             const __half *deviceFp16 = reinterpret_cast<const __half *>(m_buffers[outputBinding]);
-            launchConvertFP16ToFP32Kernel(deviceFp16, m_fp32Staging, static_cast<int>(length), m_stream);
+            Util::checkCudaErrorCode(cudaMemcpyAsync(m_hostFp16Staging.data(), deviceFp16, length * sizeof(__half),
+                                                     cudaMemcpyDeviceToHost, m_stream));
+            Util::checkCudaErrorCode(cudaStreamSynchronize(m_stream));
 
             std::vector<float> output(length);
-            Util::checkCudaErrorCode(
-                cudaMemcpyAsync(output.data(), m_fp32Staging, length * sizeof(float), cudaMemcpyDeviceToHost, m_stream));
-            Util::checkCudaErrorCode(cudaStreamSynchronize(m_stream));
+            const __half *src = m_hostFp16Staging.data();
+            float *dst = output.data();
+            for (uint32_t k = 0; k < length; ++k) {
+                dst[k] = __half2float(src[k]);
+            }
             batchOutputs.emplace_back(std::move(output));
         }
         featureVectors.emplace_back(std::move(batchOutputs));
@@ -411,9 +419,14 @@ private:
     std::unique_ptr<nvinfer1::ICudaEngine> m_engine;
     std::unique_ptr<nvinfer1::IExecutionContext> m_context;
 
-    // Staging buffer for the FP16->FP32 output kernel (c23).
+    // Staging buffer for the FP16->FP32 output kernel (c23). The fast path no longer uses it
+    // (c34: raw FP16 D2H + CPU-side conversion); kept for the legacy runInference path until the
+    // helper itself is removed in the cleanup commit.
     float *m_fp32Staging = nullptr;
     uint32_t m_fp32StagingCapacity = 0;
+
+    // c34: host-side FP16 staging for the fast path's raw-FP16 D2H copy. Resized lazily.
+    std::vector<__half> m_hostFp16Staging;
 
     // c33: pre-allocated FP16 CHW input buffer used by the fused preproc fast path
     // (runInferenceFromBGR). Owned by the engine; its address is mirrored into m_buffers at the
