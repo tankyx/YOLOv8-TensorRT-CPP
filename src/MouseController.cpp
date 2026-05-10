@@ -327,7 +327,8 @@ Object MouseController::findClosestDetection(const std::vector<Object> &detectio
 void MouseController::triggerLeftClickIfCenterWithinDetection(const std::vector<Object> &detections) {
     using namespace std::chrono;
     constexpr auto holdDuration = milliseconds(100);
-    constexpr int cooldownMeanMs = 200;
+    constexpr auto armDelay = milliseconds(60);
+    constexpr int cooldownMeanMs = 220;
     constexpr int cooldownJitterMs = 35;
 
     const auto now = steady_clock::now();
@@ -347,7 +348,27 @@ void MouseController::triggerLeftClickIfCenterWithinDetection(const std::vector<
         triggerNextAllowedAt = now + milliseconds(cooldownMeanMs + jitter(_triggerRng));
     }
 
-    if (!isTriggerKeyPressed() || triggerPressed || now < triggerNextAllowedAt) {
+    // Releasing the trigger key cancels a pending armed shot.
+    if (!isTriggerKeyPressed()) {
+        triggerArmed = false;
+        return;
+    }
+
+    if (triggerPressed) {
+        return;
+    }
+
+    // Armed shot reached its fire time — commit unconditionally. Detection is fast enough
+    // that a re-check at fire time would just add latency without improving accuracy.
+    if (triggerArmed && now >= triggerFireAt) {
+        leftClick();
+        triggerPressed = true;
+        triggerReleaseAt = now + holdDuration;
+        triggerArmed = false;
+        return;
+    }
+
+    if (triggerArmed || now < triggerNextAllowedAt) {
         return;
     }
 
@@ -360,9 +381,8 @@ void MouseController::triggerLeftClickIfCenterWithinDetection(const std::vector<
         }
         if (centerX >= detection.rect.x && centerX <= detection.rect.x + detection.rect.width &&
             centerY >= detection.rect.y && centerY <= detection.rect.y + detection.rect.height) {
-            leftClick();
-            triggerPressed = true;
-            triggerReleaseAt = now + holdDuration;
+            triggerArmed = true;
+            triggerFireAt = now + armDelay;
             break;
         }
     }

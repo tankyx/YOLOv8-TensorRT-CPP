@@ -166,9 +166,14 @@ private:
 
     // Non-blocking trigger-click state machine (c12). Cooldown between releases
     // is randomised to break up the obvious "click every N ms" pattern.
+    // triggerArmed/triggerFireAt schedule the click 60ms after detection — fire
+    // is committed at arm time, we don't re-verify the target at fire time
+    // (detection is fast enough that the recheck would just add latency).
     bool triggerPressed = false;
+    bool triggerArmed = false;
     std::chrono::steady_clock::time_point triggerReleaseAt{};
     std::chrono::steady_clock::time_point triggerNextAllowedAt{};
+    std::chrono::steady_clock::time_point triggerFireAt{};
     std::mt19937 _triggerRng{std::random_device{}()};
 
     bool isLeftMouseButtonPressed();
