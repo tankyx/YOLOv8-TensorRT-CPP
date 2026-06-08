@@ -16,6 +16,7 @@
 #include "yolov8.h"
 #include "SoftwareFuser.h"
 #include "CrosshairTrackerGPU.h"
+#include "GdiDebugWindow.h"
 
 #include <algorithm>
 #include <atomic>
@@ -88,6 +89,7 @@ private:
     bool useDirectGpuCapture;
     std::string debugOverlayTargetProcess;
     std::string crosshairTemplatePath;
+    GdiDebugWindow m_debugWin;
 };
 
 ObjectDetectionSystem::ObjectDetectionSystem(const std::string &iniFile) : running(true) {
@@ -235,10 +237,8 @@ void ObjectDetectionSystem::mainLoop() {
         std::cout << "Capture: BLOCKED (no frames after 5s) — Valorant likely blocks DXGI DD" << std::endl;
     }
 
-    // Native GDI debug window (reliable — no OpenCV highgui dependency)
-    if (debugViewOpenCV) {
-        m_debugWin.create(L"YOLO Detections", captureWidth, captureHeight);
-    }
+    // GDI debug window — always open, no config gate
+    m_debugWin.create(L"YOLO Detections", captureWidth, captureHeight);
 
     while (running) {
         MSG msg = {};
