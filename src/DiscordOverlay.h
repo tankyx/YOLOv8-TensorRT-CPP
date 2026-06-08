@@ -338,12 +338,12 @@ private:
             }
         }
 
-        // Crosshair as a small yellow cross
+        // Crosshair debug box — hollow yellow rectangle at the detected crosshair position
         if (hasCh) {
-            const float armLen = 6.0f;
-            _renderTarget->DrawLine(D2D1::Point2F(chx - armLen, chy), D2D1::Point2F(chx + armLen, chy), _yellowBrush, 1.5f);
-            _renderTarget->DrawLine(D2D1::Point2F(chx, chy - armLen), D2D1::Point2F(chx, chy + armLen), _yellowBrush, 1.5f);
-            _currentDirty.extendBox(chx - armLen, chy - armLen, chx + armLen, chy + armLen, 2.0f);
+            const float halfSize = 8.0f; // 16×16 pixel box
+            D2D1_RECT_F rect = D2D1::RectF(chx - halfSize, chy - halfSize, chx + halfSize, chy + halfSize);
+            _renderTarget->DrawRectangle(rect, _yellowBrush, 1.5f);
+            _currentDirty.extendBox(rect.left, rect.top, rect.right, rect.bottom, 2.0f);
         }
 
         // Stats line top-left

@@ -152,9 +152,9 @@ bool MouseController::processHIDReport(std::vector<uint8_t> &report) {
     }
 
     DWORD bytesWritten = 0;
-    BOOL res = WriteFile(hidDevice, report.data(), report.size(), &bytesWritten, NULL);
+    BOOL res = WriteFile(hidDevice, report.data(), (DWORD)report.size(), &bytesWritten, NULL);
     if (res && bytesWritten == report.size()) {
-        hidWarningLogged = false; // back to healthy — re-arm the one-shot
+        hidWarningLogged = false;
         return true;
     }
 

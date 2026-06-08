@@ -4,50 +4,53 @@
 #include <opencv2/cudaimgproc.hpp>
 #include <cuda_runtime.h>
 
-// Pure-GPU crosshair shape tracker. Detects the crosshair by its geometric
-// structure — a pair of roughly-perpendicular lines intersecting near their
-// midpoints — rather than template-matching against a stored image.
+// Pure-GPU crosshair tracker using template matching against a stored
+// crosshair image.  Much more robust than geometric (Hough) detection for
+// complex game backgrounds — the template captures the exact pixel pattern.
 //
-// Pipeline (all on GPU, single float2 D2H copy per frame):
-//   1. Grayscale conversion
-//   2. Canny edge detection
-//   3. Hough line-segment detection
-//   4. Custom CUDA kernel: score every line-pair intersection, pick best
-//   5. Async copy single float2 back to host
+// Pipeline (all on GPU):
+//   1. Convert ROI to grayscale
+//   2. Template matching (NCC-normalised) against the crosshair template
+//   3. Find best-match position via minMaxLoc
+//   4. Search-window gate + EMA temporal smoothing → m_crosshairPos
 class CrosshairTrackerGPU {
 public:
     // roiWidth / roiHeight: pixel dimensions of the region the tracker will
-    // receive in update(). Used to initialise the centre fallback position.
-    CrosshairTrackerGPU(int roiWidth, int roiHeight);
+    // receive in update().  templatePath: path to crosshair PNG (grayscale or
+    // colour — will be converted to single-channel on load).
+    CrosshairTrackerGPU(int roiWidth, int roiHeight,
+                        const std::string& templatePath = "crosshair.png");
     ~CrosshairTrackerGPU();
 
+    // Returns true if the template was loaded successfully.
+    bool isReady() const { return m_ready; }
+
     // Process the cropped ROI (GPU mat, BGRA or BGR) and update the internal
-    // crosshair centre. stream must outlive the call — the tracker enqueues
-    // work onto it but does NOT synchronise (the caller syncs after the
-    // async D2H copy). Returns true if a crosshair was detected this frame.
+    // crosshair centre.  stream must outlive the call.
     bool update(const cv::cuda::GpuMat& roi, cudaStream_t stream);
 
     // Latest crosshair coordinates (pixels, relative to ROI top-left).
     cv::Point2f getPosition() const { return m_crosshairPos; }
 
-    // Frame-to-frame movement delta (current – previous). Zero on the first
-    // frame where a detection occurs. Use for direct recoil compensation.
+    // Frame-to-frame movement delta (current – previous).
     cv::Point2f getDelta() const { return m_delta; }
 
 private:
-    cv::Ptr<cv::cuda::CannyEdgeDetector>   m_canny;
-    cv::Ptr<cv::cuda::HoughSegmentDetector> m_hough;
-    cv::cuda::GpuMat m_gray, m_edges, m_lines;
+    cv::Ptr<cv::cuda::TemplateMatching> m_matcher;
+    cv::cuda::GpuMat m_templateGpu;
+    cv::cuda::GpuMat m_gray, m_matchResult;
 
     cv::Point2f m_crosshairPos;
     cv::Point2f m_prevPos;
     cv::Point2f m_delta;
     int m_roiWidth, m_roiHeight;
+    int m_templateW, m_templateH;
+    bool m_ready;
     bool m_initialized;
 
-    float2* m_devBestIntersection; // device buffer for kernel output
+    // Tracking anchor for the search-window gate + EMA.
+    float2 m_trackAnchor;
 
-    // Extract device pointer + line count from m_lines, launch the scoring
-    // kernel, and enqueue an async D2H copy into m_devBestIntersection.
-    void findCrosshairFromLines(cudaStream_t stream);
+    // Debug
+    int m_debugFrame;
 };

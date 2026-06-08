@@ -77,8 +77,8 @@ private:
 // HID protocol-level constants — these describe the report format the firmware exposes,
 // not the device identity. Hardcoded on purpose; the per-device VID/PID/serial are now
 // constructor parameters (c15).
-#define TARGET_USAGE_PAGE 0xFF00 // Vendor-defined usage page
-#define TARGET_USAGE 0x01        // Vendor-defined usage
+#define TARGET_USAGE_PAGE 0x0001 // Generic Desktop (was 0xFF00)
+#define TARGET_USAGE 0x80        // Vendor usage within Generic Desktop
 
 class MouseController {
 public:
@@ -188,4 +188,3 @@ private:
     bool processHIDReport(std::vector<uint8_t> &report);
     float calculateSpeedScaling(const cv::Rect &rect);
 };
-

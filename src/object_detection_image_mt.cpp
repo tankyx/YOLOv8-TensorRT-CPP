@@ -42,7 +42,8 @@ private:
     static void moveToTop();
     static void clearScreen();
     static void logAverageLatencies(LatencyQueue &captureLatency, LatencyQueue &detectionLatency,
-                                    LatencyQueue &renderLatency, SafeQueue<std::string> &logQueue);
+                                    LatencyQueue &renderLatency, LatencyQueue &crosshairLatency,
+                                    SafeQueue<std::string> &logQueue);
 
     void captureThread();
     void detectionThread();
@@ -70,7 +71,7 @@ private:
     HWND targetWnd;
 
     SafeQueue<std::string> logQueue;
-    LatencyQueue captureLatency, detectionLatency, renderLatency;
+    LatencyQueue captureLatency, detectionLatency, renderLatency, crosshairLatency;
     std::atomic<bool> running;
     FrameQueue captureQueue;
     GpuFrameQueue gpuCaptureQueue;
@@ -85,6 +86,7 @@ private:
     bool debugView;
     bool useDirectGpuCapture;
     std::string debugOverlayTargetProcess;
+    std::string crosshairTemplatePath;
 };
 
 ObjectDetectionSystem::ObjectDetectionSystem(const std::string &iniFile) : running(true) {
@@ -113,6 +115,7 @@ void ObjectDetectionSystem::loadConfigFromINI(const std::string &iniFile) {
     // at ~120 Hz; the detection thread itself only does cheap atomics + a mutex'd vector copy.
     debugView                 = config.getBool("DebugView", false);
     debugOverlayTargetProcess = config.getString("DebugOverlayTargetProcess", "cs2.exe");
+    crosshairTemplatePath     = config.getString("CrosshairTemplate", "crosshair.png");
 
     // c39c: opt into the DXGI/CUDA-interop capture path. When true the capture stays on the
     // GPU end-to-end (no CPU map, no cvtColor, no upload). Default false until validated.
@@ -161,7 +164,8 @@ void ObjectDetectionSystem::initializeSystem() {
         // Shape-based GPU tracker replaces the old CPU template-match path.
         // Works with both direct GPU capture and the legacy CPU upload path
         // because the tracker only ever touches GpuMats.
-        crosshairTracker = std::make_unique<CrosshairTrackerGPU>(captureWidth, captureHeight);
+        crosshairTracker = std::make_unique<CrosshairTrackerGPU>(captureWidth, captureHeight,
+                                                                    crosshairTemplatePath);
     }
 
     if (useDirectGpuCapture) {
@@ -220,7 +224,7 @@ void ObjectDetectionSystem::mainLoop() {
             running = false;
         }
 
-        logAverageLatencies(captureLatency, detectionLatency, renderLatency, logQueue);
+        logAverageLatencies(captureLatency, detectionLatency, renderLatency, crosshairLatency, logQueue);
         Sleep(100);
     }
 }
@@ -248,14 +252,18 @@ void ObjectDetectionSystem::moveToTop() { std::cout << "\033[H"; }
 void ObjectDetectionSystem::clearScreen() { std::cout << "\033[2J\033[H"; }
 
 void ObjectDetectionSystem::logAverageLatencies(LatencyQueue &captureLatency, LatencyQueue &detectionLatency,
-                                                LatencyQueue &renderLatency, SafeQueue<std::string> &logQueue) {
+                                                LatencyQueue &renderLatency, LatencyQueue &crosshairLatency,
+                                                SafeQueue<std::string> &logQueue) {
     double avgCaptureLatency = captureLatency.getAverageLatency();
     double avgDetectionLatency = detectionLatency.getAverageLatency();
     double avgRenderLatency = renderLatency.getAverageLatency();
+    double avgCrosshairLatency = crosshairLatency.getAverageLatency();
 
     std::cout << "\rCapture: " << avgCaptureLatency << "ms | "
               << "Detection: " << avgDetectionLatency << "ms | "
-              << "Render: " << avgRenderLatency << "ms       " << std::flush;
+              << "Render: " << avgRenderLatency << "ms | "
+              << "Crosshair: " << std::fixed << std::setprecision(3)
+              << (avgCrosshairLatency / 1000.0) << "ms       " << std::flush;
 }
 
 void ObjectDetectionSystem::captureThread() {
@@ -317,10 +325,15 @@ void ObjectDetectionSystem::detectionThread() {
             // the cost is negligible compared to the already-present YOLO inference.
             cv::Point crosshairPos(roiWidth / 2, roiHeight / 2);
             if (crosshairTracker) {
+                auto crosshairStart = std::chrono::high_resolution_clock::now();
                 cv::cuda::GpuMat gpuCropped;
                 gpuCropped.upload(croppedFrame);
                 cudaStream_t trackerStream = nullptr;
-                if (crosshairTracker->update(gpuCropped, trackerStream)) {
+                bool detected = crosshairTracker->update(gpuCropped, trackerStream);
+                auto crosshairEnd = std::chrono::high_resolution_clock::now();
+                crosshairLatency.push(
+                    std::chrono::duration_cast<std::chrono::microseconds>(crosshairEnd - crosshairStart).count());
+                if (detected) {
                     cv::Point2f pos = crosshairTracker->getPosition();
                     crosshairPos = cv::Point(static_cast<int>(pos.x), static_cast<int>(pos.y));
                     cv::Point2f delta = crosshairTracker->getDelta();
@@ -361,8 +374,10 @@ void ObjectDetectionSystem::detectionThread() {
                     boxes.push_back(b);
                 }
                 debugOverlay->setDetections(std::move(boxes));
-                debugOverlay->setCrosshair(static_cast<float>(crosshairPos.x + x),
-                                            static_cast<float>(crosshairPos.y + y));
+                if (crosshairTracker) {
+                    debugOverlay->setCrosshair(static_cast<float>(crosshairPos.x + x),
+                                                static_cast<float>(crosshairPos.y + y));
+                }
                 debugOverlay->setStats(detectionLatency.getAverageLatency(), 0);
                 auto renderEnd = std::chrono::high_resolution_clock::now();
                 renderLatency.push(std::chrono::duration_cast<std::chrono::milliseconds>(renderEnd - renderStart).count());
@@ -437,10 +452,15 @@ void ObjectDetectionSystem::detectionThreadGpu() {
             // Falls back to ROI centre when tracking is disabled or no detection.
             cv::Point crosshairPos(captureWidth / 2, captureHeight / 2);
             if (crosshairTracker) {
+                auto crosshairStart = std::chrono::high_resolution_clock::now();
                 // Use the default stream (0) for simplicity; the tracker synchronises
                 // after its single async D2H copy.
                 cudaStream_t trackerStream = nullptr;
-                if (crosshairTracker->update(croppedFrame, trackerStream)) {
+                bool detected = crosshairTracker->update(croppedFrame, trackerStream);
+                auto crosshairEnd = std::chrono::high_resolution_clock::now();
+                crosshairLatency.push(
+                    std::chrono::duration_cast<std::chrono::microseconds>(crosshairEnd - crosshairStart).count());
+                if (detected) {
                     cv::Point2f pos = crosshairTracker->getPosition();
                     crosshairPos = cv::Point(static_cast<int>(pos.x), static_cast<int>(pos.y));
                     // Apply recoil compensation from frame-to-frame delta.
@@ -480,8 +500,10 @@ void ObjectDetectionSystem::detectionThreadGpu() {
                     boxes.push_back(b);
                 }
                 debugOverlay->setDetections(std::move(boxes));
-                debugOverlay->setCrosshair(static_cast<float>(crosshairPos.x + x),
-                                            static_cast<float>(crosshairPos.y + y));
+                if (crosshairTracker) {
+                    debugOverlay->setCrosshair(static_cast<float>(crosshairPos.x + x),
+                                                static_cast<float>(crosshairPos.y + y));
+                }
                 debugOverlay->setStats(detectionLatency.getAverageLatency(), 0);
                 auto renderEnd = std::chrono::high_resolution_clock::now();
                 renderLatency.push(
