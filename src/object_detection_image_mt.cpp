@@ -234,6 +234,12 @@ void ObjectDetectionSystem::mainLoop() {
     if (captureLatency.getAverageLatency() <= 0.0 && detectionLatency.getAverageLatency() <= 0.0) {
         std::cout << "Capture: BLOCKED (no frames after 5s) — Valorant likely blocks DXGI DD" << std::endl;
     }
+
+    // Native GDI debug window (reliable — no OpenCV highgui dependency)
+    if (debugViewOpenCV) {
+        m_debugWin.create(L"YOLO Detections", captureWidth, captureHeight);
+    }
+
     while (running) {
         MSG msg = {};
 
@@ -410,28 +416,16 @@ void ObjectDetectionSystem::detectionThread() {
                 renderLatency.push(std::chrono::duration_cast<std::chrono::milliseconds>(renderEnd - renderStart).count());
             }
 
-            // Debug frame dump to disk — first frame unconditionally, then throttled.
-            {
-                static bool s_wrote_marker = false;
-                if (!s_wrote_marker) {
-                    s_wrote_marker = true;
-                    std::ofstream m("C:/Users/tanguy/Documents/GitHub/YOLOv8-TensorRT-CPP/DETECTION_THREAD_OK.txt");
-                    m << "detection thread reached" << std::endl;
+            // GDI debug window — draw detection boxes and push to native window
+            if (debugViewOpenCV) {
+                cv::Mat vis = croppedFrame.clone();
+                for (const auto& d : detections) {
+                    cv::rectangle(vis, d.rect, cv::Scalar(0, 255, 0), 2);
+                    const char* lbl = (d.label >= 0 && static_cast<size_t>(d.label) < labelNames.size())
+                                          ? labelNames[d.label].c_str() : "?";
+                    cv::putText(vis, lbl, cv::Point(d.rect.x, d.rect.y - 4), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 0), 1);
                 }
-                static int s_dump = 0;
-                static int s_ever = 0;
-                ++s_ever;
-                if (s_ever == 1 || ++s_dump >= 60) {
-                    s_dump = 0;
-                    cv::Mat vis = croppedFrame.clone();
-                    for (const auto& d : detections) {
-                        cv::rectangle(vis, d.rect, cv::Scalar(0, 255, 0), 2);
-                        const char* lbl = (d.label >= 0 && static_cast<size_t>(d.label) < labelNames.size())
-                                              ? labelNames[d.label].c_str() : "?";
-                        cv::putText(vis, lbl, cv::Point(d.rect.x, d.rect.y - 4), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 0), 1);
-                    }
-                    cv::imwrite("C:/Users/tanguy/Documents/GitHub/YOLOv8-TensorRT-CPP/debug_frame.bmp", vis);
-                }
+                m_debugWin.updateFrame(vis);
             }
         }
     } catch (const std::exception &e) {
@@ -561,28 +555,17 @@ void ObjectDetectionSystem::detectionThreadGpu() {
                     std::chrono::duration_cast<std::chrono::milliseconds>(renderEnd - renderStart).count());
             }
 
-            // Debug frame dump to disk — hardcoded, throttled to ~4 fps.
-            {
-                static int s_dump = 0;
-                static bool s_first = true;
-                if (++s_dump >= 60) {
-                    s_dump = 1;
-                    cv::Mat vis;
-                    croppedFrame.download(vis);
-                    if (s_first) {
-                        s_first = false;
-                        std::cout << "[DEBUG] GPU thread writing first PNG: " << vis.cols
-                                  << "x" << vis.rows << " ch=" << vis.channels()
-                                  << " empty=" << vis.empty() << std::endl;
-                    }
-                    for (const auto& d : detections) {
-                        cv::rectangle(vis, d.rect, cv::Scalar(0, 255, 0), 2);
-                        const char* lbl = (d.label >= 0 && static_cast<size_t>(d.label) < labelNames.size())
-                                              ? labelNames[d.label].c_str() : "?";
-                        cv::putText(vis, lbl, cv::Point(d.rect.x, d.rect.y - 4), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 0), 1);
-                    }
-                    cv::imwrite("C:/Users/tanguy/Documents/GitHub/YOLOv8-TensorRT-CPP/debug_frame.bmp", vis);
+            // GDI debug window — download GpuMat, draw boxes, push to native window
+            if (debugViewOpenCV) {
+                cv::Mat vis;
+                croppedFrame.download(vis);
+                for (const auto& d : detections) {
+                    cv::rectangle(vis, d.rect, cv::Scalar(0, 255, 0), 2);
+                    const char* lbl = (d.label >= 0 && static_cast<size_t>(d.label) < labelNames.size())
+                                          ? labelNames[d.label].c_str() : "?";
+                    cv::putText(vis, lbl, cv::Point(d.rect.x, d.rect.y - 4), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 0), 1);
                 }
+                m_debugWin.updateFrame(vis);
             }
         }
     } catch (const std::exception &e) {
