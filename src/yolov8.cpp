@@ -125,7 +125,10 @@ std::vector<std::vector<cv::cuda::GpuMat>> YoloV8::preprocess(const cv::cuda::Gp
 
     // Convert the image from BGR to RGB
     cv::cuda::GpuMat rgbMat;
-    cv::cuda::cvtColor(gpuImg, rgbMat, cv::COLOR_BGR2RGB);
+    if (gpuImg.channels() == 4)
+        cv::cuda::cvtColor(gpuImg, rgbMat, cv::COLOR_BGRA2RGB);
+    else
+        cv::cuda::cvtColor(gpuImg, rgbMat, cv::COLOR_BGR2RGB);
 
     auto resized = rgbMat;
 

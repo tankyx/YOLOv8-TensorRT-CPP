@@ -84,6 +84,7 @@ private:
     bool pinThreads;
     bool trackCrosshair;
     bool debugView;
+    bool debugViewOpenCV;
     bool useDirectGpuCapture;
     std::string debugOverlayTargetProcess;
     std::string crosshairTemplatePath;
@@ -116,6 +117,14 @@ void ObjectDetectionSystem::loadConfigFromINI(const std::string &iniFile) {
     debugView                 = config.getBool("DebugView", false);
     debugOverlayTargetProcess = config.getString("DebugOverlayTargetProcess", "cs2.exe");
     crosshairTemplatePath     = config.getString("CrosshairTemplate", "crosshair.png");
+    debugViewOpenCV           = config.getBool("DebugViewOpenCV", false);
+    std::cout << "[CONFIG] DebugViewOpenCV = " << (debugViewOpenCV ? "true" : "false") << std::endl;
+
+    // Write a test file at startup to verify I/O works at this path
+    {
+        std::ofstream test("C:/Users/tanguy/Documents/GitHub/YOLOv8-TensorRT-CPP/STARTUP_TEST.txt");
+        test << "startup OK" << std::endl;
+    }
 
     // c39c: opt into the DXGI/CUDA-interop capture path. When true the capture stays on the
     // GPU end-to-end (no CPU map, no cvtColor, no upload). Default false until validated.
@@ -212,6 +221,19 @@ void ObjectDetectionSystem::mainLoop() {
     clearScreen();
     std::cout << "OpenCV CUDA support: " << cv::cuda::getCudaEnabledDeviceCount() << " devices" << std::endl;
     std::cout << "OpenCV version: " << CV_VERSION << std::endl;
+
+    std::cout << "Waiting for first captured frame..." << std::endl;
+    // If no frames arrive within 5 seconds, capture is blocked.
+    for (int i = 0; i < 50 && running; i++) {
+        if (captureLatency.getAverageLatency() > 0.0 || detectionLatency.getAverageLatency() > 0.0) {
+            std::cout << "Capture: OK (frames flowing)" << std::endl;
+            break;
+        }
+        Sleep(100);
+    }
+    if (captureLatency.getAverageLatency() <= 0.0 && detectionLatency.getAverageLatency() <= 0.0) {
+        std::cout << "Capture: BLOCKED (no frames after 5s) — Valorant likely blocks DXGI DD" << std::endl;
+    }
     while (running) {
         MSG msg = {};
 
@@ -300,6 +322,11 @@ void ObjectDetectionSystem::captureThread() {
 }
 
 void ObjectDetectionSystem::detectionThread() {
+    // Hardcoded startup marker to confirm this function is entered at all
+    {
+        std::ofstream m("C:/Users/tanguy/Documents/GitHub/YOLOv8-TensorRT-CPP/DET_THREAD_ENTERED.txt");
+        m << "detectionThread entered OK" << std::endl;
+    }
     try {
         while (running) {
             cv::Mat frame = captureQueue.pop();
@@ -381,6 +408,30 @@ void ObjectDetectionSystem::detectionThread() {
                 debugOverlay->setStats(detectionLatency.getAverageLatency(), 0);
                 auto renderEnd = std::chrono::high_resolution_clock::now();
                 renderLatency.push(std::chrono::duration_cast<std::chrono::milliseconds>(renderEnd - renderStart).count());
+            }
+
+            // Debug frame dump to disk — first frame unconditionally, then throttled.
+            {
+                static bool s_wrote_marker = false;
+                if (!s_wrote_marker) {
+                    s_wrote_marker = true;
+                    std::ofstream m("C:/Users/tanguy/Documents/GitHub/YOLOv8-TensorRT-CPP/DETECTION_THREAD_OK.txt");
+                    m << "detection thread reached" << std::endl;
+                }
+                static int s_dump = 0;
+                static int s_ever = 0;
+                ++s_ever;
+                if (s_ever == 1 || ++s_dump >= 60) {
+                    s_dump = 0;
+                    cv::Mat vis = croppedFrame.clone();
+                    for (const auto& d : detections) {
+                        cv::rectangle(vis, d.rect, cv::Scalar(0, 255, 0), 2);
+                        const char* lbl = (d.label >= 0 && static_cast<size_t>(d.label) < labelNames.size())
+                                              ? labelNames[d.label].c_str() : "?";
+                        cv::putText(vis, lbl, cv::Point(d.rect.x, d.rect.y - 4), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 0), 1);
+                    }
+                    cv::imwrite("C:/Users/tanguy/Documents/GitHub/YOLOv8-TensorRT-CPP/debug_frame.bmp", vis);
+                }
             }
         }
     } catch (const std::exception &e) {
@@ -508,6 +559,30 @@ void ObjectDetectionSystem::detectionThreadGpu() {
                 auto renderEnd = std::chrono::high_resolution_clock::now();
                 renderLatency.push(
                     std::chrono::duration_cast<std::chrono::milliseconds>(renderEnd - renderStart).count());
+            }
+
+            // Debug frame dump to disk — hardcoded, throttled to ~4 fps.
+            {
+                static int s_dump = 0;
+                static bool s_first = true;
+                if (++s_dump >= 60) {
+                    s_dump = 1;
+                    cv::Mat vis;
+                    croppedFrame.download(vis);
+                    if (s_first) {
+                        s_first = false;
+                        std::cout << "[DEBUG] GPU thread writing first PNG: " << vis.cols
+                                  << "x" << vis.rows << " ch=" << vis.channels()
+                                  << " empty=" << vis.empty() << std::endl;
+                    }
+                    for (const auto& d : detections) {
+                        cv::rectangle(vis, d.rect, cv::Scalar(0, 255, 0), 2);
+                        const char* lbl = (d.label >= 0 && static_cast<size_t>(d.label) < labelNames.size())
+                                              ? labelNames[d.label].c_str() : "?";
+                        cv::putText(vis, lbl, cv::Point(d.rect.x, d.rect.y - 4), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 0), 1);
+                    }
+                    cv::imwrite("C:/Users/tanguy/Documents/GitHub/YOLOv8-TensorRT-CPP/debug_frame.bmp", vis);
+                }
             }
         }
     } catch (const std::exception &e) {
