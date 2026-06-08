@@ -96,6 +96,7 @@ public:
     void aim(const std::vector<Object> &detections);
     void triggerLeftClickIfCenterWithinDetection(const std::vector<Object> &detections);
     void setCrosshairPosition(int x, int y);
+    void applyRecoilCompensation(float dx, float dy);
     int getCrosshairX() const { return crosshairX; }
     int getCrosshairY() const { return crosshairY; }
     int getMovementX() const { return _dx; }

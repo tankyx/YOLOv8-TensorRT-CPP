@@ -133,6 +133,14 @@ void MouseController::setCrosshairPosition(int x, int y) {
     crosshairY = y;
 }
 
+void MouseController::applyRecoilCompensation(float dx, float dy) {
+    const int16_t idx = static_cast<int16_t>(dx);
+    const int16_t idy = static_cast<int16_t>(dy);
+    if (idx != 0 || idy != 0) {
+        sendHIDReport(idx, idy, isLeftClicking ? 0x01 : 0x00);
+    }
+}
+
 bool MouseController::processHIDReport(std::vector<uint8_t> &report) {
     if (hidDevice == nullptr) {
         if (!hidWarningLogged) {

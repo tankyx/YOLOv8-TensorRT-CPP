@@ -67,6 +67,7 @@ endif()
 add_library(engine_cuda_kernels STATIC
     src/EngineFP16Kernels.cu
     src/YoloPostprocKernels.cu
+    src/CrosshairTrackerGPU.cu
 )
 
 set_target_properties(engine_cuda_kernels PROPERTIES

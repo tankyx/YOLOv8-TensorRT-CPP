@@ -15,6 +15,7 @@
 #include "threadsafe_queue.h"
 #include "yolov8.h"
 #include "SoftwareFuser.h"
+#include "CrosshairTrackerGPU.h"
 
 #include <algorithm>
 #include <atomic>
@@ -56,13 +57,10 @@ private:
     std::unique_ptr<DiscordOverlay> debugOverlay;
     std::vector<std::string> labelNames;
 
-    cv::Mat templateImg;
-    // GPU template-matching state for crosshair tracking (c27). Lives on the detection thread;
-    // single-consumer so no synchronization needed.
-    cv::Ptr<cv::cuda::TemplateMatching> crosshairMatcher;
-    cv::cuda::GpuMat gpuCrosshairTemplate;
-    cv::cuda::GpuMat gpuCrosshairRoi;
-    cv::cuda::GpuMat gpuCrosshairResult;
+    // Pure-GPU shape-based crosshair tracker (replaces template matching).
+    // Runs Canny + Hough + custom intersection-scoring kernel entirely on
+    // device; single float2 D2H copy per frame.
+    std::unique_ptr<CrosshairTrackerGPU> crosshairTracker;
     int captureWidth;
     int captureHeight;
     int captureFPS;
@@ -160,24 +158,13 @@ void ObjectDetectionSystem::initializeSystem() {
         config.getBool("DebugAimEnabled", true));
 
     if (trackCrosshair) {
-        templateImg = cv::imread(config.getString("CrosshairTemplate", "crosshair.png"), cv::IMREAD_COLOR);
-        if (templateImg.empty()) {
-            throw std::runtime_error("Failed to load template image");
-        }
-        gpuCrosshairTemplate.upload(templateImg);
-        crosshairMatcher = cv::cuda::createTemplateMatching(templateImg.type(), cv::TM_CCOEFF_NORMED);
+        // Shape-based GPU tracker replaces the old CPU template-match path.
+        // Works with both direct GPU capture and the legacy CPU upload path
+        // because the tracker only ever touches GpuMats.
+        crosshairTracker = std::make_unique<CrosshairTrackerGPU>(captureWidth, captureHeight);
     }
 
     if (useDirectGpuCapture) {
-        // TrackCrosshair runs a CPU-side cv::Mat template match on the small ROI; the direct-GPU
-        // capture path keeps the frame as a BGRA GpuMat throughout, with no CPU snapshot, so the
-        // combination is genuinely broken. The Discord debug overlay, OTOH, only consumes
-        // detection boxes / crosshair coords / latency stats — no frame data — so it composes
-        // cleanly with the GPU path. (c40)
-        if (trackCrosshair) {
-            throw std::runtime_error(
-                "UseDirectGpuCapture is incompatible with TrackCrosshair (CPU template path). Disable one.");
-        }
         captureCUDA = std::make_unique<DXGICaptureCUDA>();
     } else {
         capture = std::make_unique<DXGICapture>();
@@ -324,26 +311,23 @@ void ObjectDetectionSystem::detectionThread() {
 
             cv::Mat croppedFrame = frame(roi);
 
-            cv::Point crosshairPos;
-            if (trackCrosshair) {
-                int smallRoiSize = config.getInt("SmallRoiSize", 160);
-                int smallX = std::max(centerX - smallRoiSize / 2, 0);
-                int smallY = std::max(centerY - smallRoiSize / 2, 0);
-                smallX = std::min(smallX, frame.cols - smallRoiSize);
-                smallY = std::min(smallY, frame.rows - smallRoiSize);
-                cv::Rect smallRoi(smallX, smallY, smallRoiSize, smallRoiSize);
-
-                cv::Mat smallCroppedFrame = frame(smallRoi);
-                gpuCrosshairRoi.upload(smallCroppedFrame);
-                crosshairMatcher->match(gpuCrosshairRoi, gpuCrosshairTemplate, gpuCrosshairResult);
-                double maxVal = 0.0;
-                cv::Point maxLoc;
-                cv::cuda::minMaxLoc(gpuCrosshairResult, nullptr, &maxVal, nullptr, &maxLoc);
-
-                crosshairPos.x = maxLoc.x + templateImg.cols / 2 + smallX - x;
-                crosshairPos.y = maxLoc.y + templateImg.rows / 2 + smallY - y;
-            } else {
-                crosshairPos = cv::Point(roiWidth / 2, roiHeight / 2);
+            // Shape-based GPU crosshair tracker — same pipeline as detectionThreadGpu.
+            // The CPU path uploads the cropped frame to a temporary GpuMat for the
+            // tracker, then downloads the position. One extra upload per frame, but
+            // the cost is negligible compared to the already-present YOLO inference.
+            cv::Point crosshairPos(roiWidth / 2, roiHeight / 2);
+            if (crosshairTracker) {
+                cv::cuda::GpuMat gpuCropped;
+                gpuCropped.upload(croppedFrame);
+                cudaStream_t trackerStream = nullptr;
+                if (crosshairTracker->update(gpuCropped, trackerStream)) {
+                    cv::Point2f pos = crosshairTracker->getPosition();
+                    crosshairPos = cv::Point(static_cast<int>(pos.x), static_cast<int>(pos.y));
+                    cv::Point2f delta = crosshairTracker->getDelta();
+                    if (delta.x != 0.0f || delta.y != 0.0f) {
+                        mouseController->applyRecoilCompensation(-delta.x, -delta.y);
+                    }
+                }
             }
 
             std::vector<Object> detections;
@@ -448,9 +432,24 @@ void ObjectDetectionSystem::detectionThreadGpu() {
 
             cv::cuda::GpuMat croppedFrame = frame(roi); // ROI view, no copy
 
-            // Crosshair tracking is refused at init when direct GPU capture is on (CPU template
-            // match needs a cv::Mat). The overlay only consumes detection metadata, so it works.
-            const cv::Point crosshairPos(captureWidth / 2, captureHeight / 2);
+            // Shape-based GPU crosshair tracker (pure device pipeline: Canny → Hough
+            // → custom intersection-scoring kernel → single float2 D2H copy).
+            // Falls back to ROI centre when tracking is disabled or no detection.
+            cv::Point crosshairPos(captureWidth / 2, captureHeight / 2);
+            if (crosshairTracker) {
+                // Use the default stream (0) for simplicity; the tracker synchronises
+                // after its single async D2H copy.
+                cudaStream_t trackerStream = nullptr;
+                if (crosshairTracker->update(croppedFrame, trackerStream)) {
+                    cv::Point2f pos = crosshairTracker->getPosition();
+                    crosshairPos = cv::Point(static_cast<int>(pos.x), static_cast<int>(pos.y));
+                    // Apply recoil compensation from frame-to-frame delta.
+                    cv::Point2f delta = crosshairTracker->getDelta();
+                    if (delta.x != 0.0f || delta.y != 0.0f) {
+                        mouseController->applyRecoilCompensation(-delta.x, -delta.y);
+                    }
+                }
+            }
 
             std::vector<Object> detections = yoloV8->detectObjects(croppedFrame);
 
