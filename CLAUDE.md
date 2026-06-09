@@ -115,6 +115,60 @@ The detector supports three YOLO versions via a class hierarchy:
 - INI key `ModelVersion=v8|v11|v26|auto` overrides detection
 - `YoloV8Config` is an alias for `YoloConfig` (backward compatible)
 
+## Monitoring Protocol
+
+When `MetricsStatus = status.json` is set in the INI, the app writes a compact
+JSON status file once per second. This is the **primary monitoring surface**
+for codewhale instances running on the same machine.
+
+### Reading the status file
+
+```python
+# In codewhale: read_file(path="status.json")
+```
+
+The file is overwritten atomically (write to `.tmp`, then rename) so reads are
+never partial.
+
+### JSON format
+
+```json
+{
+  "ts": 1717939200,
+  "capture": {"avg": 2.1, "min": 1.8, "max": 4.3},
+  "detect":  {"avg": 0.09, "min": 0.07, "max": 0.15},
+  "render":  {"avg": 0.5, "min": 0.3, "max": 1.2},
+  "detections": 1.8,
+  "model": "v8",
+  "graph": true,
+  "precision": "fp16",
+  "uptime_s": 3421
+}
+```
+
+### What to watch for
+
+| Signal | Healthy | Warning | Critical |
+|---|---|---|---|
+| `detect.avg` | <0.5 ms | >2 ms | >10 ms (fallback path) |
+| `detect.max` | <1 ms | >5 ms (NMS spike) | >20 ms (stall) |
+| `capture.max` | <5 ms | >10 ms (DXGI drop) | >50 ms |
+| `graph` | true | — | false (not captured) |
+| `detections` | >0.5 | 0.1-0.5 | 0.0 (model not detecting) |
+| `model` | matches expected | unexpected | — |
+| `detect.max` / `detect.min` > 10 | — | graph warmup | graph failed |
+
+### How to use in codewhale
+
+1. `read_file status.json` — get current metrics
+2. Check `detect.avg` — if >2 ms, model is struggling
+3. Check `graph` — if false, CUDA graph capture failed
+4. Check `capture.max` — if spiking, GPU is throttled or DXGI stalled
+5. Check `model` — confirms auto-detection picked the right version
+
+The file path is relative to the working directory at launch (build bin dir).
+It can be an absolute path if needed.
+
 ## Important Notes
 
 - The project is Windows-specific due to DirectX dependencies (DXGI, D3D11)

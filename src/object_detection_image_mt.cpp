@@ -20,6 +20,7 @@
 #include "SoftwareFuser.h"
 #include "CrosshairTrackerGPU.h"
 #include "GdiDebugWindow.h"
+#include "MetricsWriter.h"
 
 #include <algorithm>
 #include <atomic>
@@ -93,6 +94,12 @@ private:
     std::string debugOverlayTargetProcess;
     std::string crosshairTemplatePath;
     GdiDebugWindow m_debugWin;
+
+    // Monitoring
+    MetricsWriter m_metrics;
+    std::string m_metricsPath;
+    int m_detectionCountAccum = 0;
+    int m_frameCountAccum = 0;
 };
 
 ObjectDetectionSystem::ObjectDetectionSystem(const std::string &iniFile) : running(true) {
@@ -134,6 +141,14 @@ void ObjectDetectionSystem::loadConfigFromINI(const std::string &iniFile) {
     // c39c: opt into the DXGI/CUDA-interop capture path. When true the capture stays on the
     // GPU end-to-end (no CPU map, no cvtColor, no upload). Default false until validated.
     useDirectGpuCapture = config.getBool("UseDirectGpuCapture", false);
+
+    // Optional metrics status file for external monitoring (e.g. codewhale).
+    // If set, a compact JSON status file is overwritten once per second.
+    // If omitted or empty, no file is written.
+    m_metricsPath = config.getString("MetricsStatus", "");
+    if (!m_metricsPath.empty()) {
+        m_metrics.open(m_metricsPath);
+    }
 }
 
 void ObjectDetectionSystem::initializeSystem() {
@@ -255,6 +270,10 @@ void ObjectDetectionSystem::mainLoop() {
     // GDI debug window — always open, no config gate
     m_debugWin.create(L"YOLO Detections", captureWidth, captureHeight);
 
+    // Metrics counter — write status file once per second (every 10th loop iteration
+    // since Sleep(100) gives ~10 Hz loop rate).
+    int metricsTick = 0;
+
     while (running) {
         MSG msg = {};
 
@@ -268,6 +287,53 @@ void ObjectDetectionSystem::mainLoop() {
         }
 
         logAverageLatencies(captureLatency, detectionLatency, renderLatency, crosshairLatency, logQueue);
+
+        // Write metrics status file once per second.
+        if (!m_metricsPath.empty() && ++metricsTick >= 10) {
+            metricsTick = 0;
+
+            // Determine model version string and graph state.
+            const char *modelStr = "v8";
+            bool graphOk = false;
+            if (yoloDetector) {
+                const auto &engine = yoloDetector->getEngine();
+                graphOk = (engine.getOutputDims().size() == 1);
+                // Infer version from output shape.
+                const auto &od = engine.getOutputDims();
+                if (!od.empty()) {
+                    const int ch = od[0].d[1];
+                    const int na = od[0].d[2];
+                    if (ch == 6 && na >= 100 && na <= 500) modelStr = "v26";
+                    else if (ch > 4 + static_cast<int>(labelNames.size())) modelStr = "v11";
+                }
+            }
+
+            const double fps = (m_frameCountAccum > 0)
+                ? static_cast<double>(m_frameCountAccum)
+                : 0.0;
+            const double avgDets = (m_frameCountAccum > 0)
+                ? static_cast<double>(m_detectionCountAccum) / m_frameCountAccum
+                : 0.0;
+
+            m_metrics.update(
+                captureLatency.getAverageLatency(),
+                captureLatency.getMinLatency(),
+                captureLatency.getMaxLatency(),
+                detectionLatency.getAverageLatency(),
+                detectionLatency.getMinLatency(),
+                detectionLatency.getMaxLatency(),
+                renderLatency.getAverageLatency(),
+                renderLatency.getMinLatency(),
+                renderLatency.getMaxLatency(),
+                avgDets,
+                modelStr,
+                graphOk,
+                "fp16");
+
+            m_detectionCountAccum = 0;
+            m_frameCountAccum = 0;
+        }
+
         Sleep(100);
     }
 }
@@ -393,6 +459,10 @@ void ObjectDetectionSystem::detectionThread() {
 
             std::vector<Object> detections;
             detections = yoloDetector->detectObjects(croppedFrame);
+
+            // Accumulate for per-second metrics averaging.
+            m_detectionCountAccum += static_cast<int>(detections.size());
+            m_frameCountAccum += 1;
 
             mouseController->setCrosshairPosition(crosshairPos.x, crosshairPos.y);
             mouseController->aim(detections);
@@ -532,6 +602,10 @@ void ObjectDetectionSystem::detectionThreadGpu() {
             }
 
             std::vector<Object> detections = yoloDetector->detectObjects(croppedFrame);
+
+            // Accumulate for per-second metrics averaging.
+            m_detectionCountAccum += static_cast<int>(detections.size());
+            m_frameCountAccum += 1;
 
             mouseController->setCrosshairPosition(crosshairPos.x, crosshairPos.y);
             mouseController->aim(detections);

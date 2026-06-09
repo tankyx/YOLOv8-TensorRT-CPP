@@ -106,6 +106,26 @@ public:
         return totalLatency / count;
     }
 
+    double getMinLatency() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (queue_.empty()) return 0.0;
+        double minVal = queue_.front().latency;
+        for (const auto &entry : queue_) {
+            if (entry.latency < minVal) minVal = entry.latency;
+        }
+        return minVal;
+    }
+
+    double getMaxLatency() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (queue_.empty()) return 0.0;
+        double maxVal = queue_.front().latency;
+        for (const auto &entry : queue_) {
+            if (entry.latency > maxVal) maxVal = entry.latency;
+        }
+        return maxVal;
+    }
+
 private:
     struct LatencyEntry {
         long long latency;
