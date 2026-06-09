@@ -5,10 +5,10 @@ End-to-end pipeline from screen capture to USB HID mouse report stays on the GPU
 inference runs as a captured CUDA graph, and the detection thread does sub-100us
 work per frame on an RTX 40-class card.
 
-The detector is a fine-tuned YOLOv8n exported to ONNX, compiled to a TensorRT
-engine on first run, and served by a multi-threaded C++ pipeline that does
-DXGI Desktop Duplication capture, GPU-side preprocess + decode, and direct USB-HID
-mouse output via a small bridge MCU.
+The detector supports YOLOv8, YOLOv11, and YOLOv26 models — all exported to
+ONNX, compiled to TensorRT engines on first run, and served by a multi-threaded
+C++ pipeline that does DXGI Desktop Duplication capture, GPU-side preprocess +
+decode, and direct USB-HID mouse output via a small bridge MCU.
 
 ## Highlights
 
@@ -157,21 +157,23 @@ postprocess.
 
 #### Postprocess (`YoloPostprocKernels.cu`)
 
-A second CUDA kernel runs on the engine's stream right after `enqueueV3`:
-`yoloFilterAndDecodeKernel`, one thread per anchor (8400 for 640x640). Each
-thread:
+A second CUDA kernel runs on the engine's stream right after `enqueueV3`. The
+kernel depends on the detected YOLO version:
 
-1. Loads the anchor's class scores from FP16 output, finds best class.
-2. Skips if best score <= `probabilityThreshold`.
-3. Decodes xywh -> xyxy in source-image coordinates with ratio scaling and
-   clamping to image bounds.
-4. `atomicAdd` into a single uint32 counter to claim a slot in the survivor
-   buffer, writes `(x0, y0, x1, y1, score, label)` if the slot is < `kMaxSurvivors`
-   (1024).
+- **YOLOv8**: `yoloFilterAndDecodeKernel` — one thread per anchor (8400 for
+  640x640). Decodes xywh→xyxy, finds best class, atomically writes survivors.
+- **YOLOv11**: `yoloV11FilterAndDecodeKernel` — same structure but applies DFL
+  softmax over 16 distribution bins per bbox coordinate before xywh decode.
+  Sequential coordinate processing avoids register spills.
+- **YOLOv26**: `yoloV26FilterKernel` — the model output is already decoded as
+  `(x1,y1,x2,y2,conf,class_id)` in an end-to-end head. Kernel only applies a
+  confidence threshold and copies survivors. No box decode, no class argmax,
+  no NMS needed on CPU.
 
-D2H is then ~24 KB (count + survivor records) instead of the ~270 KB FP32 full
-output the legacy path moved. CPU does only `cv::dnn::NMSBoxesBatched` on the
-survivors plus the top-K cap.
+All kernels write the same survivor format: `(x0, y0, x1, y1, score, label)`.
+D2H is ~24 KB (count + up to 1024 survivor records) instead of the ~270 KB FP32
+full output the legacy path moved. CPU does only `cv::dnn::NMSBoxesBatched`
+(V8/V11) or a direct threshold pass (V26) plus the top-K cap.
 
 #### CUDA graph capture (`yolov8.cpp`)
 
@@ -344,32 +346,37 @@ on every rebuild. Edit `dep/config_*.ini` if you want changes to survive.
 
 ## Model preparation
 
-Convert a YOLOv8 PyTorch checkpoint to ONNX (one-time per model):
+Export a YOLO checkpoint to ONNX (one-time per model). The detector auto-detects
+whether the model is V8, V11, or V26 from the output shape.
 
 ```cmd
-python scripts/pytorch2onnx.py path\to\your_model.pt v8n dep/yolov8n_cs2_fp16.onnx --fp16
+# YOLOv8 / YOLOv11 (standard decode)
+python scripts/pytorch2onnx.py path\to\your_model.pt v8n dep/your_model.onnx --fp16
+
+# YOLOv26 (end-to-end, NMS-free)
+python scripts/pytorch2onnx.py path\to\your_model.pt v26n dep/your_model.onnx --fp16
 ```
 
-Drop the resulting `.onnx` into `dep/` (or wherever `ModelPath` in the INI
-points). On first run, `EngineFP16` parses the ONNX and serializes a TensorRT
-plan keyed on the file's FNV-1a hash; subsequent launches just deserialize the
-cached plan. Re-saving the ONNX invalidates the cache automatically.
+Drop the resulting `.onnx` into `dep/` and set `ModelPath` in the INI.
+On first run, the engine parses the ONNX and serializes a TensorRT plan keyed
+on the file's FNV-1a hash; subsequent launches deserialize the cached plan.
+Re-saving the ONNX invalidates the cache automatically.
 
 ## Configuration
 
-Configs live in `dep/`. The shipped ones are:
+Configs live in `dep/`. One per game:
 
 - `dep/config_cs2.ini` — CS2 (640x640, FP16, 4-class)
-- `dep/config_valo_fp16.ini` — Valorant (320x320, FP16)
-- `dep/config_valo_fp32.ini` — Valorant (320x320, FP32, fallback)
+- `dep/config_valo.ini` — Valorant (320x320, FP16 default; edit `Precision` for FP32)
 
 ### Reference (CS2 example, annotated)
 
 ```ini
-# Model
-ModelPath = yolov8n_cs2_fp16.onnx     # relative to working dir
-Precision = half                       # half (FP16) or float (FP32)
-Labels = c, ch, t, th                  # class names; size determines numClasses
+# Model — supports YOLOv8, YOLOv11, YOLOv26 (auto-detected from filename + output shape)
+ModelPath    = yolov8n_cs2_fp16.onnx   # relative to working dir
+ModelVersion = auto                     # auto, v8, v11, or v26 (override detection)
+Precision    = half                     # half (FP16) or float (FP32)
+Labels       = c, ch, t, th            # class names; size determines numClasses
 
 # Capture / ROI
 CaptureWidth  = 640                    # ROI fed to the model (must match input)
@@ -420,9 +427,23 @@ CaptureThreadCore = 0
 
 ## Running
 
+Batch scripts are provided at the repo root:
+
+```cmd
+# CS2 (always FP16, 640x640)
+run_cs2.bat
+
+# Valorant (FP16 by default, or pass 'float' for FP32)
+run_valo.bat
+run_valo.bat float
+```
+
+Or run directly:
+
 ```cmd
 cd build\bin\Release
 detect_object_image.exe config_cs2.ini
+detect_object_image.exe config_valo.ini
 ```
 
 Press **Insert** to exit. The status line shows rolling 500-ms averages of
@@ -492,13 +513,17 @@ Tuning levers, in order of impact:
 ```
 src/
   object_detection_image_mt.cpp   # main, ObjectDetectionSystem, threads
-  yolov8.{h,cpp}                  # detector wrapper (engine + GPU postproc + graph)
+  YoloDetector.{h,cpp}            # base detector (engine mgmt, graph capture, GPU buffers)
+  yolov8.{h,cpp}                  # YOLOv8 detector (xywh decode + NMS)
+  YoloV11.{h,cpp}                 # YOLOv11 detector (DFL softmax decode + NMS)
+  YoloV26.{h,cpp}                 # YOLOv26 detector (end-to-end, no NMS)
+  DetectorFactory.{h,cpp}         # auto-detection from filename + output shape
   EngineBase.h                    # virtual interface, shared engine helpers
   EngineFP16.h                    # FP16 engine (the production path)
   EngineFP32.h                    # FP32 engine (legacy fallback)
   EngineFactory.h                 # selects engine by Precision
   EngineFP16Kernels.{h,cu}        # fused BGR/BGRA -> fp16 CHW preproc kernel
-  YoloPostprocKernels.{h,cu}      # GPU anchor filter + decode kernel
+  YoloPostprocKernels.{h,cu}      # GPU filter+decode kernels (V8/V11/V26)
   DXGICapture.h                   # legacy CPU capture path
   DXGICaptureCUDA.h               # direct GPU/D3D11 interop capture path
   DiscordOverlay.h                # Discord legacy overlay debug renderer
@@ -508,7 +533,8 @@ src/
   SoftwareFuser.{h,cu}            # capture-card + desktop fusion (optional)
 
 dep/
-  *.ini                           # configs per game
+  config_cs2.ini                  # CS2 config (640x640, FP16, 4-class)
+  config_valo.ini                 # Valorant config (320x320, FP16 default)
   *.onnx                          # exported model weights
   *.engine                        # cached TensorRT plans (generated)
 
