@@ -93,7 +93,11 @@ set_target_properties(fusion_cuda PROPERTIES
 
 # Create main YOLOv8 library
 add_library(yolov8_tensorrt STATIC
+    src/YoloDetector.cpp
     src/yolov8.cpp
+    src/YoloV11.cpp
+    src/YoloV26.cpp
+    src/DetectorFactory.cpp
 )
 
 # Create main executable

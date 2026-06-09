@@ -44,3 +44,5 @@ cmake-build-*
 /models/Valorant/train
 /models
 src/repopack-output.txt
+runs/
+*.pt

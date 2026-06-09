@@ -14,6 +14,9 @@
 #include "MouseController.h"
 #include "threadsafe_queue.h"
 #include "yolov8.h"
+#include "YoloV11.h"
+#include "YoloV26.h"
+#include "DetectorFactory.h"
 #include "SoftwareFuser.h"
 #include "CrosshairTrackerGPU.h"
 #include "GdiDebugWindow.h"
@@ -52,7 +55,7 @@ private:
     void detectionThreadGpu();
 
     INIParser config;
-    std::unique_ptr<YoloV8> yoloV8;
+    std::unique_ptr<YoloDetector> yoloDetector;
     std::unique_ptr<DXGICapture> capture;
     std::unique_ptr<DXGICaptureCUDA> captureCUDA;
     std::unique_ptr<MouseController> mouseController;
@@ -134,7 +137,7 @@ void ObjectDetectionSystem::loadConfigFromINI(const std::string &iniFile) {
 }
 
 void ObjectDetectionSystem::initializeSystem() {
-    YoloV8Config yoloConfig;
+    YoloConfig yoloConfig;
     yoloConfig.classNames = config.getStringArray("Labels");
 
     // Modify this section
@@ -147,8 +150,20 @@ void ObjectDetectionSystem::initializeSystem() {
         throw std::runtime_error("Invalid precision in INI file. Use 'float' or 'half'.");
     }
 
-    // Create YoloV8 directly - it will use the factory internally
-    yoloV8 = std::make_unique<YoloV8>(config.getString("ModelPath"), yoloConfig);
+    // Determine YOLO version: explicit INI override, or auto-detect.
+    // ModelVersion can be "v8", "v11", "v26", or "auto" (default).
+    YoloVersion modelVersion = YoloVersion::AUTO;
+    const std::string versionStr = config.getString("ModelVersion", "auto");
+    if (versionStr == "v8" || versionStr == "V8") {
+        modelVersion = YoloVersion::V8;
+    } else if (versionStr == "v11" || versionStr == "V11") {
+        modelVersion = YoloVersion::V11;
+    } else if (versionStr == "v26" || versionStr == "V26") {
+        modelVersion = YoloVersion::V26;
+    }
+    // "auto" or anything else: modelVersion stays AUTO
+
+    yoloDetector = DetectorFactory::create(config.getString("ModelPath"), yoloConfig, modelVersion);
 
     screenWidth = GetSystemMetrics(SM_CXSCREEN);
     screenHeight = GetSystemMetrics(SM_CYSCREEN);
@@ -377,7 +392,7 @@ void ObjectDetectionSystem::detectionThread() {
             }
 
             std::vector<Object> detections;
-            detections = yoloV8->detectObjects(croppedFrame);
+            detections = yoloDetector->detectObjects(croppedFrame);
 
             mouseController->setCrosshairPosition(crosshairPos.x, crosshairPos.y);
             mouseController->aim(detections);
@@ -516,7 +531,7 @@ void ObjectDetectionSystem::detectionThreadGpu() {
                 }
             }
 
-            std::vector<Object> detections = yoloV8->detectObjects(croppedFrame);
+            std::vector<Object> detections = yoloDetector->detectObjects(croppedFrame);
 
             mouseController->setCrosshairPosition(crosshairPos.x, crosshairPos.y);
             mouseController->aim(detections);

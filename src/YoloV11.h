@@ -2,13 +2,13 @@
 #include "YoloDetector.h"
 
 // ---------------------------------------------------------------------------
-// YOLOv8 detector — anchor-based detection head (no DFL), NMS required
+// YOLOv11 detector — DFL-aware bbox decode, NMS required
 // ---------------------------------------------------------------------------
 
-class YoloV8 : public YoloDetector {
+class YoloV11 : public YoloDetector {
 public:
-    YoloV8(const std::string &onnxModelPath, const YoloConfig &config)
-        : YoloDetector(onnxModelPath, config, YoloVersion::V8) {}
+    YoloV11(const std::string &onnxModelPath, const YoloConfig &config)
+        : YoloDetector(onnxModelPath, config, YoloVersion::V11) {}
 
 protected:
     void launchPostprocKernel(EngineFP16 *fp16Engine,

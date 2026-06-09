@@ -100,6 +100,21 @@ Configuration files (INI format) in `dep/` control:
 - OpenCV with CUDA support
 - Windows SDK for DirectX integration
 
+## YOLO Model Version Support
+
+The detector supports three YOLO versions via a class hierarchy:
+
+| Class | Model | Output Shape | Postprocessing |
+|---|---|---|---|
+| `YoloV8` | YOLOv8 | `(1, 4+C, 8400)` | xywh decode + NMS |
+| `YoloV11` | YOLOv11 | `(1, 4×regMax+C, 8400)` | DFL softmax + xywh decode + NMS |
+| `YoloV26` | YOLOv26 | `(1, 300, 6)` | Confidence threshold only (NMS-free) |
+
+- `YoloDetector` (base) — engine mgmt, CUDA graph capture, GPU buffers
+- `DetectorFactory::create()` auto-detects version from filename, then output shape
+- INI key `ModelVersion=v8|v11|v26|auto` overrides detection
+- `YoloV8Config` is an alias for `YoloConfig` (backward compatible)
+
 ## Important Notes
 
 - The project is Windows-specific due to DirectX dependencies (DXGI, D3D11)
