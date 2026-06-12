@@ -89,7 +89,7 @@ void launchYoloV11FilterAndDecodeKernel(const YoloV11FilterParams &params,
 // no NMS. The kernel only applies a confidence threshold and copies survivors.
 
 struct YoloV26FilterParams {
-    const __half *output; // engine output, FP16, layout [1, 6, maxDetections]
+    const __half *output; // engine output, FP16, layout [1, maxDetections, 6]
     int maxDetections;    // typically 300
 
     float probThreshold;

@@ -39,10 +39,13 @@ public:
         return loadNetwork(engineName, subVals, divVals, normalize);
     }
 
-    bool loadNetwork(std::string trtModelPath, const std::array<float, 3> & /*subVals*/ = {0.f, 0.f, 0.f},
-                     const std::array<float, 3> & /*divVals*/ = {1.f, 1.f, 1.f}, bool /*normalize*/ = true) override {
-        // c36: subVals/divVals/normalize are no longer stashed on the engine — runInferenceFromBGR
-        // takes them per-call, since the OpenCV-based input prep that consumed them is gone.
+    bool loadNetwork(std::string trtModelPath, const std::array<float, 3> &subVals = {0.f, 0.f, 0.f},
+                     const std::array<float, 3> &divVals = {1.f, 1.f, 1.f}, bool normalize = true) override {
+        // When the engine is FP32 (TensorRT upcast), stash preproc params so
+        // runInference can blend them via blobFromGpuMats (matching EngineFP32).
+        m_subValsFP32 = subVals;
+        m_divValsFP32 = divVals;
+        m_normalizeFP32 = normalize;
         if (!Util::doesFileExist(trtModelPath)) {
             std::cout << "Error, unable to read TensorRT model at path: " + trtModelPath << std::endl;
             return false;
@@ -78,44 +81,61 @@ public:
         if (!m_context) {
             return false;
         }
+        std::cout << "[EngineFP16] Execution context created, setting up I/O..." << std::endl;
+        std::cout.flush();
 
+        // File marker — survives process crash
+        { std::ofstream m("C:/Users/tanguy/Documents/GitHub/YOLOv8-TensorRT-CPP/BEFORE_CLEARGPUBUFFERS.txt"); m << "ok" << std::endl; }
         clearGpuBuffers();
+        std::cout << "[EngineFP16] Buffers cleared, " << m_engine->getNbIOTensors() << " I/O tensors" << std::endl;
+        std::cout.flush();
         m_buffers.resize(m_engine->getNbIOTensors());
         m_outputLengths.clear();
         m_inputDims.clear();
         m_outputDims.clear();
         m_IOTensorNames.clear();
 
+        // Detect actual tensor precision — the ONNX may be exported as FP16 but
+        // TensorRT may upcast to FP32 internally (common with certain opsets).
+        bool engineIsFP16 = true;
+        for (int i = 0; i < m_engine->getNbIOTensors(); ++i) {
+            const auto name = m_engine->getIOTensorName(i);
+            if (m_engine->getTensorDataType(name) != nvinfer1::DataType::kHALF) {
+                engineIsFP16 = false;
+                break;
+            }
+        }
+        m_engineIsFP32 = !engineIsFP16;
+        if (m_engineIsFP32) {
+            std::cout << "[EngineFP16] TensorRT upcast FP16 ONNX to FP32 engine — using FP32 path internally" << std::endl;
+        }
+
         for (int i = 0; i < m_engine->getNbIOTensors(); ++i) {
             const auto tensorName = m_engine->getIOTensorName(i);
             m_IOTensorNames.emplace_back(tensorName);
             const auto tensorType = m_engine->getTensorIOMode(tensorName);
             const auto tensorShape = m_engine->getTensorShape(tensorName);
+            const bool isFloat = m_engine->getTensorDataType(tensorName) == nvinfer1::DataType::kFLOAT;
 
             if (tensorType == nvinfer1::TensorIOMode::kINPUT) {
-                if (m_engine->getTensorDataType(tensorName) != nvinfer1::DataType::kHALF) {
-                    throw std::runtime_error("Error, expected FP16 input in EngineFP16");
-                }
-
                 m_inputDims.emplace_back(tensorShape.d[1], tensorShape.d[2], tensorShape.d[3]);
                 m_inputBatchSize = tensorShape.d[0];
 
-                // Pre-allocate the FP16 CHW input buffer (c33). The fused preproc kernel writes
-                // directly here, so we no longer need a per-call OpenCV GpuMat for the input.
                 const int inputC = tensorShape.d[1];
                 const int inputH = tensorShape.d[2];
                 const int inputW = tensorShape.d[3];
-                size_t inputBytes = static_cast<size_t>(inputC) * inputH * inputW * m_options.maxBatchSize * sizeof(__half);
-                inputBytes = (inputBytes + 31) & ~31; // 32-byte alignment for FP16 tensor cores
+                size_t inputBytes;
+                if (isFloat) {
+                    inputBytes = static_cast<size_t>(inputC) * inputH * inputW * m_options.maxBatchSize * sizeof(float);
+                } else {
+                    inputBytes = static_cast<size_t>(inputC) * inputH * inputW * m_options.maxBatchSize * sizeof(__half);
+                }
+                inputBytes = (inputBytes + 31) & ~31;
 
                 Util::checkCudaErrorCode(cudaMallocAsync(&m_ownedInputBuffer, inputBytes, m_stream));
                 m_buffers[i] = m_ownedInputBuffer;
                 m_inputBufferIndex = i;
             } else if (tensorType == nvinfer1::TensorIOMode::kOUTPUT) {
-                if (m_engine->getTensorDataType(tensorName) != nvinfer1::DataType::kHALF) {
-                    throw std::runtime_error("Error, expected FP16 output in EngineFP16");
-                }
-
                 uint32_t outputLength = 1;
                 m_outputDims.push_back(tensorShape);
 
@@ -125,9 +145,13 @@ public:
 
                 m_outputLengths.push_back(outputLength);
 
-                // Make sure the allocation is aligned for FP16
-                size_t allocSize = outputLength * m_options.maxBatchSize * sizeof(__half);
-                allocSize = (allocSize + 31) & ~31; // 32-byte alignment
+                size_t allocSize;
+                if (isFloat) {
+                    allocSize = outputLength * m_options.maxBatchSize * sizeof(float);
+                } else {
+                    allocSize = outputLength * m_options.maxBatchSize * sizeof(__half);
+                }
+                allocSize = (allocSize + 31) & ~31;
 
                 Util::checkCudaErrorCode(cudaMallocAsync(&m_buffers[i], allocSize, m_stream));
             }
@@ -145,6 +169,7 @@ public:
     //
     // Accessors below expose the engine's stream and the device output binding pointer / length
     // so the caller can hand them to a downstream kernel.
+    [[nodiscard]] bool isEngineFP32() const { return m_engineIsFP32; }
     [[nodiscard]] cudaStream_t stream() const { return m_stream; }
     [[nodiscard]] void *outputDevicePtr(int outputIdx) const {
         return m_buffers[m_inputDims.size() + outputIdx];
@@ -233,14 +258,80 @@ public:
         return true;
     }
 
-    // c36: legacy runInference path retired. EngineFP16 only ships the fast path now —
-    // YoloV8::detectObjects dispatches to runInferenceFromBGR via dynamic_cast for FP16 engines,
-    // and EngineFP32::runInference is the only remaining caller of the OpenCV-based input prep.
-    // Kept as a stub purely to satisfy the EngineBase pure virtual.
-    bool runInference(const std::vector<std::vector<cv::cuda::GpuMat>> & /*inputs*/,
-                      std::vector<std::vector<std::vector<float>>> & /*featureVectors*/) override {
-        std::cout << "EngineFP16::runInference is retired — call runInferenceFromBGR instead." << std::endl;
-        return false;
+    // FP32 fallback runInference — used when TensorRT upcasts an FP16 ONNX to an FP32 engine.
+    // Mirrors EngineFP32::runInference (blobFromGpuMats → enqueueV3 → D2H memcpy).
+    bool runInference(const std::vector<std::vector<cv::cuda::GpuMat>> &inputs,
+                      std::vector<std::vector<std::vector<float>>> &featureVectors) override {
+        if (!m_engineIsFP32) {
+            std::cout << "EngineFP16::runInference is only supported when the engine is FP32." << std::endl;
+            return false;
+        }
+        if (inputs.empty() || inputs[0].empty()) {
+            std::cout << "Provided input vector is empty!" << std::endl;
+            return false;
+        }
+
+        const auto numInputs = m_inputDims.size();
+        if (inputs.size() != numInputs || inputs[0].size() > static_cast<size_t>(m_options.maxBatchSize)) {
+            std::cout << "Incorrect number of inputs or batch size too large!" << std::endl;
+            return false;
+        }
+
+        const auto batchSize = static_cast<int32_t>(inputs[0].size());
+        if (m_inputBatchSize != -1 && batchSize != m_inputBatchSize) {
+            std::cout << "The batch size is different from what the model expects!" << std::endl;
+            return false;
+        }
+
+        // Set input shapes and preprocess via blobFromGpuMats.
+        std::vector<cv::cuda::GpuMat> preprocessedInputs;
+        for (size_t i = 0; i < numInputs; ++i) {
+            const auto &dims = m_inputDims[i];
+            auto &input = inputs[i][0];
+            if (input.channels() != dims.d[0] || input.rows != dims.d[1] || input.cols != dims.d[2]) {
+                std::cout << "Input dimensions mismatch!" << std::endl;
+                return false;
+            }
+            nvinfer1::Dims4 inputDims = {batchSize, dims.d[0], dims.d[1], dims.d[2]};
+            m_context->setInputShape(m_IOTensorNames[i].c_str(), inputDims);
+
+            auto processed = blobFromGpuMats(inputs[i], m_subValsFP32, m_divValsFP32, m_normalizeFP32);
+            preprocessedInputs.push_back(processed);
+            m_buffers[i] = processed.ptr<void>();
+        }
+
+        if (!m_context->allInputDimensionsSpecified()) {
+            throw std::runtime_error("Not all required dimensions specified");
+        }
+
+        // Bind tensor addresses.
+        for (size_t i = 0; i < m_buffers.size(); ++i) {
+            if (!m_context->setTensorAddress(m_IOTensorNames[i].c_str(), m_buffers[i])) {
+                return false;
+            }
+        }
+
+        // Enqueue and copy outputs back.
+        if (!m_context->enqueueV3(m_stream)) {
+            return false;
+        }
+
+        featureVectors.clear();
+        for (int batch = 0; batch < batchSize; ++batch) {
+            std::vector<std::vector<float>> batchOutputs;
+            for (int32_t outputBinding = numInputs; outputBinding < m_engine->getNbIOTensors(); ++outputBinding) {
+                std::vector<float> output(m_outputLengths[outputBinding - numInputs]);
+                Util::checkCudaErrorCode(cudaMemcpyAsync(
+                    output.data(),
+                    static_cast<char *>(m_buffers[outputBinding]) + (batch * sizeof(float) * m_outputLengths[outputBinding - numInputs]),
+                    m_outputLengths[outputBinding - numInputs] * sizeof(float), cudaMemcpyDeviceToHost, m_stream));
+                batchOutputs.emplace_back(std::move(output));
+            }
+            featureVectors.emplace_back(std::move(batchOutputs));
+        }
+
+        Util::checkCudaErrorCode(cudaStreamSynchronize(m_stream));
+        return true;
     }
 
     [[nodiscard]] const std::vector<nvinfer1::Dims3> &getInputDims() const override { return m_inputDims; }
@@ -297,4 +388,10 @@ private:
     // transient OpenCV GpuMat pointer, so the fast path restores from m_ownedInputBuffer on entry.
     void *m_ownedInputBuffer = nullptr;
     int m_inputBufferIndex = -1;
+    bool m_engineIsFP32 = false;  // set in loadNetwork when TRT upcasts FP16 ONNX → FP32 engine
+
+    // Stashed preproc params for the FP32 fallback path (runInference).
+    std::array<float, 3> m_subValsFP32{};
+    std::array<float, 3> m_divValsFP32{};
+    bool m_normalizeFP32{true};
 };

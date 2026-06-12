@@ -105,6 +105,7 @@ private:
 ObjectDetectionSystem::ObjectDetectionSystem(const std::string &iniFile) : running(true) {
     loadConfigFromINI(iniFile);
     initializeSystem();
+    std::cout << "[CTOR] initializeSystem complete, entering run()" << std::endl;
 }
 
 void ObjectDetectionSystem::loadConfigFromINI(const std::string &iniFile) {
@@ -178,7 +179,9 @@ void ObjectDetectionSystem::initializeSystem() {
     }
     // "auto" or anything else: modelVersion stays AUTO
 
+    std::cout << "[INIT] Creating YOLO detector..." << std::endl;
     yoloDetector = DetectorFactory::create(config.getString("ModelPath"), yoloConfig, modelVersion);
+    std::cout << "[INIT] YOLO detector OK" << std::endl;
 
     screenWidth = GetSystemMetrics(SM_CXSCREEN);
     screenHeight = GetSystemMetrics(SM_CYSCREEN);
@@ -250,9 +253,12 @@ void ObjectDetectionSystem::startThreads() {
 }
 
 void ObjectDetectionSystem::mainLoop() {
+    // Startup marker — proves mainLoop was reached even if stdout is swallowed.
+    { std::ofstream m("C:/Users/tanguy/Documents/GitHub/YOLOv8-TensorRT-CPP/MAINLOOP_OK.txt"); m << "reached" << std::endl; }
     clearScreen();
     std::cout << "OpenCV CUDA support: " << cv::cuda::getCudaEnabledDeviceCount() << " devices" << std::endl;
     std::cout << "OpenCV version: " << CV_VERSION << std::endl;
+    std::cout.flush();
 
     std::cout << "Waiting for first captured frame..." << std::endl;
     // If no frames arrive within 5 seconds, capture is blocked.
@@ -267,8 +273,10 @@ void ObjectDetectionSystem::mainLoop() {
         std::cout << "Capture: BLOCKED (no frames after 5s) — Valorant likely blocks DXGI DD" << std::endl;
     }
 
-    // GDI debug window — always open, no config gate
-    m_debugWin.create(L"YOLO Detections", captureWidth, captureHeight);
+    // GDI debug window — only when DebugViewOpenCV is enabled
+    if (debugViewOpenCV) {
+        m_debugWin.create(L"YOLO Detections", captureWidth, captureHeight);
+    }
 
     // Metrics counter — write status file once per second (every 10th loop iteration
     // since Sleep(100) gives ~10 Hz loop rate).
@@ -351,7 +359,9 @@ void ObjectDetectionSystem::cleanup() {
 }
 
 void ObjectDetectionSystem::run() {
+    { std::ofstream m("C:/Users/tanguy/Documents/GitHub/YOLOv8-TensorRT-CPP/RUN_OK.txt"); m << "entered" << std::endl; }
     startThreads();
+    { std::ofstream m("C:/Users/tanguy/Documents/GitHub/YOLOv8-TensorRT-CPP/THREADS_OK.txt"); m << "started" << std::endl; }
     mainLoop();
     cleanup();
 }

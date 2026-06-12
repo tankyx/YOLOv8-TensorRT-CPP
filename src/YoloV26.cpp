@@ -52,10 +52,12 @@ std::vector<Object> YoloV26::postprocessFromSurvivors(uint32_t count) {
 
 std::vector<Object> YoloV26::postprocessDetect(const std::vector<float> &featureVector) {
     const auto &outputDims = m_trtEngine->getOutputDims();
-    const int maxDetections = outputDims[0].d[2]; // typically 300
+    // Output can be (1, detections, 6) or (1, 6, detections).
+    // Compute the true detection count from total elements / 6 fields.
+    const int totalElements = outputDims[0].d[1] * outputDims[0].d[2];
+    const int maxDetections = totalElements / 6;
 
-    // Output layout: (1, 6, maxDetections) where each row is
-    // [x1, y1, x2, y2, confidence, class_id]
+    // Output layout: (1, maxDetections, 6) — 6 fields contiguous per detection.
     const float *data = featureVector.data();
 
     std::vector<Object> objects;
@@ -64,12 +66,13 @@ std::vector<Object> YoloV26::postprocessDetect(const std::vector<float> &feature
     for (int i = 0; i < maxDetections; ++i) {
         if (static_cast<int>(objects.size()) >= TOP_K) { break; }
 
-        const float x1   = data[0 * maxDetections + i];
-        const float y1   = data[1 * maxDetections + i];
-        const float x2   = data[2 * maxDetections + i];
-        const float y2   = data[3 * maxDetections + i];
-        const float conf = data[4 * maxDetections + i];
-        const float cls  = data[5 * maxDetections + i];
+        const float *det = &data[i * 6];
+        const float x1   = det[0];
+        const float y1   = det[1];
+        const float x2   = det[2];
+        const float y2   = det[3];
+        const float conf = det[4];
+        const float cls  = det[5];
 
         if (conf <= PROBABILITY_THRESHOLD) { continue; }
 

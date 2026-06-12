@@ -19,9 +19,9 @@ decode, and direct USB-HID mouse output via a small bridge MCU.
 - **CUDA graph capture** of the entire per-frame GPU sequence. One
   `cudaMemcpy2DAsync` + one `cudaGraphLaunch` per frame instead of seven kernel
   launches.
-- **Ultra-low latency**: <0.1 ms detection time on RTX 40 series at 640x640 FP16,
-  capture-thread limited; aim-loop latency dominated by display refresh and HID
-  bridge round-trip.
+- **Ultra-low latency**: ~0.4 ms detection time on RTX 50 series at 640×640 FP16
+  with direct GPU capture; ~5 ms on the legacy CPU path. Aim-loop latency
+  dominated by display refresh and HID bridge round-trip.
 - **Direct hardware HID output** to an ESP32-P4 / RP2040 bridge MCU (USB
   composite device) — bypasses Windows raw input entirely, so the game sees a
   hardware mouse.
@@ -124,8 +124,8 @@ Two paths, gated by `UseDirectGpuCapture` in the INI:
   Slower (1-3 ms per frame just for capture), but compatible with the optional
   `TrackCrosshair` CPU template-matching path.
 
-The two paths are mutually exclusive; `TrackCrosshair=true` requires
-`UseDirectGpuCapture=false`. The Discord debug overlay works with either.
+The Discord debug overlay works with either capture path. `UseDirectGpuCapture=true`
+is recommended for all configs; disable only if `TrackCrosshair=true` is needed.
 
 #### Preprocess (`EngineFP16Kernels.cu`)
 
@@ -165,8 +165,8 @@ kernel depends on the detected YOLO version:
 - **YOLOv11**: `yoloV11FilterAndDecodeKernel` — same structure but applies DFL
   softmax over 16 distribution bins per bbox coordinate before xywh decode.
   Sequential coordinate processing avoids register spills.
-- **YOLOv26**: `yoloV26FilterKernel` — the model output is already decoded as
-  `(x1,y1,x2,y2,conf,class_id)` in an end-to-end head. Kernel only applies a
+- **YOLOv26**: `yoloV26FilterKernel` — the model output is `(1, maxDetections, 6)`
+  in an end-to-end head, 6 fields contiguous per detection. Kernel applies a
   confidence threshold and copies survivors. No box decode, no class argmax,
   no NMS needed on CPU.
 
@@ -346,8 +346,9 @@ on every rebuild. Edit `dep/config_*.ini` if you want changes to survive.
 
 ## Model preparation
 
-Export a YOLO checkpoint to ONNX (one-time per model). The detector auto-detects
-whether the model is V8, V11, or V26 from the output shape.
+Export a YOLO checkpoint to ONNX (one-time per model). Use `--fp16` to export
+FP16 I/O tensors (required for the CUDA graph fast path). The detector auto-detects
+the version from the output shape and filename.
 
 ```cmd
 # YOLOv8 / YOLOv11 (standard decode)
@@ -366,8 +367,8 @@ Re-saving the ONNX invalidates the cache automatically.
 
 Configs live in `dep/`. One per game:
 
-- `dep/config_cs2.ini` — CS2 (640x640, FP16, 4-class)
-- `dep/config_valo.ini` — Valorant (320x320, FP16 default; edit `Precision` for FP32)
+- `dep/config_cs2.ini` — CS2 (640×640, FP16, 1-class)
+- `dep/config_valo.ini` — Valorant (640×640, FP16, 4-class)
 
 ### Reference (CS2 example, annotated)
 
@@ -376,7 +377,7 @@ Configs live in `dep/`. One per game:
 ModelPath    = yolov8n_cs2_fp16.onnx   # relative to working dir
 ModelVersion = auto                     # auto, v8, v11, or v26 (override detection)
 Precision    = half                     # half (FP16) or float (FP32)
-Labels       = c, ch, t, th            # class names; size determines numClasses
+Labels       = player                  # class names; size determines numClasses
 
 # Capture / ROI
 CaptureWidth  = 640                    # ROI fed to the model (must match input)
@@ -385,8 +386,8 @@ CaptureFPS    = 240                    # advisory; capture is duplication-rate-l
 UseDirectGpuCapture = true             # DXGI/CUDA interop path; recommended
 
 # Detection
-HeadLabelID1 = 1                       # primary head class id (used by mouseController)
-HeadLabelID2 = 3                       # secondary head class id
+HeadLabelID1 = 0                       # primary head class id (used by mouseController)
+HeadLabelID2 = 0                       # secondary head class id
 
 # Mouse / aim
 CPI              = 3000                # mouse counts per inch (your in-game sens calibration)
@@ -397,7 +398,7 @@ MaxGain          = 0.65
 MaxSpeed         = 15
 Smoothing        = 10                  # 1=snappy, 10=very smooth (Bezier dt-based)
 DebugSnapGain    = 3.0                 # RMB snap-aim ROI-px -> mouse-counts multiplier
-DebugAimEnabled  = false               # true => RMB engages unsmoothed snap-aim
+DebugAimEnabled  = true                # true => RMB engages unsmoothed snap-aim (debug)
 
 # HID bridge
 HidVendorId  = 0x3367                  # ESP32-P4 OP1 8K V2 default
@@ -405,7 +406,7 @@ HidProductId = 0x1978
 HidSerial    =                         # blank = match by VID/PID only
 
 # Debug overlay
-DebugView                  = false     # Discord legacy overlay debug renderer
+DebugView                  = true      # Discord legacy overlay debug renderer
 DebugOverlayTargetProcess  = cs2.exe   # process Discord must be hooked into
 
 # Optional: CPU template-matching crosshair tracker (legacy capture path only)
@@ -430,12 +431,19 @@ CaptureThreadCore = 0
 Batch scripts are provided at the repo root:
 
 ```cmd
-# CS2 (always FP16, 640x640)
-run_cs2.bat
+# CS2 — pass model variant (defaults to v8)
+run_cs2.bat              # YOLOv8n
+run_cs2.bat v11s          # YOLOv11s
+run_cs2.bat v11m          # YOLOv11m
+run_cs2.bat v26m          # YOLOv26m
+run_cs2.bat v26l          # YOLOv26l
 
-# Valorant (FP16 by default, or pass 'float' for FP32)
-run_valo.bat
-run_valo.bat float
+# Valorant — same variants as CS2
+run_valo.bat              # YOLOv8n
+run_valo.bat v11s          # YOLOv11s
+run_valo.bat v11m          # YOLOv11m
+run_valo.bat v26m          # YOLOv26m
+run_valo.bat v26l          # YOLOv26l
 ```
 
 Or run directly:
@@ -456,17 +464,15 @@ capture cost (~50 ms); steady-state begins on frame 2.
 
 ## Performance
 
-Numbers from an RTX 40-class card at 640x640 FP16, single-class CS2 model:
+Numbers from an RTX 5090 at 640×640 FP16:
 
-- **Detection thread time** (preproc + inference + postprocess + sync):
-  **<0.1 ms** with `UseDirectGpuCapture=true`. The detection thread is now
-  capture-rate-limited.
+- **Detection thread time** (full loop: preproc + inference + postprocess + aim +
+  overlay): **~0.4 ms** with `UseDirectGpuCapture=true` (V8n); ~5 ms on the
+  legacy CPU capture path. V26l adds ~2 ms for the larger model.
 - **Capture thread time**: dominated by `IDXGIOutputDuplication::AcquireNextFrame`
-  blocking until the next refresh; <1 ms of actual work per frame on the
-  direct-GPU path, ~3-5 ms on the legacy CPU path.
-- **End-to-end latency** (screen change to HID report leaving the host):
-  bounded below by display refresh interval + bridge MCU round-trip; the
-  software pipeline contributes <2 ms.
+  blocking until the next refresh; negligible actual work on the direct-GPU path.
+- **End-to-end latency**: bounded below by display refresh interval + bridge MCU
+  round-trip; the software pipeline contributes <1 ms with direct GPU capture.
 
 Tuning levers, in order of impact:
 
@@ -533,13 +539,14 @@ src/
   SoftwareFuser.{h,cu}            # capture-card + desktop fusion (optional)
 
 dep/
-  config_cs2.ini                  # CS2 config (640x640, FP16, 4-class)
-  config_valo.ini                 # Valorant config (320x320, FP16 default)
-  *.onnx                          # exported model weights
-  *.engine                        # cached TensorRT plans (generated)
+  config_{cs2,valo}.ini           # base configs per game
+  config_{cs2,valo}_v{8,11s,11m,26m,26l}.ini  # per-variant configs
+  *.onnx, *.pt                    # exported model weights / checkpoints
+  *.engine                        # cached TensorRT plans (generated on first run)
 
 scripts/
   pytorch2onnx.py                 # PyTorch -> ONNX export
+  train_all.bat                   # full training sweep launcher
 ```
 
 ## Acknowledgments

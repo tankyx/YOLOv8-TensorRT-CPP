@@ -152,7 +152,7 @@ void launchYoloV11FilterAndDecodeKernel(const YoloV11FilterParams &params, cudaS
 // YOLOv26 — end-to-end filter (NMS-free)
 // ---------------------------------------------------------------------------
 //
-// YOLOv26 output: (1, 6, maxDetections) where each row is
+// YOLOv26 output: (1, maxDetections, 6) where each row is
 //   [x1, y1, x2, y2, confidence, class_id]
 //
 // The output is already decoded — no box math, no class argmax.
@@ -162,14 +162,14 @@ __global__ void yoloV26FilterKernel(YoloV26FilterParams p) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= p.maxDetections) { return; }
 
-    // Row-major: detection i is at offset i*6 in the 2D output.
-    // Output layout is [1, 6, maxDetections], so contiguous stride is maxDetections.
-    const float x1     = __half2float(p.output[0 * p.maxDetections + i]);
-    const float y1     = __half2float(p.output[1 * p.maxDetections + i]);
-    const float x2     = __half2float(p.output[2 * p.maxDetections + i]);
-    const float y2     = __half2float(p.output[3 * p.maxDetections + i]);
-    const float conf   = __half2float(p.output[4 * p.maxDetections + i]);
-    const float cls_id = __half2float(p.output[5 * p.maxDetections + i]);
+    // Output layout is [1, maxDetections, 6] — 6 fields contiguous per detection.
+    const __half *det = &p.output[i * 6];
+    const float x1     = __half2float(det[0]);
+    const float y1     = __half2float(det[1]);
+    const float x2     = __half2float(det[2]);
+    const float y2     = __half2float(det[3]);
+    const float conf   = __half2float(det[4]);
+    const float cls_id = __half2float(det[5]);
 
     if (conf <= p.probThreshold) { return; }
 

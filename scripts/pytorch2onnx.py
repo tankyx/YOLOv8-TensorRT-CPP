@@ -20,10 +20,14 @@ def convert_pt_to_onnx(pt_path, yolo_version, onnx_path, use_fp16=False, use_dyn
             raise RuntimeError("FP16 export requires GPU. Please run with GPU or use FP32.")
         
         # Force FP16 settings
+        # Using half=True to export FP16 ONNX tensors throughout.
+        # half=False (FP32 ONNX) + TensorRT kFP16 builder flag works for v8/v11
+        # but fails for v26 end-to-end heads — the output stays FP32, causing
+        # TensorRT to upcast the entire engine to FP32 (136 ms vs ~5 ms).
         export_params.update({
             "half": True,
-            "dynamic": False,  # FP16 is not compatible with dynamic shapes
-            "device": 0  # Ensure GPU usage
+            "dynamic": False,
+            "device": 0
         })
     else:
         export_params.update({
@@ -72,7 +76,9 @@ def main():
     parser.add_argument("--pt_path", type=str, help="Path to the input .pt file")
     parser.add_argument("--yolo_version", type=str, 
                         choices=["v5n", "v5s", "v5m", "v5l", "v5x", 
-                                 "v8n", "v8s", "v8m", "v8l", "v8x"],
+                                 "v8n", "v8s", "v8m", "v8l", "v8x",
+                                 "v11n", "v11s", "v11m", "v11l", "v11x",
+                                 "v26n", "v26s", "v26m", "v26l", "v26x"],
                         help="YOLO model version and size (e.g., v8n for YOLOv8-nano)")
     parser.add_argument("--onnx_path", type=str, help="Path to save the output .onnx file")
     parser.add_argument("--fp16", action="store_true", help="Export in FP16 precision (requires GPU)")

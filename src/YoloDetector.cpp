@@ -44,9 +44,20 @@ YoloDetector::YoloDetector(const std::string &onnxModelPath, const YoloConfig &c
         throw std::runtime_error(errMsg);
     }
     std::cout << "TensorRT engine built and loaded!" << std::endl;
+    std::cout.flush(); // force flush before anything that might crash
 
     // Cache fp16 engine pointer (avoids dynamic_cast per frame).
     m_fp16Engine = dynamic_cast<EngineFP16 *>(m_trtEngine.get());
+    // If the engine's output tensors are FP32 (TensorRT upcast the FP16 ONNX),
+    // keep the fast path for input (fused preproc works since input is still Half)
+    // but skip the GPU postproc kernel — raw D2H + CPU postproc instead.
+    if (m_fp16Engine && m_fp16Engine->isEngineFP32()) {
+        std::cout << "[YoloDetector] Engine has FP32 output — keeping fast path, GPU postproc disabled" << std::endl;
+        m_outputIsFP32 = true;
+        // Pre-allocate host buffer for raw FP32 output D2H copy.
+        m_rawOutputLen = static_cast<int>(m_fp16Engine->outputLength(0));
+        m_hostRawOutput.resize(static_cast<size_t>(m_rawOutputLen));
+    }
 
     // Cache output dimensions — never change after engine construction.
     if (m_trtEngine->getOutputDims().size() >= 1) {
@@ -56,6 +67,11 @@ YoloDetector::YoloDetector(const std::string &onnxModelPath, const YoloConfig &c
 
         if (m_version == YoloVersion::V26) {
             m_numClasses = static_cast<int>(CLASS_NAMES.size());
+            std::cout << "[YoloDetector] V26 output dims: (" << od.d[0]
+                      << ", " << od.d[1] << ", " << od.d[2] << ")"
+                      << "  maxDetectionsV26=" << MAX_DETECTIONS_V26
+                      << "  fp16Engine=" << (m_fp16Engine ? "yes" : "no")
+                      << std::endl;
         } else if (m_version == YoloVersion::V11) {
             m_numClasses = numChannels - 4 * REG_MAX;
         } else {
@@ -64,8 +80,11 @@ YoloDetector::YoloDetector(const std::string &onnxModelPath, const YoloConfig &c
     }
 
     if (config.precision == Precision::FP16) {
+        std::cout << "[YoloDetector] Allocating postproc buffers..." << std::endl;
         allocatePostprocBuffers();
+        std::cout << "[YoloDetector] Postproc buffers OK" << std::endl;
     }
+    std::cout << "[YoloDetector] Constructor complete" << std::endl;
 }
 
 YoloDetector::~YoloDetector() {
@@ -134,16 +153,24 @@ bool YoloDetector::runFp16InferenceOnStream(const cv::cuda::GpuMat &captureView,
     m_imgHeight = static_cast<float>(captureView.rows);
     m_ratio = ratio;
 
-    cudaMemsetAsync(m_devSurvivorCount, 0, sizeof(uint32_t), stream);
+    if (m_outputIsFP32) {
+        // Engine output is FP32 — skip GPU postproc kernel, copy raw output.
+        cudaMemcpyAsync(m_hostRawOutput.data(),
+                        m_fp16Engine->outputDevicePtr(0),
+                        static_cast<size_t>(m_rawOutputLen) * sizeof(float),
+                        cudaMemcpyDeviceToHost, stream);
+    } else {
+        cudaMemsetAsync(m_devSurvivorCount, 0, sizeof(uint32_t), stream);
 
-    // Version-specific GPU postproc kernel (virtual dispatch)
-    launchPostprocKernel(m_fp16Engine, numAnchors, numClasses, stream);
+        // Version-specific GPU postproc kernel (virtual dispatch)
+        launchPostprocKernel(m_fp16Engine, numAnchors, numClasses, stream);
 
-    cudaMemcpyAsync(&m_hostSurvivorCount, m_devSurvivorCount,
-                    sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(m_hostSurvivors.data(), m_devSurvivors,
-                    static_cast<size_t>(kMaxSurvivors) * kYoloSurvivorStride * sizeof(float),
-                    cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyAsync(&m_hostSurvivorCount, m_devSurvivorCount,
+                        sizeof(uint32_t), cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyAsync(m_hostSurvivors.data(), m_devSurvivors,
+                        static_cast<size_t>(kMaxSurvivors) * kYoloSurvivorStride * sizeof(float),
+                        cudaMemcpyDeviceToHost, stream);
+    }
     return true;
 }
 
@@ -295,12 +322,18 @@ std::vector<Object> YoloDetector::detectObjects(const cv::cuda::GpuMat &inputIma
             }
             m_graphCaptured = true;
             cudaStreamSynchronize(stream);
+            if (m_outputIsFP32) {
+                return postprocessDetect(m_hostRawOutput);
+            }
             return postprocessFromSurvivors(m_hostSurvivorCount);
         }
 
         // Steady state: replay captured graph.
         cudaGraphLaunch(m_graphExec, stream);
         cudaStreamSynchronize(stream);
+        if (m_outputIsFP32) {
+            return postprocessDetect(m_hostRawOutput);
+        }
         return postprocessFromSurvivors(m_hostSurvivorCount);
     }
 
@@ -409,9 +442,12 @@ YoloVersion YoloDetector::detectVersionFromOutput(const nvinfer1::Dims &outputDi
     const int channels = outputDims.d[1];
     const int anchors  = outputDims.d[2];
 
-    // V26 end-to-end: output is (1, ~300, 6) — 6 fields per detection
+    // V26 end-to-end: output can be (1, 6, ~300) or (1, ~300, 6)
     // The 6 fields are: (x1, y1, x2, y2, confidence, class_id)
     if (channels == 6 && anchors >= 100 && anchors <= 500) {
+        return YoloVersion::V26;
+    }
+    if (anchors == 6 && channels >= 100 && channels <= 500) {
         return YoloVersion::V26;
     }
 

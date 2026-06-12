@@ -135,6 +135,11 @@ protected:
     int m_numClasses = 0;
     int m_srcChannels = 0; // 3 (CV_8UC3 BGR) or 4 (CV_8UC4 BGRA)
 
+    // -- FP32 output fallback ------------------------------------------------
+    bool m_outputIsFP32 = false;
+    std::vector<float> m_hostRawOutput;
+    int m_rawOutputLen = 0;
+
     // -- Graph capture state ------------------------------------------------
     uint8_t *m_captureBuffer = nullptr;
     size_t m_captureBufferPitch = 0;
