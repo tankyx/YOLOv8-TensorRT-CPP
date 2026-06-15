@@ -260,8 +260,10 @@ protected:
             const auto inputName = input->getName();
             const auto inputDims = input->getDimensions();
             int32_t inputC = inputDims.d[1];
-            int32_t inputH = inputDims.d[2];
-            int32_t inputW = inputDims.d[3];
+            // ONNX models may export with dynamic spatial dims (-1).
+            // TensorRT optimization profile requires concrete values; default to 640.
+            int32_t inputH = inputDims.d[2] > 0 ? inputDims.d[2] : 640;
+            int32_t inputW = inputDims.d[3] > 0 ? inputDims.d[3] : 640;
 
             optProfile->setDimensions(inputName, nvinfer1::OptProfileSelector::kMIN, nvinfer1::Dims4(1, inputC, inputH, inputW));
             optProfile->setDimensions(inputName, nvinfer1::OptProfileSelector::kOPT,

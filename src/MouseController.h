@@ -92,6 +92,7 @@ public:
     void setDebugSnapGain(float g) { _debugSnapGain = (std::max)(0.1f, g); }
     void setDebugAimEnabled(bool e) { _debugAimEnabled = e; }
     float getSmoothing() const { return _userSmoothing; }
+    void setGameCalibration(float sens, float fov, const std::string& game);
     ~MouseController();
     void aim(const std::vector<Object> &detections);
     void triggerLeftClickIfCenterWithinDetection(const std::vector<Object> &detections);
@@ -101,6 +102,7 @@ public:
     int getCrosshairY() const { return crosshairY; }
     int getMovementX() const { return _dx; }
     int getMovementY() const { return _dy; }
+    std::pair<float, float> pixelDeltaToCounts(float deltaX, float deltaY) const;
 
 private:
     int screenWidth;
@@ -145,6 +147,17 @@ private:
     float _residX = 0.0f;
     float _residY = 0.0f;
     BezierCurve2D _bezier;
+
+    // Pixel-perfect FOV-based mouse count conversion. When true, pixel deltas
+    // are converted to mouse counts via the focal-length/atan2 method instead
+    // of a linear gain multiplier.
+    float gameFOV = 90.0f;
+    float m_yaw = 0.022f;
+    bool useFovMethod = true;
+
+    // Precomputed constants for pixelDeltaToCounts — avoids tanf per frame.
+    float m_focalLength = 1920.0f;
+    float m_anglePerCountRad = 0.000096f;
 
     // Multiplier applied to the raw screen-pixel delta on the RMB-only debug
     // path. Translates ROI pixels into mouse counts for the user's in-game

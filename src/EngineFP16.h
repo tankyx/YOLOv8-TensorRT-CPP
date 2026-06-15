@@ -84,8 +84,6 @@ public:
         std::cout << "[EngineFP16] Execution context created, setting up I/O..." << std::endl;
         std::cout.flush();
 
-        // File marker — survives process crash
-        { std::ofstream m("C:/Users/tanguy/Documents/GitHub/YOLOv8-TensorRT-CPP/BEFORE_CLEARGPUBUFFERS.txt"); m << "ok" << std::endl; }
         clearGpuBuffers();
         std::cout << "[EngineFP16] Buffers cleared, " << m_engine->getNbIOTensors() << " I/O tensors" << std::endl;
         std::cout.flush();

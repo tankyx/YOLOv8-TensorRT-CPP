@@ -1,319 +1,216 @@
 # YOLOv8-TensorRT-CPP
 
-Sub-millisecond YOLOv8 object detection for real-time gaming aim assist on Windows.
-End-to-end pipeline from screen capture to USB HID mouse report stays on the GPU,
-inference runs as a captured CUDA graph, and the detection thread does sub-100us
-work per frame on an RTX 40-class card.
+Sub-millisecond YOLO object detection for real-time gaming aim assist on Windows.
+End-to-end GPU pipeline: DXGI capture → fused preproc → TensorRT inference → GPU
+decode → HID mouse output. CUDA graph-captured, Discord-overlay-debugged.
 
-The detector supports YOLOv8, YOLOv11, and YOLOv26 models — all exported to
-ONNX, compiled to TensorRT engines on first run, and served by a multi-threaded
-C++ pipeline that does DXGI Desktop Duplication capture, GPU-side preprocess +
-decode, and direct USB-HID mouse output via a small bridge MCU.
+Supports YOLOv8, YOLOv11, and YOLOv26 models.
+
+---
+
+## Quick Start
+
+```cmd
+# 1. Build
+git clone https://github.com/tankyx/YOLOv8-TensorRT-CPP.git
+cd YOLOv8-TensorRT-CPP
+mkdir build && cd build
+cmake .. -G "Visual Studio 17 2022" -A x64 ^
+  -DCMAKE_BUILD_TYPE=Release ^
+  -DOpenCV_DIR=C:/opencv-4.10.0 ^
+  -DTENSORRT_ROOT="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.9"
+cmake --build . --config Release
+
+# 2. Export your model to ONNX (one-time)
+python scripts/pytorch2onnx.py path\to\model.pt v8n dep/model.onnx --fp16
+
+# 3. Configure
+# Edit dep/config_cs2.ini — set ModelPath, Labels, CPI, etc.
+# See the annotated reference below.
+
+# 4. Run
+cd build\bin\Release
+detect_object_image.exe config_cs2.ini
+```
+
+First launch with a new model takes 30–60 seconds to compile the TensorRT plan.
+Press **Insert** to exit.
+
+Batch scripts at repo root:
+```cmd
+run_cs2.bat              # CS2 — default YOLOv8n
+run_cs2.bat v11s          # YOLOv11s
+run_cs2.bat v11m          # YOLOv11m
+run_valo.bat              # Valorant — YOLOv8n
+run_valo.bat v11s          # YOLOv11s
+run_valo.bat v26l          # YOLOv26l
+```
+
+Prerequisites: Windows 10/11, NVIDIA RTX 40+ series, Visual Studio 2022, CMake 3.22+,
+CUDA Toolkit 12.4+, TensorRT 10.x, OpenCV 4.10 with CUDA modules.
+Full build instructions → [Building from source](#building-from-source).
+
+---
 
 ## Highlights
 
-- **Fully GPU pipeline** when `UseDirectGpuCapture=true`: DXGI Desktop Duplication
-  -> CUDA-D3D11 interop -> fused BGRA->fp16 CHW preproc kernel -> TensorRT
-  inference -> GPU anchor filter+decode -> ~20 KB D2H of survivors -> CPU NMS.
-  Zero CPU pixel touch.
-- **CUDA graph capture** of the entire per-frame GPU sequence. One
-  `cudaMemcpy2DAsync` + one `cudaGraphLaunch` per frame instead of seven kernel
-  launches.
-- **Ultra-low latency**: ~0.4 ms detection time on RTX 50 series at 640×640 FP16
-  with direct GPU capture; ~5 ms on the legacy CPU path. Aim-loop latency
-  dominated by display refresh and HID bridge round-trip.
-- **Direct hardware HID output** to an ESP32-P4 / RP2040 bridge MCU (USB
-  composite device) — bypasses Windows raw input entirely, so the game sees a
-  hardware mouse.
-- **Discord-overlay debug renderer**: detection boxes draw into Discord's
-  legacy in-game overlay shared memory (no separate transparent window).
-- **Bezier-smoothed dt-based aim path** ported from CS2Miam, plus an unsmoothed
-  RMB debug snap-aim for tuning.
+- **Fully GPU pipeline** with `UseDirectGpuCapture=true`: DXGI Desktop Duplication
+  → CUDA-D3D11 interop → fused BGRA→fp16 CHW preproc kernel → TensorRT
+  inference → GPU anchor filter+decode → ~20 KB D2H → CPU NMS. Zero CPU pixel touch.
+- **CUDA graph capture** of the per-frame GPU sequence. One `cudaMemcpy2DAsync` +
+  one `cudaGraphLaunch` per frame.
+- **~0.4 ms detection time** on RTX 5090 at 640×640 FP16 with direct GPU capture.
+- **Direct HID output** to an ESP32-P4/RP2040 bridge MCU — the game sees a hardware
+  mouse, not a synthesized one.
+- **Discord-overlay debug renderer**: detection boxes draw into Discord's legacy
+  in-game overlay shared memory (no separate window).
+- **Bezier-smoothed dt-based aim** with sub-pixel residue carry.
 
-## Architecture overview
+---
 
-```
-                      +-----------------+
-                      |  DXGI Output    |
-                      |  Duplication    |
-                      +--------+--------+
-                               |
-              +----------------+----------------+
-              | UseDirectGpuCapture = true      |
-              |   (DXGICaptureCUDA)             |
-              v                                 v
-   +------------------------+      +------------------------+
-   | D3D11 GPU staging tex  |      | CPU staging tex (Map)  |
-   | cudaGraphicsD3D11      |      | cv::cvtColor BGRA->BGR |
-   | RegisterResource       |      | cv::Mat                |
-   | -> cudaArray (BGRA)    |      |                        |
-   | cudaMemcpy2DFromArray  |      |                        |
-   |   into BGRA GpuMat     |      |                        |
-   +-----------+------------+      +-----------+------------+
-               |                               |
-               v                               v
-       GpuFrameQueue                    FrameQueue (cv::Mat)
-               |                               |
-               v                               v
-   +------------------------+      +------------------------+
-   | detectionThreadGpu     |      | detectionThread        |
-   | ROI = frame(rect)      |      | ROI = frame(rect)      |
-   | (GpuMat view, no copy) |      | + optional crosshair   |
-   |                        |      |   GPU template match   |
-   +-----------+------------+      +-----------+------------+
-               |                               |
-               +---------------+---------------+
-                               |
-                               v
-                +------------------------------+
-                |   YoloV8::detectObjects      |
-                |                              |
-                |  cudaMemcpy2D src -> stable  |
-                |    capture buffer            |
-                |                              |
-                |  cudaGraphLaunch:            |
-                |    fused preproc kernel      |
-                |    (BGR/BGRA -> fp16 CHW)    |
-                |    enqueueV3 (TensorRT)      |
-                |    memset(survivor count)    |
-                |    filter+decode kernel      |
-                |    memcpy(count, survivors)  |
-                |                              |
-                |  cudaStreamSynchronize       |
-                |  cv::dnn::NMSBoxesBatched    |
-                |    on <= 1024 survivors      |
-                +---------------+--------------+
-                                |
-                                v
-                +------------------------------+
-                |   MouseController::aim       |
-                |                              |
-                |  Bezier dt-based smoothing   |
-                |    (LMB held)                |
-                |   OR unsmoothed snap         |
-                |    (RMB held, debug)         |
-                |  sub-pixel residue carry     |
-                |  HID report -> bridge MCU    |
-                +---------------+--------------+
-                                |
-                                v
-                +------------------------------+
-                | Discord legacy overlay       |
-                | (shared memory, optional)    |
-                +------------------------------+
-```
-
-### Stages in detail
-
-#### Capture
-
-Two paths, gated by `UseDirectGpuCapture` in the INI:
-
-- **Direct GPU (`true`, recommended).** `DXGICaptureCUDA` creates a private
-  GPU-only D3D11 staging texture (`DXGI_FORMAT_B8G8R8A8_UNORM`,
-  `D3D11_USAGE_DEFAULT`), registers it once with CUDA via
-  `cudaGraphicsD3D11RegisterResource`. Per frame: `AcquireNextFrame` ->
-  `CopyResource` desktop into staging -> `cudaGraphicsMapResources` ->
-  `cudaGraphicsSubResourceGetMappedArray` -> `cudaMemcpy2DFromArrayAsync` into
-  a `cv::cuda::GpuMat` (CV_8UC4 BGRA). No CPU touch, no `cvtColor`, no upload.
-  Pushed through `GpuFrameQueue` to the detection thread. The fused preproc
-  kernel handles BGRA by reading 4 bytes per pixel and ignoring alpha.
-
-- **Legacy CPU path (`false`).** `DXGICapture` does the classic GPU->CPU staging
-  map + `cv::cvtColor` BGRA->BGR + `cv::Mat` upload in the detection thread.
-  Slower (1-3 ms per frame just for capture), but compatible with the optional
-  `TrackCrosshair` CPU template-matching path.
-
-The Discord debug overlay works with either capture path. `UseDirectGpuCapture=true`
-is recommended for all configs; disable only if `TrackCrosshair=true` is needed.
-
-#### Preprocess (`EngineFP16Kernels.cu`)
-
-A single CUDA kernel per frame, `fusedPreprocBGRtoFP16Kernel`. One thread per
-output pixel:
-
-1. Letterbox resize with bilinear sampling (matches OpenCV's `INTER_LINEAR`
-   corner convention; padding region writes zeros to match the original
-   `resizeKeepAspectRatioPadRightBottom`).
-2. BGR/BGRA -> RGB channel swap (alpha read and dropped on the BGRA path).
-3. Per-channel normalize: `(v / 255 - sub[c]) / div[c]` in float.
-4. Cast to `__half` and store directly into the FP16 CHW input buffer that's
-   bound to TensorRT's input tensor.
-
-Replaces what used to be 7+ OpenCV CUDA launches with a 4.7 MB FP32 intermediate
-and an in-preprocess `cudaStreamSynchronize`. The FP16 input buffer
-(`m_ownedInputBuffer` in `EngineFP16`) is owned by the engine, allocated once
-in `loadNetwork`.
-
-#### Inference (`EngineFP16` + TensorRT 10.x)
-
-Standard `enqueueV3` against the loaded engine. The serialized `.engine` plan
-is keyed in `serializeEngineOptions` by ONNX file path, GPU device name,
-precision suffix, opt/max batch sizes, and an FNV-1a 64-bit hash of the ONNX
-file contents (so editing the `.onnx` in place invalidates the cache).
-
-Output is FP16. There is no host D2H of the full output tensor — see
-postprocess.
-
-#### Postprocess (`YoloPostprocKernels.cu`)
-
-A second CUDA kernel runs on the engine's stream right after `enqueueV3`. The
-kernel depends on the detected YOLO version:
-
-- **YOLOv8**: `yoloFilterAndDecodeKernel` — one thread per anchor (8400 for
-  640x640). Decodes xywh→xyxy, finds best class, atomically writes survivors.
-- **YOLOv11**: `yoloV11FilterAndDecodeKernel` — same structure but applies DFL
-  softmax over 16 distribution bins per bbox coordinate before xywh decode.
-  Sequential coordinate processing avoids register spills.
-- **YOLOv26**: `yoloV26FilterKernel` — the model output is `(1, maxDetections, 6)`
-  in an end-to-end head, 6 fields contiguous per detection. Kernel applies a
-  confidence threshold and copies survivors. No box decode, no class argmax,
-  no NMS needed on CPU.
-
-All kernels write the same survivor format: `(x0, y0, x1, y1, score, label)`.
-D2H is ~24 KB (count + up to 1024 survivor records) instead of the ~270 KB FP32
-full output the legacy path moved. CPU does only `cv::dnn::NMSBoxesBatched`
-(V8/V11) or a direct threshold pass (V26) plus the top-K cap.
-
-#### CUDA graph capture (`yolov8.cpp`)
-
-The per-frame GPU sequence is `[fused_preproc -> enqueueV3 -> memset(count) ->
-filter+decode -> memcpy(count) -> memcpy(survivors)]`. All have stable pointers
-because the fused preproc reads from a stable owned `m_captureBuffer` (the
-captured `bgr` GpuMat is `cudaMemcpy2DAsync`'d into it before the graph
-launch), and the engine's input/output buffers were allocated once at load.
-
-On the first detection-thread call after engine load:
-
-1. **Warmup pass** (outside capture): TRT may make internal allocations the
-   first time `enqueueV3` runs; these can't happen inside `cudaStreamCapture`.
-2. **Capture pass**: `cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal)`,
-   re-issue the same sequence, `cudaStreamEndCapture`, `cudaGraphInstantiate`.
-3. **Steady state**: `cudaGraphLaunch` per frame.
-
-The graph is rebuilt if capture dimensions change at runtime (they shouldn't,
-since `CaptureWidth`/`Height` are INI-fixed).
-
-#### Mouse aim (`MouseController.cpp`)
-
-`MouseController::aim` is called per detection frame. Trigger gating:
-
-- **LMB held** -> smoothed aim. The aim moves toward the closest detection
-  using a 2D Bezier curve (`BezierCurve2D`) with a dt-based progress
-  parameter: `_t += (1 - smoothingFactor) * 0.00005 * elapsed_us`. This makes
-  total time-to-target roughly invariant to detection rate.
-- **RMB held** + `DebugAimEnabled=true` -> unsmoothed snap-aim. Raw delta
-  multiplied by `DebugSnapGain` and sent in one HID report. For tuning
-  in-game sensitivity calibration.
-- **LSHIFT held** -> triggerbot hold key. When the crosshair is within a
-  detection box and LSHIFT is held, fires a non-blocking randomized-cooldown
-  click via the same HID path.
-
-Sub-pixel residue (`_residX/_residY`) is carried frame-to-frame so slow
-tracking doesn't truncate to zero counts every report.
-
-The `Smoothing` knob (1-10 in the INI) maps to `smoothingFactor` in
-`[0.005, 0.5]`. The mapping was widened from the original CS2Miam 90-100 band
-to compensate for the previous pipeline's ~4-5 ms detection staleness; with
-the new sub-100us pipeline you generally want `Smoothing=10` (slowest).
-
-#### HID output
-
-`MouseController` opens the bridge MCU as a HID device using
-`HidVendorId`/`HidProductId`/`HidSerial` from the INI. Defaults match an
-ESP32-P4 board cloned as the `OP1 8K V2` (VID `0x3367` PID `0x1978`, no
-serial). Movement reports are 4 bytes: `(buttons, dx_lo, dx_hi, dy_lo, dy_hi)`
-with int16 deltas — the bridge re-emits them as native USB HID mouse reports
-to the host. Game sees a hardware mouse, not a SendInput synthesized one.
-
-#### Debug overlay (`DiscordOverlay.h`)
-
-When `DebugView=true`, the detection thread renders detection boxes and the
-resolved crosshair into a CPU-side Direct2D + WIC bitmap, memcpys the dirty
-rect into Discord's legacy in-game-overlay shared memory, and bumps the
-frame counter. Discord's already-injected DLL composites our pixels into the
-game's swap chain — so the overlay rides the game's frame, no separate
-top-most window. Requires the **legacy** Discord in-game overlay (User
-Settings -> Game Overlay -> Enable in-game overlay); the post-2024 overlay
-doesn't expose this mapping.
-
-`DebugOverlayTargetProcess` (default `cs2.exe`) is the process Discord must
-be hooked into. Launch the game first, then this binary.
-
-### Threading & queues
-
-Two threads, plus the main thread:
-
-- `captureThread{,Gpu}` — calls `DXGICapture::CaptureScreen` (or
-  `DXGICaptureCUDA::CaptureScreen` with a private CUDA stream and
-  `cudaStreamSynchronize` before push), pushes to `FrameQueue` /
-  `GpuFrameQueue`. Both queues are drop-old-keep-newest: the consumer always
-  sees the most recent frame, never a stale one.
-- `detectionThread{,Gpu}` — pops a frame, crops to ROI, runs
-  `yoloV8->detectObjects`, calls `mouseController->aim(detections)` and
-  `triggerLeftClickIfCenterWithinDetection`, pushes to a `DetectionQueue`
-  (move-threshold-filtered), and optionally publishes to the Discord overlay.
-- Main thread — pumps Win32 messages, watches for VK_INSERT to exit, prints a
-  status line every 100 ms with rolling averages (`Capture / Detection /
-  Render`).
-
-`SafeQueue<T>` is a generic mutex+cv FIFO used for the log channel.
-`LatencyQueue` keeps a sliding 500 ms window for the rolling averages.
-
-## Prerequisites
-
-### System
-
-- Windows 10/11 (64-bit). DXGI Desktop Duplication + CUDA-D3D11 interop are
-  Windows-only.
-- NVIDIA GPU with compute capability >= 8.9 (RTX 40 series). RTX 50 series
-  also supported with CUDA 12.9; pass `-DCMAKE_CUDA_ARCHITECTURES=120` (or
-  whatever your card's SM is) at configure time.
-- Visual Studio 2022 with C++ desktop workload + Windows 10 SDK.
-- CMake 3.22+.
-
-### CUDA + TensorRT
-
-1. **CUDA Toolkit 12.4+** (12.9 tested) from
-   <https://developer.nvidia.com/cuda-downloads>. Verify with `nvcc --version`.
-2. **TensorRT 10.x** from <https://developer.nvidia.com/tensorrt>. Extract into
-   the CUDA install root, e.g. `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\`,
-   so the following exist:
-   - `include\NvInfer.h`, `include\NvOnnxParser.h`
-   - `lib\nvinfer_10.lib`, `lib\nvonnxparser_10.lib`,
-     `lib\nvinfer_plugin_10.lib`
-   - `bin\nvinfer*.dll` (CMake copies these next to the exe at build time)
-
-### OpenCV with CUDA
-
-Stock OpenCV doesn't ship CUDA modules; build it yourself once.
+## Running
 
 ```cmd
-git clone https://github.com/opencv/opencv.git -b 4.10.0
-git clone https://github.com/opencv/opencv_contrib.git -b 4.10.0
+# Direct
+cd build\bin\Release
+detect_object_image.exe config_valo.ini
 
-mkdir opencv-build && cd opencv-build
-
-cmake -G "Visual Studio 17 2022" -A x64 ^
-  -DCMAKE_BUILD_TYPE=Release ^
-  -DCMAKE_INSTALL_PREFIX=C:/opencv-4.10.0 ^
-  -DOPENCV_EXTRA_MODULES_PATH=../opencv_contrib/modules ^
-  -DWITH_CUDA=ON ^
-  -DWITH_CUDNN=ON ^
-  -DOPENCV_DNN_CUDA=ON ^
-  -DCUDA_ARCH_BIN=8.9 ^
-  -DCUDA_FAST_MATH=ON ^
-  -DWITH_CUBLAS=ON ^
-  -DBUILD_opencv_world=ON ^
-  -DBUILD_TESTS=OFF ^
-  -DBUILD_PERF_TESTS=OFF ^
-  -DBUILD_EXAMPLES=OFF ^
-  ../opencv
-
-cmake --build . --config Release --target INSTALL
+# Or use batch scripts
+run_cs2.bat v11s
 ```
 
-For RTX 50 builds, set `-DCUDA_ARCH_BIN=12.0` (or list multiple, e.g. `8.9;12.0`).
+Press **Insert** to exit. Status line shows rolling 500 ms averages of
+capture / detection / render latency.
+
+### Triggers
+
+| Key held | Behavior |
+|---|---|
+| **LMB** | Smoothed Bezier aim path, HID click forwarded to game |
+| **RMB** (when `DebugAimEnabled=true`) | Unsmoothed snap-aim for sensitivity tuning |
+| **LSHIFT** | Triggerbot — fires when crosshair is inside a detection box |
+
+---
+
+## Configuration
+
+Configs live in `dep/`. One per game + model variant:
+
+```
+dep/
+  config_cs2.ini               # CS2 base
+  config_cs2_v11s.ini           # CS2 YOLOv11s
+  config_valo.ini               # Valorant base
+  config_valo_v11m.ini          # Valorant YOLOv11m
+  config_valo_v11s_purple.ini   # Valorant purple enemy highlight
+  ...
+```
+
+### Full INI reference
+
+```ini
+# Model
+ModelPath    = yolov8n_cs2_fp16.onnx    # relative to working dir
+ModelVersion = auto                      # auto, v8, v11, or v26
+Precision    = half                      # half (FP16) or float (FP32)
+Labels       = player                   # class names
+
+# Capture
+CaptureWidth  = 640
+CaptureHeight = 640
+CaptureFPS    = 240
+UseDirectGpuCapture = true              # recommended for latency
+
+# Detection
+HeadLabelID1  = 0                       # primary head class id
+HeadLabelID2  = 0                       # secondary head class id
+
+# Aim
+CPI              = 3000
+MouseSensitivity = 0.80
+AimFOV           = 55
+MinGain          = 0.25
+MaxGain          = 0.65
+MaxSpeed         = 15
+Smoothing        = 10                   # 1=snappy, 10=very smooth
+DebugAimEnabled  = true                 # RMB snap-aim for tuning
+DebugSnapGain    = 3.0
+
+# HID bridge
+HidVendorId  = 0x3367                   # ESP32-P4 OP1 8K V2 default
+HidProductId = 0x1978
+HidSerial    =                          # blank = match by VID/PID only
+
+# Debug overlay (Discord legacy in-game overlay)
+DebugView                 = true
+DebugOverlayTargetProcess = cs2.exe
+
+# Threading
+PinThreads         = false
+CaptureThreadCore  = 0
+
+# Monitoring (optional JSON status file for codewhale)
+MetricsStatus = status.json
+```
+
+CMake's POST_BUILD step copies `dep/` next to the exe — it **overwrites** deployed
+configs on rebuild. Edit `dep/config_*.ini` to persist changes.
+
+---
+
+## Model preparation
+
+Export a YOLO checkpoint to ONNX with `scripts/pytorch2onnx.py`:
+
+```cmd
+# YOLOv8 / YOLOv11
+python scripts/pytorch2onnx.py path\to\model.pt v8n dep/model.onnx --fp16
+
+# YOLOv26 (NMS-free)
+python scripts/pytorch2onnx.py path\to\model.pt v26n dep/model.onnx --fp16
+```
+
+Drop the `.onnx` into `dep/` and set `ModelPath` in your INI. The engine auto-detects
+the YOLO version from filename and output shape. On first run, TensorRT compiles and
+serializes a `.engine` plan keyed on the ONNX file hash — subsequent launches load it
+instantly.
+
+Version tokens: `v8n`, `v8s`, `v8m`, `v8l`, `v8x`, `v11n`, `v11s`, `v11m`, `v11l`,
+`v11x`, `v26n`, `v26s`, `v26m`, `v26l`, `v26x`.
+
+---
+
+## Building from source
+
+### Prerequisites
+
+- **Windows 10/11 (64-bit)** — DXGI Desktop Duplication + CUDA-D3D11 interop are
+  Windows-only.
+- **NVIDIA GPU** with compute capability ≥ 8.9 (RTX 40 series+).
+- **Visual Studio 2022** with C++ desktop workload + Windows 10 SDK.
+- **CMake 3.22+**.
+- **CUDA Toolkit 12.4+** (12.9 tested). Install from
+  [developer.nvidia.com/cuda-downloads](https://developer.nvidia.com/cuda-downloads).
+- **TensorRT 10.x** from [developer.nvidia.com/tensorrt](https://developer.nvidia.com/tensorrt).
+  Extract into the CUDA install root so `include\NvInfer.h`, `lib\nvinfer_10.lib`,
+  and `bin\nvinfer*.dll` are resolvable.
+- **OpenCV 4.10 with CUDA modules**. Stock OpenCV doesn't ship CUDA — build from source:
+  ```cmd
+  git clone https://github.com/opencv/opencv.git -b 4.10.0
+  git clone https://github.com/opencv/opencv_contrib.git -b 4.10.0
+  mkdir opencv-build && cd opencv-build
+  cmake -G "Visual Studio 17 2022" -A x64 ^
+    -DCMAKE_BUILD_TYPE=Release ^
+    -DCMAKE_INSTALL_PREFIX=C:/opencv-4.10.0 ^
+    -DOPENCV_EXTRA_MODULES_PATH=../opencv_contrib/modules ^
+    -DWITH_CUDA=ON -DWITH_CUDNN=ON -DOPENCV_DNN_CUDA=ON ^
+    -DCUDA_ARCH_BIN=8.9 -DCUDA_FAST_MATH=ON -DWITH_CUBLAS=ON ^
+    -DBUILD_opencv_world=ON ^
+    -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DBUILD_EXAMPLES=OFF ^
+    ../opencv
+  cmake --build . --config Release --target INSTALL
+  ```
+  For RTX 50 series, use `-DCUDA_ARCH_BIN=12.0`.
 
 ### Environment
 
@@ -324,240 +221,211 @@ set OpenCV_DIR=C:\opencv-4.10.0
 set PATH=%OpenCV_DIR%\x64\vc17\bin;%PATH%
 ```
 
-## Building
+### Build
 
 ```cmd
-git clone https://github.com/tankyx/YOLOv8-TensorRT-CPP.git
-cd YOLOv8-TensorRT-CPP
-
 mkdir build && cd build
 cmake .. -G "Visual Studio 17 2022" -A x64 ^
   -DCMAKE_BUILD_TYPE=Release ^
   -DOpenCV_DIR=C:/opencv-4.10.0 ^
   -DTENSORRT_ROOT="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.9"
-
 cmake --build . --config Release
 ```
 
-Outputs land in `build/bin/Release/`. CMake's POST_BUILD step copies the
-contents of `dep/` (model files, INI configs) and TensorRT DLLs alongside the
-exe — note that this **overwrites** any in-place edits to the deployed config
-on every rebuild. Edit `dep/config_*.ini` if you want changes to survive.
+Output: `build/bin/Release/detect_object_image.exe`.
 
-## Model preparation
+---
 
-Export a YOLO checkpoint to ONNX (one-time per model). Use `--fp16` to export
-FP16 I/O tensors (required for the CUDA graph fast path). The detector auto-detects
-the version from the output shape and filename.
+## Architecture overview
 
-```cmd
-# YOLOv8 / YOLOv11 (standard decode)
-python scripts/pytorch2onnx.py path\to\your_model.pt v8n dep/your_model.onnx --fp16
-
-# YOLOv26 (end-to-end, NMS-free)
-python scripts/pytorch2onnx.py path\to\your_model.pt v26n dep/your_model.onnx --fp16
+```
+                       +-----------------+
+                       |  DXGI Output    |
+                       |  Duplication    |
+                       +--------+--------+
+                                |
+               +----------------+----------------+
+               | UseDirectGpuCapture = true      |
+               |   (DXGICaptureCUDA)             |
+               v                                 v
+    +-----------------------+      +-----------------------+
+    | D3D11 GPU staging tex |      | CPU staging tex (Map) |
+    | cudaGraphicsD3D11     |      | cv::cvtColor BGRA→BGR |
+    | → cudaArray (BGRA)   |      | cv::Mat               |
+    | → GpuMat (BGRA)       |      |                       |
+    +-----------+-----------+      +-----------+-----------+
+                |                               |
+                v                               v
+        GpuFrameQueue                    FrameQueue (cv::Mat)
+                |                               |
+                v                               v
+    +-----------------------+      +-----------------------+
+    | detectionThreadGpu    |      | detectionThread       |
+    | ROI = frame(rect)     |      | ROI = frame(rect)     |
+    | (GpuMat view, no copy)|      | + crosshair tracking  |
+    +-----------+-----------+      +-----------+-----------+
+                |                               |
+                +---------------+---------------+
+                                |
+                                v
+                 +------------------------------+
+                 |   YoloDetector::detectObjects |
+                 |                              |
+                 |  cudaMemcpy2D → capture buf  |
+                 |  cudaGraphLaunch:            |
+                 |    fused preproc kernel      |
+                 |    (BGR/BGRA → fp16 CHW)     |
+                 |    enqueueV3 (TensorRT)      |
+                 |    memset(survivor count)    |
+                 |    filter+decode kernel      |
+                 |    memcpy(count, survivors)  |
+                 |  cudaStreamSynchronize       |
+                 |  NMS (V8/V11) or threshold   |
+                 |    (V26, NMS-free)           |
+                 +---------------+--------------+
+                                 |
+                                 v
+                 +------------------------------+
+                 |   MouseController::aim       |
+                 |                              |
+                 |  Bezier dt-based smoothing   |
+                 |    (LMB held)                |
+                 |   OR unsmoothed snap         |
+                 |    (RMB held, debug)         |
+                 |  sub-pixel residue carry     |
+                 |  HID report → bridge MCU     |
+                 +---------------+--------------+
 ```
 
-Drop the resulting `.onnx` into `dep/` and set `ModelPath` in the INI.
-On first run, the engine parses the ONNX and serializes a TensorRT plan keyed
-on the file's FNV-1a hash; subsequent launches deserialize the cached plan.
-Re-saving the ONNX invalidates the cache automatically.
+### Pipeline stages
 
-## Configuration
+**Capture.** Two paths, gated by `UseDirectGpuCapture`. The direct-GPU path keeps
+everything on device via CUDA-D3D11 interop — zero CPU pixel touch. The legacy CPU
+path maps the staging texture to host memory (slower but supports `TrackCrosshair`).
 
-Configs live in `dep/`. One per game:
+**Preprocess.** A single fused CUDA kernel (`EngineFP16Kernels.cu`): letterbox
+resize with bilinear sampling, BGR/BGRA→RGB channel swap, per-channel normalize,
+cast to `__half`. Writes directly into the TensorRT input buffer — no intermediate
+FP32 blob, no OpenCV CUDA launches.
 
-- `dep/config_cs2.ini` — CS2 (640×640, FP16, 1-class)
-- `dep/config_valo.ini` — Valorant (640×640, FP16, 4-class)
+**Inference.** TensorRT 10.x `enqueueV3` against the loaded engine. Engine plans
+are cached and keyed on the ONNX file hash.
 
-### Reference (CS2 example, annotated)
+**Postprocess.** A second CUDA kernel runs on the engine's stream after inference:
+- **YOLOv8**: xywh→xyxy decode, best class, atomic survivor write.
+- **YOLOv11**: DFL softmax over 16 distribution bins per coordinate, then decode.
+- **YOLOv26**: end-to-end, confidence threshold only — no box decode, no NMS.
 
-```ini
-# Model — supports YOLOv8, YOLOv11, YOLOv26 (auto-detected from filename + output shape)
-ModelPath    = yolov8n_cs2_fp16.onnx   # relative to working dir
-ModelVersion = auto                     # auto, v8, v11, or v26 (override detection)
-Precision    = half                     # half (FP16) or float (FP32)
-Labels       = player                  # class names; size determines numClasses
+D2H is ~24 KB (count + ≤1024 survivor records). CPU does only NMS (V8/V11) or
+direct threshold pass (V26).
 
-# Capture / ROI
-CaptureWidth  = 640                    # ROI fed to the model (must match input)
-CaptureHeight = 640
-CaptureFPS    = 240                    # advisory; capture is duplication-rate-limited
-UseDirectGpuCapture = true             # DXGI/CUDA interop path; recommended
+**CUDA graph.** The per-frame GPU sequence is captured as a CUDA graph on the
+first detection frame after engine load. Steady-state is one `cudaGraphLaunch`
+per frame.
 
-# Detection
-HeadLabelID1 = 0                       # primary head class id (used by mouseController)
-HeadLabelID2 = 0                       # secondary head class id
+**Mouse aim.** `MouseController::aim` uses a 2D Bezier curve with dt-based progress
+(LMB held), or unsmoothed snap-aim (RMB held + `DebugAimEnabled`). Sub-pixel
+residue carries frame-to-frame. HID reports go to an ESP32-P4/RP2040 bridge MCU
+that re-emits them as native USB mouse reports.
 
-# Mouse / aim
-CPI              = 3000                # mouse counts per inch (your in-game sens calibration)
-MouseSensitivity = 0.80
-AimFOV           = 55                  # gates which detections aim engages on
-MinGain          = 0.25
-MaxGain          = 0.65
-MaxSpeed         = 15
-Smoothing        = 10                  # 1=snappy, 10=very smooth (Bezier dt-based)
-DebugSnapGain    = 3.0                 # RMB snap-aim ROI-px -> mouse-counts multiplier
-DebugAimEnabled  = true                # true => RMB engages unsmoothed snap-aim (debug)
+**Debug overlay.** `DiscordOverlay.h` renders detection boxes into Discord's legacy
+in-game overlay shared memory — boxes ride the game's swap chain with no separate
+window. Requires the legacy Discord overlay enabled.
 
-# HID bridge
-HidVendorId  = 0x3367                  # ESP32-P4 OP1 8K V2 default
-HidProductId = 0x1978
-HidSerial    =                         # blank = match by VID/PID only
+### Threading
 
-# Debug overlay
-DebugView                  = true      # Discord legacy overlay debug renderer
-DebugOverlayTargetProcess  = cs2.exe   # process Discord must be hooked into
+Three threads: capture (DXGI Duplication → queue), detection (queue → crop →
+detect → aim → overlay), and main (Win32 message pump + status line).
 
-# Optional: CPU template-matching crosshair tracker (legacy capture path only)
-TrackCrosshair    = false
-CrosshairTemplate = crosshair.png
+Queues use drop-old-keep-newest semantics. `LatencyQueue` maintains a 500 ms
+sliding window for the rolling averages.
 
-# Threading (advisory)
-PinThreads        = false
-CaptureThreadCore = 0
-```
+---
 
-### Triggers
+## YOLO model versions
 
-- **LMB hold** — smoothed aim engages, HID click bit forwarded to the game.
-- **RMB hold** (when `DebugAimEnabled=true`) — unsmoothed snap-aim, click bit
-  stays 0 (debug only, no shot fired).
-- **LSHIFT hold** — triggerbot. When held and the screen center is inside a
-  detection rectangle, fires a non-blocking randomized-cooldown click via HID.
+| Version | Output shape | Postprocess | NMS needed? |
+|---|---|---|---|
+| YOLOv8 | `(1, 4+C, 8400)` | xywh→xyxy decode | Yes |
+| YOLOv11 | `(1, 4×16+C, 8400)` | DFL softmax + decode | Yes |
+| YOLOv26 | `(1, 300, 6)` | Confidence threshold | No |
 
-## Running
+Detector auto-detection: `DetectorFactory::create()` checks filename first, then
+output shape. Override with `ModelVersion` in the INI.
 
-Batch scripts are provided at the repo root:
-
-```cmd
-# CS2 — pass model variant (defaults to v8)
-run_cs2.bat              # YOLOv8n
-run_cs2.bat v11s          # YOLOv11s
-run_cs2.bat v11m          # YOLOv11m
-run_cs2.bat v26m          # YOLOv26m
-run_cs2.bat v26l          # YOLOv26l
-
-# Valorant — same variants as CS2
-run_valo.bat              # YOLOv8n
-run_valo.bat v11s          # YOLOv11s
-run_valo.bat v11m          # YOLOv11m
-run_valo.bat v26m          # YOLOv26m
-run_valo.bat v26l          # YOLOv26l
-```
-
-Or run directly:
-
-```cmd
-cd build\bin\Release
-detect_object_image.exe config_cs2.ini
-detect_object_image.exe config_valo.ini
-```
-
-Press **Insert** to exit. The status line shows rolling 500-ms averages of
-capture / detection / render latency.
-
-First launch with a new model takes 30-60 seconds to compile the TensorRT
-plan; subsequent launches load the cached `.engine` immediately. The first
-detection-thread frame after engine load also pays a one-shot CUDA-graph
-capture cost (~50 ms); steady-state begins on frame 2.
+---
 
 ## Performance
 
-Numbers from an RTX 5090 at 640×640 FP16:
+Measured on RTX 5090 at 640×640 FP16, `UseDirectGpuCapture=true`:
 
-- **Detection thread time** (full loop: preproc + inference + postprocess + aim +
-  overlay): **~0.4 ms** with `UseDirectGpuCapture=true` (V8n); ~5 ms on the
-  legacy CPU capture path. V26l adds ~2 ms for the larger model.
-- **Capture thread time**: dominated by `IDXGIOutputDuplication::AcquireNextFrame`
-  blocking until the next refresh; negligible actual work on the direct-GPU path.
-- **End-to-end latency**: bounded below by display refresh interval + bridge MCU
-  round-trip; the software pipeline contributes <1 ms with direct GPU capture.
+- **Detection thread**: ~0.4 ms (YOLOv8n); ~2 ms (YOLOv26l).
+- **Capture thread**: dominated by `AcquireNextFrame` blocking for next refresh.
+- **End-to-end latency**: bounded by display refresh + bridge MCU round-trip.
 
-Tuning levers, in order of impact:
+### Tuning
 
-1. `UseDirectGpuCapture=true` — biggest single jump. Off only if you need
-   `TrackCrosshair`.
-2. `Precision=half` — keep at FP16. FP32 is for ONNX validation, not
-   production.
-3. `CaptureWidth/Height` matched to the model input — avoids the inverse
-   letterbox math doing real work. The fused preproc kernel handles arbitrary
-   sizes but is fastest at 1:1.
-4. `Smoothing` — purely an aim-feel knob, doesn't affect detection latency.
-   Higher = smoother flick, longer time-to-target.
-5. `PinThreads=true` plus `CaptureThreadCore` / `DetectionThreadCore` — only
-   useful on systems with bad scheduler behavior; typically negligible.
+1. `UseDirectGpuCapture=true` — single biggest improvement.
+2. `Precision=half` — FP16 is the production path.
+3. Match `CaptureWidth/Height` to model input for fastest fused preproc.
+4. `Smoothing` — aim-feel only, doesn't affect detection latency.
+
+---
 
 ## Troubleshooting
 
-- **TensorRT libraries not found at link time** — `TENSORRT_ROOT` doesn't
-  point at a directory containing `lib\nvinfer_10.lib`. Check the path.
-- **`cudaD3D11GetDevice failed` on startup with `UseDirectGpuCapture=true`** —
-  CUDA and D3D11 picked different adapters (multi-GPU systems). Set the
-  `CUDA_VISIBLE_DEVICES` env var to the adapter that drives your monitor, or
-  fall back to `UseDirectGpuCapture=false`.
-- **`cudaGraphInstantiate failed`** — extremely rare; usually means a TRT
-  internal allocation slipped into the capture. The warmup pass should
-  prevent this. If it persists, post the exact CUDA error string from the
-  exception.
-- **Boxes drawn at the wrong screen position via Discord overlay** — the
-  overlay assumes fullscreen at native resolution. Windowed/borderless or
-  scaled-resolution will draw boxes at the wrong screen location.
-- **Discord overlay shows nothing** — must be the *legacy* in-game overlay
-  enabled in Discord settings; the post-2024 overlay doesn't expose the
-  shared-memory mapping. Discord must already be hooked into the target
-  process when the detector starts (launch the game first).
-- **HID device not opening** — `HidVendorId` / `HidProductId` in the INI
-  don't match a connected device. Check Device Manager for the bridge MCU's
-  VID/PID. Run as Administrator if device enumeration fails.
-- **DXGI access lost** — happens on resolution changes, lock screen, UAC.
-  Both capture paths recover on the next frame (re-create the duplication +
-  re-register the CUDA resource).
+- **TensorRT libraries not found at link time** — check `TENSORRT_ROOT` path.
+- **`cudaD3D11GetDevice failed`** — CUDA and D3D11 picked different GPUs. Set
+  `CUDA_VISIBLE_DEVICES` or use `UseDirectGpuCapture=false`.
+- **`cudaGraphInstantiate failed`** — rare; the warmup pass should prevent it.
+- **Discord overlay shows nothing** — must use the *legacy* in-game overlay in
+  Discord settings. Launch game first, then detector.
+- **HID device not opening** — verify VID/PID in Device Manager. Run as Admin if
+  enumeration fails.
+- **DXGI access lost** — on resolution change / lock screen / UAC. Both capture
+  paths auto-recover next frame.
+
+---
 
 ## Repository layout
 
 ```
 src/
   object_detection_image_mt.cpp   # main, ObjectDetectionSystem, threads
-  YoloDetector.{h,cpp}            # base detector (engine mgmt, graph capture, GPU buffers)
-  yolov8.{h,cpp}                  # YOLOv8 detector (xywh decode + NMS)
-  YoloV11.{h,cpp}                 # YOLOv11 detector (DFL softmax decode + NMS)
-  YoloV26.{h,cpp}                 # YOLOv26 detector (end-to-end, no NMS)
+  YoloDetector.{h,cpp}            # base detector (engine mgmt, graph, GPU buffers)
+  yolov8.{h,cpp}                  # YOLOv8 (xywh decode + NMS)
+  YoloV11.{h,cpp}                 # YOLOv11 (DFL softmax + NMS)
+  YoloV26.{h,cpp}                 # YOLOv26 (end-to-end, NMS-free)
   DetectorFactory.{h,cpp}         # auto-detection from filename + output shape
-  EngineBase.h                    # virtual interface, shared engine helpers
-  EngineFP16.h                    # FP16 engine (the production path)
-  EngineFP32.h                    # FP32 engine (legacy fallback)
+  EngineBase.h                    # virtual interface, build helpers
+  EngineFP16.h                    # FP16 engine (production path)
+  EngineFP32.h                    # FP32 engine (fallback)
   EngineFactory.h                 # selects engine by Precision
-  EngineFP16Kernels.{h,cu}        # fused BGR/BGRA -> fp16 CHW preproc kernel
-  YoloPostprocKernels.{h,cu}      # GPU filter+decode kernels (V8/V11/V26)
+  EngineFP16Kernels.{h,cu}        # fused BGR/BGRA → fp16 CHW preproc kernel
+  YoloPostprocKernels.{h,cu}     # GPU filter+decode kernels (V8/V11/V26)
   DXGICapture.h                   # legacy CPU capture path
-  DXGICaptureCUDA.h               # direct GPU/D3D11 interop capture path
+  DXGICaptureCUDA.h               # direct GPU/D3D11 interop capture
   DiscordOverlay.h                # Discord legacy overlay debug renderer
+  CrosshairTrackerGPU.h           # GPU crosshair detector (shape-based)
   MouseController.{h,cpp}         # HID output, Bezier aim, triggerbot
-  threadsafe_queue.h              # SafeQueue, FrameQueue, GpuFrameQueue, etc.
+  threadsafe_queue.h              # thread-safe queues (frame, detection, latency)
   IniParser.h                     # zero-dep INI parser
+  MetricsWriter.h                 # optional JSON status file writer
   SoftwareFuser.{h,cu}            # capture-card + desktop fusion (optional)
 
 dep/
   config_{cs2,valo}.ini           # base configs per game
   config_{cs2,valo}_v{8,11s,11m,26m,26l}.ini  # per-variant configs
-  *.onnx, *.pt                    # exported model weights / checkpoints
+  *.onnx, *.pt                    # models / checkpoints
   *.engine                        # cached TensorRT plans (generated on first run)
 
 scripts/
-  pytorch2onnx.py                 # PyTorch -> ONNX export
-  train_all.bat                   # full training sweep launcher
+  pytorch2onnx.py                 # PyTorch → ONNX export
+
+ESP32-P4-Aimer/                   # Bridge MCU firmware (ESP-IDF project)
 ```
 
-## Acknowledgments
-
-- Ultralytics — YOLOv8.
-- NVIDIA — TensorRT, CUDA, cuda-d3d11 interop.
-- OpenCV — CUDA imgproc + DNN NMS.
-- CS2Miam — original Bezier smoothing pipeline that the aim path was ported
-  from.
-- Samuel Tulach (OverlayCord) — reverse-engineered the Discord legacy
-  in-game-overlay shared-memory contract used by `DiscordOverlay`.
+---
 
 ## License
 

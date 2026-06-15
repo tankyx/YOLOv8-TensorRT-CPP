@@ -30,6 +30,31 @@ void MouseController::setSmoothing(float userVal) {
     _smoothVal = smoothingToInternal(_userSmoothing);
 }
 
+void MouseController::setGameCalibration(float sens, float fov, const std::string& game) {
+    sensitivity = sens;
+    gameFOV = fov;
+    if (game == "VALORANT" || game == "Valorant" || game == "valorant") {
+        m_yaw = 0.07f;
+    } else if (game == "CS2" || game == "cs2") {
+        m_yaw = 0.022f;
+    } else {
+        m_yaw = 0.022f;
+    }
+    useFovMethod = true;
+
+    // Precompute focal length and angle-per-count for the hot path.
+    const float fovRad = gameFOV * 3.14159265f / 180.0f;
+    m_focalLength = (static_cast<float>(screenWidth) / 2.0f) / tanf(fovRad / 2.0f);
+    m_anglePerCountRad = sensitivity * m_yaw * (3.14159265f / 180.0f);
+}
+
+std::pair<float, float> MouseController::pixelDeltaToCounts(float deltaX, float deltaY) const {
+    if (deltaX == 0.0f && deltaY == 0.0f) return {0.0f, 0.0f};
+    const float angleX = atan2f(deltaX, m_focalLength);
+    const float angleY = atan2f(deltaY, m_focalLength);
+    return {angleX / m_anglePerCountRad, angleY / m_anglePerCountRad};
+}
+
 MouseController::~MouseController() {
     if (hidDevice) {
         CloseHandle(hidDevice);
@@ -242,20 +267,56 @@ void MouseController::aim(const std::vector<Object> &detections) {
         isLeftClicking = true;
     }
 
-    const Object closest = findClosestDetection(detections);
+    // Sort detections by screen-space distance to crosshair (closest first).
+    // findClosestDetection would already pick the closest, but sorting gives
+    // the caller a distance-ordered list for any multi-target logic.
+    std::vector<Object> sortedDets = detections;
+    std::sort(sortedDets.begin(), sortedDets.end(),
+        [this](const Object &a, const Object &b) {
+            const float ax = static_cast<float>(detectionZoneX + a.rect.x + a.rect.width  / 2) - static_cast<float>(crosshairX);
+            const float ay = static_cast<float>(detectionZoneY + a.rect.y + a.rect.height / 2) - static_cast<float>(crosshairY);
+            const float bx = static_cast<float>(detectionZoneX + b.rect.x + b.rect.width  / 2) - static_cast<float>(crosshairX);
+            const float by = static_cast<float>(detectionZoneY + b.rect.y + b.rect.height / 2) - static_cast<float>(crosshairY);
+            return (ax * ax + ay * ay) < (bx * bx + by * by);
+        });
+
+    const Object closest = findClosestDetection(sortedDets);
     if (closest.probability <= probabilityThreshold) {
         _bezier.deactivate();
         return;
     }
 
-    const float targetX = static_cast<float>(closest.rect.x + closest.rect.width / 2);
-    const float targetY = static_cast<float>(closest.rect.y + closest.rect.height / 2);
-    const float deltaX = targetX - static_cast<float>(crosshairX);
-    const float deltaY = targetY - static_cast<float>(crosshairY);
+    // Target bounding box in screen space.
+    const float boxL = static_cast<float>(detectionZoneX + closest.rect.x);
+    const float boxT = static_cast<float>(detectionZoneY + closest.rect.y);
+    const float boxR = boxL + static_cast<float>(closest.rect.width);
+    const float boxB = boxT + static_cast<float>(closest.rect.height);
 
-    // Tracking dead zone — if the crosshair is essentially on target, don't
-    // move (stops jitter from sub-pixel oscillation).
-    if (deltaX * deltaX + deltaY * deltaY < 1.0f) {
+    // Crosshair position in screen space (from GPU tracker when enabled).
+    const float chX = static_cast<float>(crosshairX);
+    const float chY = static_cast<float>(crosshairY);
+
+    // Recoil-containment delta: move crosshair to the nearest box *edge*,
+    // not the centre.  When the crosshair is inside the box, no movement
+    // is needed — the aimbot only activates when recoil pushes it out.
+    float movePxX = 0.0f, movePxY = 0.0f;
+    if      (chX < boxL)  movePxX = boxL - chX;
+    else if (chX > boxR)  movePxX = boxR - chX;
+
+    if      (chY < boxT)  movePxY = boxT - chY;
+    else if (chY > boxB)  movePxY = boxB - chY;
+
+    const bool inside = (movePxX == 0.0f && movePxY == 0.0f);
+
+    if (inside) {
+        _bezier.deactivate();
+        return;
+    }
+
+    // Aim-FOV gate: skip if the containment distance exceeds the configured
+    // aim field-of-view radius.  The RMB debug path ignores this gate.
+    const float distToBox = std::sqrt(movePxX * movePxX + movePxY * movePxY);
+    if (clickThrough && distToBox > static_cast<float>(centralSquareSize)) {
         _bezier.deactivate();
         return;
     }
@@ -263,23 +324,26 @@ void MouseController::aim(const std::vector<Object> &detections) {
     float movementX;
     float movementY;
     if (clickThrough) {
-        // Real aim path: Bezier-smoothed flick, re-anchored when the target jumps.
-        const cv::Point2f currentTarget(deltaX, deltaY);
-        if (_bezier.shouldReinitialize(currentTarget)) {
-            _bezier.initialize(cv::Point2f(0.0f, 0.0f), currentTarget);
-        }
-        _bezier.update(_smoothVal);
-        cv::Point2f bezierPos = _bezier.getCurrentPosition();
-        movementX = bezierPos.x;
-        movementY = bezierPos.y;
-        _bezier.updateStartPosition(cv::Point2f(movementX, movementY));
-    } else {
-        // Debug aim (RMB-only): no smoothing — snap straight at the target.
-        // _debugSnapGain converts ROI pixels into mouse counts for the user's
-        // in-game sensitivity (1 count ≠ 1 ROI px, so the raw delta under-rotates).
+        // LMB path: lower base gain to reduce oscillation from aim-punch.
+        // Aim punch moves the detection box, and a high gain chases it too
+        // aggressively.  Ceiling also lowered from 0.55 → 0.40.
         _bezier.deactivate();
-        movementX = deltaX * _debugSnapGain;
-        movementY = deltaY * _debugSnapGain;
+        auto [fullCountX, fullCountY] = pixelDeltaToCounts(movePxX, movePxY);
+        const float baseGain = (std::max)(0.04f, 0.20f - _smoothVal * 0.25f);
+        const float t = 1.0f - distToBox / 80.0f;
+        const float gain = baseGain + (0.40f - baseGain) * (t > 0.0f ? t : 0.0f);
+        movementX = fullCountX * gain;
+        movementY = fullCountY * gain;
+    } else {
+        // RMB debug path: snap to box centre (pixel-perfect at gain=1.0).
+        _bezier.deactivate();
+        const float boxCX = (boxL + boxR) * 0.5f;
+        const float boxCY = (boxT + boxB) * 0.5f;
+        const float dX = boxCX - chX;
+        const float dY = boxCY - chY;
+        auto [snapCountX, snapCountY] = pixelDeltaToCounts(dX, dY);
+        movementX = snapCountX * _debugSnapGain;
+        movementY = snapCountY * _debugSnapGain;
     }
 
     // Carry sub-pixel residue across frames so slow tracking doesn't truncate
@@ -310,18 +374,22 @@ void MouseController::leftClick() { sendHIDReport(0, 0, 0x01); }
 
 void MouseController::releaseLeftClick() { sendHIDReport(0, 0, 0x00); }
 
-// Modify findClosestDetection to use crosshair position
+// Find the detection closest to the crosshair. Detection boxes are in capture
+// space; the crosshair is in screen space. We translate detection centers to
+// screen space for a correct distance comparison.
 Object MouseController::findClosestDetection(const std::vector<Object> &detections) {
     Object closestDetection;
-    closestDetection.probability = 0.0f; // Initialize with no detection
+    closestDetection.probability = 0.0f;
 
     float closestDistance = FLT_MAX;
 
     for (const auto &detection : detections) {
-        if (detection.label == headLabel1 || detection.label == headLabel2) { // Replace with actual label values
-            int detectionCenterX = detection.rect.x + detection.rect.width / 2;
-            int detectionCenterY = detection.rect.y + detection.rect.height / 2;
-            float distance = std::sqrt(std::pow(detectionCenterX - crosshairX, 2) + std::pow(detectionCenterY - crosshairY, 2));
+        if (detection.label == headLabel1 || detection.label == headLabel2) {
+            const float screenCX = static_cast<float>(detectionZoneX + detection.rect.x + detection.rect.width / 2);
+            const float screenCY = static_cast<float>(detectionZoneY + detection.rect.y + detection.rect.height / 2);
+            const float dx = screenCX - static_cast<float>(crosshairX);
+            const float dy = screenCY - static_cast<float>(crosshairY);
+            const float distance = dx * dx + dy * dy;
             if (distance < closestDistance) {
                 closestDistance = distance;
                 closestDetection = detection;
@@ -380,15 +448,17 @@ void MouseController::triggerLeftClickIfCenterWithinDetection(const std::vector<
         return;
     }
 
-    const int centerX = crosshairX;
-    const int centerY = crosshairY;
+    // Crosshair is screen-space; detection rects are capture-space.
+    // Convert crosshair to capture-space for the containment check.
+    const int capCHX = crosshairX - detectionZoneX;
+    const int capCHY = crosshairY - detectionZoneY;
 
     for (const auto &detection : detections) {
         if (detection.label >= nLabels) {
             continue;
         }
-        if (centerX >= detection.rect.x && centerX <= detection.rect.x + detection.rect.width &&
-            centerY >= detection.rect.y && centerY <= detection.rect.y + detection.rect.height) {
+        if (capCHX >= detection.rect.x && capCHX <= detection.rect.x + detection.rect.width &&
+            capCHY >= detection.rect.y && capCHY <= detection.rect.y + detection.rect.height) {
             triggerArmed = true;
             triggerFireAt = now + armDelay;
             break;

@@ -125,10 +125,6 @@ private:
     std::mutex                 _stateMutex;
     std::vector<DetectionBox>  _detections;
     std::vector<std::string>   _labelNames;
-    float                      _crosshairX{0.f};
-    float                      _crosshairY{0.f};
-    bool                       _hasCrosshair{false};
-
     std::atomic<double> _detectionLatencyMs{0.0};
     std::atomic<int>    _detectionFps{0};
 
@@ -299,15 +295,10 @@ private:
 
         std::vector<DetectionBox> dets;
         std::vector<std::string>  labelNames;
-        float chx = 0.f, chy = 0.f;
-        bool  hasCh = false;
         {
             std::lock_guard<std::mutex> lock(_stateMutex);
             dets       = _detections;
             labelNames = _labelNames;
-            chx        = _crosshairX;
-            chy        = _crosshairY;
-            hasCh      = _hasCrosshair;
         }
 
         const double latencyMs = _detectionLatencyMs.load(std::memory_order_relaxed);
@@ -336,14 +327,6 @@ private:
                 _renderTarget->DrawText(labelBuf, static_cast<UINT32>(wcslen(labelBuf)), _labelFormat, textRect, brush);
                 _currentDirty.extendBox(textRect.left, textRect.top, textRect.right, textRect.bottom, 2.0f);
             }
-        }
-
-        // Crosshair debug box — hollow yellow rectangle at the detected crosshair position
-        if (hasCh) {
-            const float halfSize = 8.0f; // 16×16 pixel box
-            D2D1_RECT_F rect = D2D1::RectF(chx - halfSize, chy - halfSize, chx + halfSize, chy + halfSize);
-            _renderTarget->DrawRectangle(rect, _yellowBrush, 1.5f);
-            _currentDirty.extendBox(rect.left, rect.top, rect.right, rect.bottom, 2.0f);
         }
 
         // Stats line top-left
@@ -437,18 +420,6 @@ public:
     void setDetections(std::vector<DetectionBox> boxes) {
         std::lock_guard<std::mutex> lock(_stateMutex);
         _detections = std::move(boxes);
-    }
-
-    void setCrosshair(float x, float y) {
-        std::lock_guard<std::mutex> lock(_stateMutex);
-        _crosshairX  = x;
-        _crosshairY  = y;
-        _hasCrosshair = true;
-    }
-
-    void clearCrosshair() {
-        std::lock_guard<std::mutex> lock(_stateMutex);
-        _hasCrosshair = false;
     }
 
     void setStats(double latencyMs, int fps) {

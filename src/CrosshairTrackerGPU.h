@@ -4,26 +4,23 @@
 #include <opencv2/cudaimgproc.hpp>
 #include <cuda_runtime.h>
 
-// Pure-GPU crosshair tracker using template matching against a stored
-// crosshair image.  Much more robust than geometric (Hough) detection for
-// complex game backgrounds — the template captures the exact pixel pattern.
+// GPU crosshair tracker for dot-type crosshairs.
+// Finds the brightest spot in a small search window around the last known
+// position.  No template matching — just argmax + weighted centroid.
 //
-// Pipeline (all on GPU):
-//   1. Convert ROI to grayscale
-//   2. Template matching (NCC-normalised) against the crosshair template
-//   3. Find best-match position via minMaxLoc
-//   4. Search-window gate + EMA temporal smoothing → m_crosshairPos
+// Pipeline:
+//   1. Convert ROI to grayscale (GPU)
+//   2. Crop 31×31 search window around tracking anchor (GPU, zero-copy)
+//   3. Download 961 bytes → find brightest pixel + weighted centroid (CPU)
+//   4. Brightness gate + EMA temporal smoothing → m_crosshairPos
 class CrosshairTrackerGPU {
 public:
-    // roiWidth / roiHeight: pixel dimensions of the region the tracker will
-    // receive in update().  templatePath: path to crosshair PNG (grayscale or
-    // colour — will be converted to single-channel on load).
     CrosshairTrackerGPU(int roiWidth, int roiHeight,
                         const std::string& templatePath = "crosshair.png");
     ~CrosshairTrackerGPU();
 
-    // Returns true if the template was loaded successfully.
-    bool isReady() const { return m_ready; }
+    // Always ready — no template to load.
+    bool isReady() const { return true; }
 
     // Process the cropped ROI (GPU mat, BGRA or BGR) and update the internal
     // crosshair centre.  stream must outlive the call.
@@ -35,22 +32,19 @@ public:
     // Frame-to-frame movement delta (current – previous).
     cv::Point2f getDelta() const { return m_delta; }
 
+    // Dot size for overlay bounding box (fixed at 9×9).
+    int getTemplateW() const { return 9; }
+    int getTemplateH() const { return 9; }
+
 private:
-    cv::Ptr<cv::cuda::TemplateMatching> m_matcher;
-    cv::cuda::GpuMat m_templateGpu;
-    cv::cuda::GpuMat m_gray, m_matchResult;
+    cv::cuda::GpuMat m_gray;       // full-ROI grayscale (reused)
 
     cv::Point2f m_crosshairPos;
     cv::Point2f m_prevPos;
     cv::Point2f m_delta;
     int m_roiWidth, m_roiHeight;
-    int m_templateW, m_templateH;
-    bool m_ready;
     bool m_initialized;
 
-    // Tracking anchor for the search-window gate + EMA.
+    // Tracking anchor for search window + EMA.
     float2 m_trackAnchor;
-
-    // Debug
-    int m_debugFrame;
 };
