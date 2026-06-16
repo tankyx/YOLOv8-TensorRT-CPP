@@ -64,7 +64,12 @@ Full build instructions → [Building from source](#building-from-source).
   mouse, not a synthesized one.
 - **Discord-overlay debug renderer**: detection boxes draw into Discord's legacy
   in-game overlay shared memory (no separate window).
-- **Bezier-smoothed dt-based aim** with sub-pixel residue carry.
+- **FOV-based pixel-perfect aim** — focal-length/atan2 conversion from screen pixels
+  to mouse counts, calibrated per-game (m_yaw + rendering hFOV). No CPI dependency.
+- **Recoil containment strategy** — aimbot keeps the crosshair inside the target's
+  bounding box rather than snapping to centre, absorbing aim-punch naturally.
+- **GPU-only pipeline** — CPU capture/detection paths removed. Direct GPU capture
+  is the only path.
 
 ---
 
@@ -86,8 +91,7 @@ capture / detection / render latency.
 
 | Key held | Behavior |
 |---|---|
-| **LMB** | Smoothed Bezier aim path, HID click forwarded to game |
-| **RMB** (when `DebugAimEnabled=true`) | Unsmoothed snap-aim for sensitivity tuning |
+| **LMB** | Recoil-containment aim — keeps crosshair inside the target bounding box |
 | **LSHIFT** | Triggerbot — fires when crosshair is inside a detection box |
 
 ---
@@ -119,22 +123,18 @@ Labels       = player                   # class names
 CaptureWidth  = 640
 CaptureHeight = 640
 CaptureFPS    = 240
-UseDirectGpuCapture = true              # recommended for latency
 
 # Detection
 HeadLabelID1  = 0                       # primary head class id
 HeadLabelID2  = 0                       # secondary head class id
 
-# Aim
-CPI              = 3000
-MouseSensitivity = 0.80
-AimFOV           = 55
-MinGain          = 0.25
-MaxGain          = 0.65
-MaxSpeed         = 15
-Smoothing        = 10                   # 1=snappy, 10=very smooth
-DebugAimEnabled  = true                 # RMB snap-aim for tuning
-DebugSnapGain    = 3.0
+# Aim — pixel-perfect FOV-based conversion
+MouseSensitivity = 0.25                  # in-game sensitivity (CS2) or 0.1 (Valorant)
+GameFOV          = 106                   # rendering hFOV (106 for CS2 16:9, 103 Valorant)
+AimFOV           = 45                    # aim activation radius in screen pixels
+Smoothing        = 4                     # 1=snappy (high gain), 10=very smooth (low gain)
+DebugSnapGain    = 1.0                   # multiplier on RMB snap counts (1.0 = pixel-perfect)
+DebugAimEnabled  = false                 # RMB snap-aim disabled by default
 
 # HID bridge
 HidVendorId  = 0x3367                   # ESP32-P4 OP1 8K V2 default
@@ -244,28 +244,23 @@ Output: `build/bin/Release/detect_object_image.exe`.
                        |  Duplication    |
                        +--------+--------+
                                 |
-               +----------------+----------------+
-               | UseDirectGpuCapture = true      |
-               |   (DXGICaptureCUDA)             |
-               v                                 v
-    +-----------------------+      +-----------------------+
-    | D3D11 GPU staging tex |      | CPU staging tex (Map) |
-    | cudaGraphicsD3D11     |      | cv::cvtColor BGRA→BGR |
-    | → cudaArray (BGRA)   |      | cv::Mat               |
-    | → GpuMat (BGRA)       |      |                       |
-    +-----------+-----------+      +-----------+-----------+
-                |                               |
-                v                               v
-        GpuFrameQueue                    FrameQueue (cv::Mat)
-                |                               |
-                v                               v
-    +-----------------------+      +-----------------------+
-    | detectionThreadGpu    |      | detectionThread       |
-    | ROI = frame(rect)     |      | ROI = frame(rect)     |
-    | (GpuMat view, no copy)|      | + crosshair tracking  |
-    +-----------+-----------+      +-----------+-----------+
-                |                               |
-                +---------------+---------------+
+                                v
+                    +-----------------------+
+                    | D3D11 GPU staging tex |
+                    | cudaGraphicsD3D11     |
+                    | → cudaArray (BGRA)   |
+                    | → GpuMat (BGRA)       |
+                    +-----------+-----------+
+                                |
+                                v
+                        GpuFrameQueue
+                                |
+                                v
+                    +-----------------------+
+                    | detectionThread       |
+                    | ROI = frame(rect)     |
+                    | (GpuMat view, no copy)|
+                    +-----------+-----------+
                                 |
                                 v
                  +------------------------------+
@@ -288,10 +283,10 @@ Output: `build/bin/Release/detect_object_image.exe`.
                  +------------------------------+
                  |   MouseController::aim       |
                  |                              |
-                 |  Bezier dt-based smoothing   |
-                 |    (LMB held)                |
-                 |   OR unsmoothed snap         |
-                 |    (RMB held, debug)         |
+                 |  recoil containment          |
+                 |  (keep crosshair in box)     |
+                 |  distance-adaptive gain      |
+                 |  FOV pixel→count conversion  |
                  |  sub-pixel residue carry     |
                  |  HID report → bridge MCU     |
                  +---------------+--------------+
@@ -299,9 +294,8 @@ Output: `build/bin/Release/detect_object_image.exe`.
 
 ### Pipeline stages
 
-**Capture.** Two paths, gated by `UseDirectGpuCapture`. The direct-GPU path keeps
-everything on device via CUDA-D3D11 interop — zero CPU pixel touch. The legacy CPU
-path maps the staging texture to host memory (slower but supports `TrackCrosshair`).
+**Capture.** Single GPU path via CUDA-D3D11 interop — DXGI Desktop Duplication
+→ CUDA array → GpuMat. Zero CPU pixel touch.
 
 **Preprocess.** A single fused CUDA kernel (`EngineFP16Kernels.cu`): letterbox
 resize with bilinear sampling, BGR/BGRA→RGB channel swap, per-channel normalize,
@@ -323,14 +317,17 @@ direct threshold pass (V26).
 first detection frame after engine load. Steady-state is one `cudaGraphLaunch`
 per frame.
 
-**Mouse aim.** `MouseController::aim` uses a 2D Bezier curve with dt-based progress
-(LMB held), or unsmoothed snap-aim (RMB held + `DebugAimEnabled`). Sub-pixel
-residue carries frame-to-frame. HID reports go to an ESP32-P4/RP2040 bridge MCU
-that re-emits them as native USB mouse reports.
+**Mouse aim.** `MouseController::aim` uses a recoil-containment strategy: the
+aimbot only moves when the crosshair exits the target's bounding box. Pixel
+deltas are converted to mouse counts via a focal-length/atan2 FOV method
+calibrated per-game (m_yaw + rendering hFOV). A distance-adaptive proportional
+gain provides smooth convergence without oscillation. Sub-pixel residue carries
+frame-to-frame. HID reports go to an ESP32-P4/RP2040 bridge MCU that re-emits
+them as native USB mouse reports.
 
-**Debug overlay.** `DiscordOverlay.h` renders detection boxes into Discord's legacy
-in-game overlay shared memory — boxes ride the game's swap chain with no separate
-window. Requires the legacy Discord overlay enabled.
+**Debug overlay.** `DiscordOverlay.h` renders detection boxes into Discord's
+legacy in-game overlay shared memory — boxes ride the game's swap chain with
+no separate window. Requires the legacy Discord overlay enabled.
 
 ### Threading
 
@@ -357,7 +354,7 @@ output shape. Override with `ModelVersion` in the INI.
 
 ## Performance
 
-Measured on RTX 5090 at 640×640 FP16, `UseDirectGpuCapture=true`:
+Measured on RTX 5090 at 640×640 FP16:
 
 - **Detection thread**: ~0.4 ms (YOLOv8n); ~2 ms (YOLOv26l).
 - **Capture thread**: dominated by `AcquireNextFrame` blocking for next refresh.
@@ -365,10 +362,11 @@ Measured on RTX 5090 at 640×640 FP16, `UseDirectGpuCapture=true`:
 
 ### Tuning
 
-1. `UseDirectGpuCapture=true` — single biggest improvement.
-2. `Precision=half` — FP16 is the production path.
-3. Match `CaptureWidth/Height` to model input for fastest fused preproc.
-4. `Smoothing` — aim-feel only, doesn't affect detection latency.
+1. `Precision=half` — FP16 is the production path.
+2. Match `CaptureWidth/Height` to model input for fastest fused preproc.
+3. `GameFOV` — must match your game's actual rendering hFOV (CS2 16:9 = 106, Valorant = 103).
+4. `MouseSensitivity` — must match your in-game sensitivity exactly.
+5. `Smoothing` — controls the proportional gain (1=snappy high gain, 10=very smooth low gain).
 
 ---
 
@@ -391,7 +389,7 @@ Measured on RTX 5090 at 640×640 FP16, `UseDirectGpuCapture=true`:
 
 ```
 src/
-  object_detection_image_mt.cpp   # main, ObjectDetectionSystem, threads
+  object_detection_image_mt.cpp   # main, ObjectDetectionSystem, GPU-only threads
   YoloDetector.{h,cpp}            # base detector (engine mgmt, graph, GPU buffers)
   yolov8.{h,cpp}                  # YOLOv8 (xywh decode + NMS)
   YoloV11.{h,cpp}                 # YOLOv11 (DFL softmax + NMS)
@@ -403,15 +401,12 @@ src/
   EngineFactory.h                 # selects engine by Precision
   EngineFP16Kernels.{h,cu}        # fused BGR/BGRA → fp16 CHW preproc kernel
   YoloPostprocKernels.{h,cu}     # GPU filter+decode kernels (V8/V11/V26)
-  DXGICapture.h                   # legacy CPU capture path
-  DXGICaptureCUDA.h               # direct GPU/D3D11 interop capture
+  DXGICaptureCUDA.h               # GPU/D3D11 interop capture
   DiscordOverlay.h                # Discord legacy overlay debug renderer
-  CrosshairTrackerGPU.h           # GPU crosshair detector (shape-based)
-  MouseController.{h,cpp}         # HID output, Bezier aim, triggerbot
+  MouseController.{h,cpp}         # HID output, FOV pixel→count, containment aim
   threadsafe_queue.h              # thread-safe queues (frame, detection, latency)
   IniParser.h                     # zero-dep INI parser
   MetricsWriter.h                 # optional JSON status file writer
-  SoftwareFuser.{h,cu}            # capture-card + desktop fusion (optional)
 
 dep/
   config_{cs2,valo}.ini           # base configs per game
