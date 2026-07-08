@@ -402,10 +402,10 @@ Object MouseController::findClosestDetection(const std::vector<Object> &detectio
 
 void MouseController::triggerLeftClickIfCenterWithinDetection(const std::vector<Object> &detections) {
     using namespace std::chrono;
-    constexpr auto holdDuration = milliseconds(100);
-    constexpr auto armDelay = milliseconds(60);
-    constexpr int cooldownMeanMs = 220;
-    constexpr int cooldownJitterMs = 35;
+    constexpr auto holdDuration = milliseconds(60);
+    constexpr auto armDelay = milliseconds(30);
+    constexpr int cooldownMeanMs = 110;
+    constexpr int cooldownJitterMs = 18;
 
     const auto now = steady_clock::now();
 
