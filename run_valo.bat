@@ -24,7 +24,9 @@ if "%CONFIG%"=="" (
     exit /b 1
 )
 
-cd /d "C:\Users\tanguy\Documents\GitHub\YOLOv8-TensorRT-CPP\build2\bin\Release"
+rem Load CUDA/OpenCV DLL paths, then run from the build output (repo-relative).
+call "%~dp0scripts\env.bat"
+cd /d "%~dp0build2\bin\Release"
 
 echo ========================================
 echo   YOLO-TensorRT — Valorant

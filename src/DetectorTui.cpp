@@ -294,6 +294,24 @@ static fs::path executableDir() {
 #endif
 }
 
+// Locate scripts\env.bat by walking up from the config directory. The detector
+// runs as a child of this process, so it needs the CUDA/OpenCV DLL directories
+// that env.bat sets -- even when the TUI itself was started from a shell that
+// did not source it (double-click, fresh terminal, etc.).
+static fs::path findEnvBat(const fs::path &start) {
+    std::error_code ec;
+    fs::path p = fs::absolute(start, ec);
+    if (ec) return {};
+    for (int depth = 0; depth < 8; ++depth) {
+        fs::path candidate = p / "scripts" / "env.bat";
+        if (fs::exists(candidate, ec)) return candidate;
+        fs::path parent = p.parent_path();
+        if (parent.empty() || parent == p) break;
+        p = parent;
+    }
+    return {};
+}
+
 // ---------------------------------------------------------------------------
 // Frame buffer: fixed-size char grid, painted row by row. Row styles are kept
 // separate so the renderer can wrap whole rows in ANSI attributes.
@@ -400,6 +418,10 @@ int main(int argc, char **argv) {
 #endif
     exe = fs::absolute(exe, aec);
 
+    // Apply scripts\env.bat to the detector child so it finds the CUDA/OpenCV
+    // DLLs regardless of how the TUI itself was launched.
+    fs::path envBat = findEnvBat(dir);
+
     Terminal term;
     if (!term.init()) {
         std::fprintf(stderr,
@@ -463,7 +485,8 @@ int main(int argc, char **argv) {
         fs::remove(dir / "status.json", rec); // drop stale metrics from a previous run
         std::string err;
         if (!child.start(exe.string(), cfg.file, dir.string(),
-                         (dir / "detector_tui.log").string(), err)) {
+                         (dir / "detector_tui.log").string(), err,
+                         envBat.string())) {
             message = "launch failed: " + err;
             return;
         }
@@ -722,7 +745,11 @@ int main(int argc, char **argv) {
             running = false;
             stopDeadline = -1.0;
             lastExit = child.exitCode();
-            message = "detector exited (code " + std::to_string(lastExit) + ")";
+            if (static_cast<unsigned>(lastExit) == 0xC0000135u) {
+                message = "detector failed to start: missing DLL (env.bat not applied?)";
+            } else {
+                message = "detector exited (code " + std::to_string(lastExit) + ")";
+            }
         }
         if (running && stopDeadline > 0.0 && nowSec() >= stopDeadline) {
             child.kill();

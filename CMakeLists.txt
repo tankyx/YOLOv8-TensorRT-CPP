@@ -32,23 +32,47 @@ else()
     find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs videoio highgui dnn
                                             cudaarithm cudaimgproc cudawarping cudafilters)
 endif()
-find_package(CUDA REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 
 if(WIN32)
-    # Set TensorRT paths using CUDA installation
-    set(TENSORRT_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4" CACHE PATH "Path to TensorRT installation")
+    # TensorRT is normally merged into the CUDA toolkit tree by
+    # scripts\windows_setup.ps1, so default TENSORRT_ROOT to the detected CUDA
+    # toolkit (env CUDA_PATH first, then the CUDAToolkit root). Override with
+    # -DTENSORRT_ROOT=<path> when TensorRT lives elsewhere.
+    if(NOT TENSORRT_ROOT)
+        if(DEFINED ENV{CUDA_PATH})
+            set(TENSORRT_ROOT "$ENV{CUDA_PATH}" CACHE PATH "Path to TensorRT installation")
+        elseif(CUDAToolkit_ROOT)
+            set(TENSORRT_ROOT "${CUDAToolkit_ROOT}" CACHE PATH "Path to TensorRT installation")
+        else()
+            set(TENSORRT_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4" CACHE PATH "Path to TensorRT installation")
+        endif()
+    endif()
     set(TENSORRT_INCLUDE_DIRS "${TENSORRT_ROOT}/include")
     set(TENSORRT_LIB_DIR "${TENSORRT_ROOT}/lib")
     set(TENSORRT_BIN_DIR "${TENSORRT_ROOT}/bin")
 
-    # Find TensorRT libraries with version numbers
-    file(GLOB NVINFER_LIB "${TENSORRT_LIB_DIR}/nvinfer_10.lib")
-    file(GLOB NVONNXPARSER_LIB "${TENSORRT_LIB_DIR}/nvonnxparser_10.lib")
-    file(GLOB NVINFER_PLUGIN_LIB "${TENSORRT_LIB_DIR}/nvinfer_plugin_10.lib")
+    # TensorRT 10 ships nvinfer_10.lib, TensorRT 11 nvinfer_11.lib; some builds
+    # use unversioned names. Accept whichever is present.
+    set(NVINFER_LIB "")
+    foreach(_trt_ver 10 11 "")
+        if(_trt_ver STREQUAL "")
+            set(_trt_suffix "")
+        else()
+            set(_trt_suffix "_${_trt_ver}")
+        endif()
+        if(EXISTS "${TENSORRT_LIB_DIR}/nvinfer${_trt_suffix}.lib")
+            set(NVINFER_LIB        "${TENSORRT_LIB_DIR}/nvinfer${_trt_suffix}.lib")
+            set(NVONNXPARSER_LIB   "${TENSORRT_LIB_DIR}/nvonnxparser${_trt_suffix}.lib")
+            set(NVINFER_PLUGIN_LIB "${TENSORRT_LIB_DIR}/nvinfer_plugin${_trt_suffix}.lib")
+            message(STATUS "TensorRT library suffix: '${_trt_suffix}'")
+            break()
+        endif()
+    endforeach()
 
-    if(NOT NVINFER_LIB OR NOT NVONNXPARSER_LIB OR NOT NVINFER_PLUGIN_LIB)
-        message(FATAL_ERROR "Could not find TensorRT libraries. Please check your installation.")
+    if(NOT NVINFER_LIB OR NOT EXISTS "${NVONNXPARSER_LIB}" OR NOT EXISTS "${NVINFER_PLUGIN_LIB}")
+        message(FATAL_ERROR "Could not find TensorRT libraries (nvinfer_10 / nvinfer_11 / nvinfer) in ${TENSORRT_LIB_DIR}. "
+                            "Install TensorRT there or pass -DTENSORRT_ROOT=<path>.")
     endif()
 else()
     # Linux: TensorRT from system packages (AUR `tensorrt`) or TensorRT_DIR hint
@@ -82,7 +106,7 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${OpenCV_INCLUDE_DIRS} 
     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
-    ${CUDA_INCLUDE_DIRS}
+    ${CUDAToolkit_INCLUDE_DIRS}
     ${TENSORRT_INCLUDE_DIRS}
 )
 

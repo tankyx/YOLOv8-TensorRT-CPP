@@ -99,6 +99,10 @@ cd build2\bin\Release
 detector_tui.exe
 ```
 
+The TUI locates `scripts\env.bat` (walking up from its config directory) and
+applies it to the detector child, so you do not have to source it first — the
+CUDA/OpenCV DLL paths are set even when the TUI is started from a fresh shell.
+
 ```bash
 # Linux
 ./build/bin/detector_tui

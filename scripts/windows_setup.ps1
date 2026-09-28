@@ -46,7 +46,7 @@ param(
     [string] $TensorRtVersion  = '10.9.0.34',
     # Best effort: pull TensorRT from PyPI instead of the NVIDIA zip.
     [switch] $UsePipTensorRt,
-    [string] $OpenCvVersion    = '4.10.0',
+    [string] $OpenCvVersion    = '4.14.0',
     [string] $OpenCvInstallDir = '',
     # 'auto' detects the GPU compute capability via nvidia-smi (8.9 = RTX 40, 12.0 = RTX 50).
     [string] $CudaArch         = 'auto',
@@ -161,6 +161,57 @@ function Install-WingetPackage {
         Write-Warn "$Label installed, but '$VerifyTool' is not on this shell's PATH yet - open a new terminal."
     }
 }
+
+function Find-VsInstall {
+    # Path of the newest Visual Studio with the Desktop C++ workload (falls back
+    # to any Visual Studio). Returns $null when none is installed.
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (-not (Test-Path $vswhere)) { return $null }
+    $path = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+    if (-not $path) { $path = & $vswhere -latest -products '*' -property installationPath 2>$null }
+    if (-not $path) { return $null }
+    return ($path | Select-Object -First 1).Trim()
+}
+
+function Get-VsGenerator {
+    # Map the Visual Studio product version to the CMake generator name.
+    param([string] $InstallPath)
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path $vswhere) {
+        $ver = & $vswhere -latest -products '*' -property installationVersion 2>$null | Select-Object -First 1
+        if ($ver -match '^(\d+)') {
+            switch ($Matches[1]) {
+                '18' { return 'Visual Studio 18 2026' }
+                '17' { return 'Visual Studio 17 2022' }
+                '16' { return 'Visual Studio 16 2019' }
+            }
+        }
+    }
+    return 'Visual Studio 17 2022'
+}
+
+function Find-VsCmake {
+    # Visual Studio bundles its own CMake under Common7\IDE. Prefer it when
+    # cmake is not already on PATH so no winget/admin is required.
+    param([string] $VsInstall)
+    $candidates = @()
+    if ($VsInstall) { $candidates += (Join-Path $VsInstall 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe') }
+    $candidates += (Join-Path $env:ProgramFiles 'CMake\bin\cmake.exe')
+    $candidates += (Join-Path ${env:ProgramFiles(x86)} 'CMake\bin\cmake.exe')
+    foreach ($c in $candidates) {
+        if ($c -and (Test-Path $c)) { return $c }
+    }
+    return $null
+}
+
+function Convert-ToCMakePath {
+    # CMake wants forward slashes on Windows. Backslashes in a PATHS value get
+    # re-parsed as escapes (e.g. '\P' in '\Program Files') by the FindCUDA
+    # shim shipped with CMake 4.x and abort the configure.
+    param([string] $Path)
+    if (-not $Path) { return $Path }
+    return ($Path -replace '\\', '/')
+}
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -249,22 +300,15 @@ Write-Step 'Build tools (git, CMake, Visual Studio 2022)'
 if (Test-Tool 'git') { Write-Ok ((& git --version) -join '') }
 else { Install-WingetPackage -Id 'Git.Git' -Label 'Git' -VerifyTool 'git' }
 
-if (Test-Tool 'cmake') {
-    $v = (& cmake --version | Select-Object -First 1)
-    Write-Ok $v
-    if ($v -match '(\d+)\.(\d+)' -and [int]$Matches[1] -lt 3 -and [int]$Matches[2] -lt 22) {
-        Write-Warn 'CMake 3.22+ is recommended'
-    }
+# Visual Studio first: it determines the CMake generator and may provide a
+# bundled CMake (no winget / admin required).
+$vsInstall   = Find-VsInstall
+$vsGenerator = 'Visual Studio 17 2022'
+if ($vsInstall) {
+    $vsGenerator = Get-VsGenerator $vsInstall
+    Write-Ok ("Visual Studio: {0} [{1}]" -f $vsInstall, $vsGenerator)
 } else {
-    Install-WingetPackage -Id 'Kitware.CMake' -Label 'CMake' -VerifyTool 'cmake'
-}
-
-$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-if (Test-Path $vswhere) {
-    $vsPath = (& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null)
-    if ($vsPath) { Write-Ok ("Visual Studio: {0}" -f $vsPath.Trim()) }
-    else { Write-Warn 'Visual Studio is installed without the Desktop C++ (MSVC) workload - add it via the Visual Studio Installer' }
-} else {
+    Write-Warn 'Visual Studio with the Desktop C++ (MSVC) workload was not found - add it via the Visual Studio Installer'
     $vsOverride = '--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.NativeDesktop --includeRecommended'
     Install-WingetPackage -Id (@{
         Community    = 'Microsoft.VisualStudio.2022.Community'
@@ -272,6 +316,35 @@ if (Test-Path $vswhere) {
         Professional = 'Microsoft.VisualStudio.2022.Professional'
         Enterprise   = 'Microsoft.VisualStudio.2022.Enterprise'
     }[$VsEdition]) -Label "Visual Studio 2022 $VsEdition (Desktop C++)" -ExtraArgs @('--override', $vsOverride)
+}
+
+if (Test-Tool 'cmake') {
+    $v = (& cmake --version | Select-Object -First 1)
+    Write-Ok $v
+    if ($v -match '(\d+)\.(\d+)' -and [int]$Matches[1] -lt 3 -and [int]$Matches[2] -lt 22) {
+        Write-Warn 'CMake 3.22+ is recommended'
+    }
+} else {
+    $vsCmake = Find-VsCmake $vsInstall
+    if ($vsCmake) {
+        $env:PATH = (Split-Path $vsCmake -Parent) + ';' + $env:PATH
+        Write-Ok ("using the CMake bundled with Visual Studio: {0}" -f (& $vsCmake --version | Select-Object -First 1))
+    } elseif (Test-Tool 'winget') {
+        Install-WingetPackage -Id 'Kitware.CMake' -Label 'CMake' -VerifyTool 'cmake'
+    } else {
+        # No winget and no bundled CMake: drop a portable CMake into the work dir.
+        $cmakeVersion = '3.31.6'
+        $cmakeZip = Join-Path $WorkDir "cmake-$cmakeVersion-windows-x86_64.zip"
+        $cmakeDir = Join-Path $WorkDir "cmake-$cmakeVersion-windows-x86_64"
+        Get-Download -Url "https://github.com/Kitware/CMake/releases/download/v$cmakeVersion/cmake-$cmakeVersion-windows-x86_64.zip" -Dest $cmakeZip
+        if (-not $DryRun) {
+            if (-not (Test-Path (Join-Path $cmakeDir 'bin\cmake.exe'))) {
+                Expand-Archive -Path $cmakeZip -DestinationPath $WorkDir -Force
+            }
+            $env:PATH = (Join-Path $cmakeDir 'bin') + ';' + $env:PATH
+        }
+        Write-Ok "CMake $cmakeVersion (portable, no admin needed)"
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -333,16 +406,26 @@ if ($cudaRoot -and -not $Force) {
     if ($DryRun -and -not $cudaRoot) { $cudaRoot = Join-Path ${env:ProgramFiles} "NVIDIA GPU Computing Toolkit\CUDA\v$CudaVersion" }
 }
 
+# Forward-slash form for every path handed to CMake (see Convert-ToCMakePath).
+$cudaRootCm = Convert-ToCMakePath $cudaRoot
+
 # ---------------------------------------------------------------------------
 # 4. TensorRT (merged into the CUDA root, matching CMakeLists.txt)
 # ---------------------------------------------------------------------------
-Write-Step "TensorRT $TensorRtVersion (merged into the CUDA root)"
+Write-Step 'TensorRT (merged into the CUDA root)'
 
 function Test-TensorRtInCudaRoot { param([string] $Root)
     if (-not $Root) { return $false }
     if (-not (Test-Path (Join-Path $Root 'include\NvInfer.h'))) { return $false }
-    foreach ($sub in @('lib', 'bin')) {
-        if (Test-Path (Join-Path $Root "$sub\nvinfer_10.lib")) { return $true }
+    foreach ($suffix in @('_10', '_11', '')) {
+        foreach ($sub in @('lib', 'bin')) {
+            $dir = Join-Path $Root $sub
+            if ((Test-Path (Join-Path $dir "nvinfer$suffix.lib")) -and
+                (Test-Path (Join-Path $dir "nvonnxparser$suffix.lib")) -and
+                (Test-Path (Join-Path $dir "nvinfer_plugin$suffix.lib"))) {
+                return $true
+            }
+        }
     }
     return $false
 }
@@ -387,6 +470,10 @@ if ($SkipTensorRt) {
     } elseif (-not (Test-Path $zipPath)) {
         Die "TensorRT zip not found: $zipPath"
     }
+    if (-not $isAdmin -and -not $DryRun -and ($cudaRoot -like '*Program Files*')) {
+        Die ("merging TensorRT into $cudaRoot needs an elevated (admin) PowerShell. " +
+             "Re-open the terminal as Administrator and re-run, or pass -InstallRoot to a user-writable location.")
+    }
     Install-TensorRtFromZip -ZipPath $zipPath -CudaRoot $cudaRoot
 } elseif ($UsePipTensorRt) {
     if (-not (Test-Tool 'python')) { Die '-UsePipTensorRt needs Python on PATH' }
@@ -399,8 +486,8 @@ if ($SkipTensorRt) {
         Copy-Item -Path (Join-Path $libs '*.dll') -Destination (Join-Path $cudaRoot 'bin') -Force -ErrorAction SilentlyContinue
         if (Test-Path $inc) { Copy-Item -Path (Join-Path $inc '*.h') -Destination (Join-Path $cudaRoot 'include') -Force }
         if (-not (Test-TensorRtInCudaRoot $cudaRoot)) {
-            Die ('the PyPI TensorRT package did not provide nvinfer_10.lib / NvInfer.h. Download the TensorRT ' +
-                 'Windows zip from https://developer.nvidia.com/tensorrt and re-run with -TensorRtZip <path>.')
+            Die ('the PyPI TensorRT package did not provide NvInfer.h + nvinfer / nvonnxparser / nvinfer_plugin libs. ' +
+                 'Download the TensorRT Windows zip from https://developer.nvidia.com/tensorrt and re-run with -TensorRtZip <path>.')
         }
         Write-Ok 'TensorRT installed from PyPI'
     }
@@ -408,7 +495,7 @@ if ($SkipTensorRt) {
     Write-Host ''
     Write-Warn 'TensorRT is not installed and no source was given.'
     Write-Info 'NVIDIA requires a free account, so this download cannot be automated:'
-    Write-Info '  1. open https://developer.nvidia.com/tensorrt and download the TensorRT 10.x Windows zip (CUDA 12.x)'
+    Write-Info '  1. open https://developer.nvidia.com/tensorrt and download the TensorRT Windows zip that matches your CUDA version'
     Write-Info '  2. re-run:  scripts\windows_setup.bat -TensorRtZip <path-to-zip>'
     Die 'stopping before the (30-60 minute) OpenCV build because the project cannot link without TensorRT'
 }
@@ -446,14 +533,21 @@ if ($opencvDir -and -not $Force) {
                                          'https://github.com/opencv/opencv_contrib.git', $openCvContrib) -What 'cloning opencv_contrib'
     } else { Write-Skip "opencv_contrib sources present: $openCvContrib" }
 
+    $openCvSrcCm     = Convert-ToCMakePath $openCvSrc
+    $openCvBuildCm   = Convert-ToCMakePath $openCvBuild
+    $openCvInstallCm = Convert-ToCMakePath $OpenCvInstallDir
+    $openCvContribCm = Convert-ToCMakePath (Join-Path $openCvContrib 'modules')
     $configureArgs = @(
-        '-S', $openCvSrc, '-B', $openCvBuild,
-        '-G', 'Visual Studio 17 2022', '-A', 'x64',
-        "-DCMAKE_INSTALL_PREFIX=$OpenCvInstallDir",
-        "-DOPENCV_EXTRA_MODULES_PATH=$(Join-Path $openCvContrib 'modules')",
+        '-S', $openCvSrcCm, '-B', $openCvBuildCm,
+        '-G', $vsGenerator, '-A', 'x64',
+        "-DCMAKE_INSTALL_PREFIX=$openCvInstallCm",
+        "-DOPENCV_EXTRA_MODULES_PATH=$openCvContribCm",
+        "-DCUDA_TOOLKIT_ROOT_DIR=$cudaRootCm",
         '-DWITH_CUDA=ON',
-        '-DWITH_CUDNN=ON',
-        '-DOPENCV_DNN_CUDA=ON',
+        # Inference goes through TensorRT, not the OpenCV DNN CUDA backend, so
+        # cuDNN is not required (and is usually absent on dev machines).
+        '-DWITH_CUDNN=OFF',
+        '-DOPENCV_DNN_CUDA=OFF',
         "-DCUDA_ARCH_BIN=$gpuArch",
         '-DCUDA_FAST_MATH=ON',
         '-DWITH_CUBLAS=ON',
@@ -464,15 +558,15 @@ if ($opencvDir -and -not $Force) {
         '-DBUILD_opencv_python3=OFF'
     )
     Invoke-Cmd -Exe 'cmake' -ArgList $configureArgs -What 'configuring OpenCV'
-    Invoke-Cmd -Exe 'cmake' -ArgList @('--build', $openCvBuild, '--config', 'Release', '--target', 'INSTALL', '--', '/m') `
+    Invoke-Cmd -Exe 'cmake' -ArgList @('--build', $openCvBuildCm, '--config', 'Release', '--target', 'INSTALL', '--', '/m') `
                -What 'building and installing OpenCV (long; -DryRun prints the exact command)'
 
     $opencvDir = Find-OpenCvConfigDir $OpenCvInstallDir
     if ($DryRun -and -not $opencvDir) { $opencvDir = $OpenCvInstallDir }
     if (-not $opencvDir) {
         Die ("OpenCV built but no OpenCVConfig.cmake was installed under $OpenCvInstallDir. If the configure " +
-             "step rejected CUDA_ARCH_BIN=$gpuArch, this OpenCV tag predates sm_$archNoDot: retry with a newer " +
-             "-OpenCvVersion (4.11+ knows sm_120) or with -CudaArch 8.9.")
+             "step rejected CUDA_ARCH_BIN=$gpuArch, this OpenCV tag predates sm_${archNoDot}: retry with a newer " +
+             "-OpenCvVersion (4.14+ knows sm_120 / CUDA 13) or with -CudaArch 8.9.")
     }
     Write-Ok "OpenCV: $opencvDir"
 }
@@ -500,7 +594,8 @@ rem Run this in a cmd.exe window before launching the detector, or call it from 
 rem   scripts\env.bat
 set "CUDA_PATH={0}"
 set "OpenCV_DIR={1}"
-set "PATH=%CUDA_PATH%\bin;{2}%PATH%"
+rem CUDA 13 moved the runtime DLLs into bin\x64 (CUDA 12 and earlier keep them in bin).
+set "PATH=%CUDA_PATH%\bin;%CUDA_PATH%\bin\x64;{2}%PATH%"
 '@
 $envPrefix = ''
 if ($opencvBinDir) { $envPrefix = "$opencvBinDir;" }
@@ -522,15 +617,19 @@ $exe = Join-Path $ProjectBuildDir 'bin\Release\detect_object_image.exe'
 if ($SkipProjectBuild) {
     Write-Skip 'skipped (-SkipProjectBuild)'
 } elseif (Test-Tool 'cmake') {
+    $repoRootCm  = Convert-ToCMakePath $script:RepoRoot
+    $buildDirCm  = Convert-ToCMakePath $ProjectBuildDir
+    $opencvDirCm = Convert-ToCMakePath $opencvDir
     Invoke-Cmd -Exe 'cmake' -ArgList @(
-        '-S', $script:RepoRoot, '-B', $ProjectBuildDir,
-        '-G', 'Visual Studio 17 2022', '-A', 'x64',
+        '-S', $repoRootCm, '-B', $buildDirCm,
+        '-G', $vsGenerator, '-A', 'x64',
         '-DCMAKE_BUILD_TYPE=Release',
-        "-DOpenCV_DIR=$opencvDir",
-        "-DTENSORRT_ROOT=$cudaRoot",
+        "-DOpenCV_DIR=$opencvDirCm",
+        "-DTENSORRT_ROOT=$cudaRootCm",
+        "-DCUDAToolkit_ROOT=$cudaRootCm",
         "-DCMAKE_CUDA_ARCHITECTURES=$archNoDot"
     ) -What 'configuring the project'
-    Invoke-Cmd -Exe 'cmake' -ArgList @('--build', $ProjectBuildDir, '--config', 'Release', '--', '/m') `
+    Invoke-Cmd -Exe 'cmake' -ArgList @('--build', $buildDirCm, '--config', 'Release', '--', '/m') `
                -What 'building the project (Release)'
     if (-not $DryRun) {
         if (Test-Path $exe) { Write-Ok "built: $exe" }

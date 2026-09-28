@@ -52,15 +52,18 @@ public:
     ChildProcess &operator=(const ChildProcess &) = delete;
 
     // exe, workDir and logPath are filesystem paths; arg is a single argument
-    // (the config filename). Returns false and fills err on failure.
+    // (the config filename). envBat, when non-empty (Windows only), is a
+    // scripts\env.bat that is applied to the child so it inherits the CUDA /
+    // OpenCV DLL paths. Returns false and fills err on failure.
     bool start(const std::string &exe, const std::string &arg,
                const std::string &workDir, const std::string &logPath,
-               std::string &err) {
+               std::string &err, const std::string &envBat = "") {
         if (running()) {
             err = "a detector process is already running";
             return false;
         }
         reset();
+        (void) envBat; // Windows-only (envBat is applied via cmd.exe below)
 
 #if defined(_WIN32)
         std::wstring wExe = widen(exe);
@@ -95,7 +98,18 @@ public:
         si.hStdOutput = hLog;
         si.hStdError = hLog;
 
-        std::wstring cmd = L"\"" + wExe + L"\" " + wArg;
+        // When envBat is given, run through cmd.exe so env.bat's PATH (CUDA 13
+        // bin\x64, OpenCV bin) is applied to the detector. cmd.exe returns the
+        // detector's exit code; the kill-on-close job still owns the tree.
+        std::wstring cmd;
+        if (!envBat.empty()) {
+            std::wstring wEnv = widen(envBat);
+            // cmd /d /s /c ""<env.bat>" >nul 2>&1 && "<exe>" <arg>"
+            cmd = L"cmd.exe /d /s /c \"\"" + wEnv +
+                  L"\" >nul 2>&1 && \"" + wExe + L"\" " + wArg + L"\"";
+        } else {
+            cmd = L"\"" + wExe + L"\" " + wArg;
+        }
         PROCESS_INFORMATION pi{};
         BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr,
                                  TRUE /* inherit handles */, 0, nullptr,
