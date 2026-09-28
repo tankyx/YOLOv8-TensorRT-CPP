@@ -44,6 +44,9 @@ static void onQuitSignal(int) { g_quitRequested = 1; }
 
 using namespace std::chrono;
 
+// Title of the optional DebugCaptureWindow (see updateDebugWindow).
+static const char *kDebugWindowName = "YOLO capture";
+
 class ObjectDetectionSystem {
 public:
     ObjectDetectionSystem(const std::string &iniFile);
@@ -60,6 +63,8 @@ private:
 
     void captureThread();
     void detectionThread();
+    void updateDebugWindow(const cv::cuda::GpuMat &croppedFrame,
+                           const std::vector<Object> &detections);
 
     INIParser config;
     std::unique_ptr<YoloDetector> yoloDetector;
@@ -89,6 +94,16 @@ private:
     bool pinThreads;
     bool debugView;
     std::string debugOverlayTargetProcess;
+
+    // Optional small OpenCV window showing the capture ROI (the exact image the
+    // detector sees) with detection boxes drawn on it. Off unless
+    // DebugCaptureWindow = true in the INI.
+    bool debugCaptureWindow = false;
+    int debugCaptureWindowFPS = 30;
+    bool m_debugWindowOpen = false;
+    cv::Mat m_debugCaptureFrame;
+    cv::Mat m_debugBgrFrame;
+    std::chrono::steady_clock::time_point m_debugWindowLast{};
 
     // Monitoring
     MetricsWriter m_metrics;
@@ -124,6 +139,8 @@ void ObjectDetectionSystem::loadConfigFromINI(const std::string &iniFile) {
 
     debugView                 = config.getBool("DebugView", false);
     debugOverlayTargetProcess = config.getString("DebugOverlayTargetProcess", "cs2.exe");
+    debugCaptureWindow        = config.getBool("DebugCaptureWindow", false);
+    debugCaptureWindowFPS     = config.getInt("DebugCaptureWindowFPS", 30);
 
     m_metricsPath = config.getString("MetricsStatus", "");
     if (!m_metricsPath.empty()) {
@@ -328,6 +345,10 @@ void ObjectDetectionSystem::mainLoop() {
 }
 
 void ObjectDetectionSystem::cleanup() {
+    if (m_debugWindowOpen) {
+        try { cv::destroyWindow(kDebugWindowName); } catch (...) {}
+        m_debugWindowOpen = false;
+    }
     if (debugOverlay) {
         debugOverlay->stop();
         debugOverlay.reset();
@@ -388,6 +409,83 @@ void ObjectDetectionSystem::captureThread() {
     } catch (...) {
         std::cerr << "captureThread: unknown error" << std::endl;
         running = false;
+    }
+}
+
+// ── Optional debug capture window ─────────────────────────────────────
+// A small, ordinary window showing the capture ROI — the exact image handed to
+// the network — with the detection boxes drawn on it. Handy for checking the
+// crop/FOV and what the model actually sees. Enabled with DebugCaptureWindow =
+// true in the INI; closing the window turns it back off. Runs on the detection
+// thread and is throttled (DebugCaptureWindowFPS) so the GPU->CPU download and
+// drawing stay off the hot path. Requires a highgui backend (Win32 on Windows).
+
+void ObjectDetectionSystem::updateDebugWindow(const cv::cuda::GpuMat &croppedFrame,
+                                              const std::vector<Object> &detections) {
+    if (!debugCaptureWindow) return;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (m_debugWindowOpen && debugCaptureWindowFPS > 0) {
+        const double minDt = 1.0 / static_cast<double>(debugCaptureWindowFPS);
+        if (std::chrono::duration<double>(now - m_debugWindowLast).count() < minDt) return;
+    }
+    m_debugWindowLast = now;
+
+    try {
+        if (!m_debugWindowOpen) {
+            cv::namedWindow(kDebugWindowName, cv::WINDOW_AUTOSIZE);
+            cv::moveWindow(kDebugWindowName, 20, 20);
+            m_debugWindowOpen = true;
+        } else if (cv::getWindowProperty(kDebugWindowName, cv::WND_PROP_VISIBLE) < 1.0) {
+            // User closed the window: stop updating instead of forcing it back.
+            cv::destroyWindow(kDebugWindowName);
+            m_debugWindowOpen = false;
+            debugCaptureWindow = false;
+            return;
+        }
+
+        croppedFrame.download(m_debugCaptureFrame);
+        cv::Mat *canvas = &m_debugCaptureFrame;
+        if (canvas->channels() == 4) {
+            // Separate buffer: cvtColor cannot convert in place when it changes
+            // the channel count (it would reallocate the source).
+            cv::cvtColor(m_debugCaptureFrame, m_debugBgrFrame, cv::COLOR_BGRA2BGR);
+            canvas = &m_debugBgrFrame;
+        }
+
+        static const cv::Scalar kPalette[] = {
+            {0, 255, 0},   {0, 165, 255}, {255, 0, 255}, {255, 255, 0},
+            {0, 0, 255},   {255, 0, 0},   {128, 255, 0}, {255, 128, 0},
+        };
+        const int paletteSize = static_cast<int>(sizeof(kPalette) / sizeof(kPalette[0]));
+
+        for (const auto &d : detections) {
+            const cv::Scalar color = kPalette[(d.label >= 0 ? d.label : 0) % paletteSize];
+            const cv::Rect r = d.rect; // Rect_<float> -> Rect
+            cv::rectangle(*canvas, r, color, 2);
+
+            const std::string name =
+                (d.label >= 0 && d.label < static_cast<int>(labelNames.size()))
+                    ? labelNames[d.label]
+                    : std::to_string(d.label);
+            const std::string text = name + " " + cv::format("%.2f", d.probability);
+
+            int baseline = 0;
+            const cv::Size ts = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
+            const int ty = std::max(r.y, ts.height + 3);
+            cv::rectangle(*canvas,
+                          cv::Rect(r.x, ty - ts.height - 3, ts.width + 4, ts.height + baseline + 3),
+                          color, cv::FILLED);
+            cv::putText(*canvas, text, cv::Point(r.x + 2, ty),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1, cv::LINE_AA);
+        }
+
+        cv::imshow(kDebugWindowName, *canvas);
+        cv::waitKey(1); // pump highgui events for this thread's window
+    } catch (const std::exception &e) {
+        std::cerr << "DebugCaptureWindow: " << e.what() << "; disabling." << std::endl;
+        m_debugWindowOpen = false;
+        debugCaptureWindow = false;
     }
 }
 
@@ -471,6 +569,10 @@ void ObjectDetectionSystem::detectionThread() {
                 auto tR2 = std::chrono::high_resolution_clock::now();
                 renderLatency.push(std::chrono::duration_cast<std::chrono::milliseconds>(tR2 - tR).count());
             }
+
+            // Debug capture window (no-op unless enabled). After t1 so the
+            // download/draw cost never shows up in the detection latency.
+            updateDebugWindow(croppedFrame, detections);
         }
     } catch (const std::exception &e) {
         std::cerr << "detectionThread: " << e.what() << std::endl;

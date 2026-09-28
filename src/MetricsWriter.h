@@ -20,9 +20,11 @@
 // }
 
 #include <chrono>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <cstdio>
+#include <system_error>
 #include <vector>
 
 // Latest per-frame detection boxes, capture-frame pixels (origin = crop
@@ -110,14 +112,17 @@ public:
         }
         if (static_cast<size_t>(n) + 1 < sizeof(buf)) { buf[n++] = '\n'; buf[n] = '\0'; }
 
-        // Write to tmp, then rename. On NTFS rename is atomic for small files.
+        // Write to tmp, then replace. std::rename() refuses to overwrite on
+        // Windows, so use std::filesystem::rename (MoveFileEx REPLACE_EXISTING)
+        // for atomic replace semantics on both platforms.
         {
             std::ofstream ofs(tmpPath, std::ios::trunc);
             if (!ofs) return;
             ofs.write(buf, n);
             ofs.close();
         }
-        std::rename(tmpPath.c_str(), m_path.c_str());
+        std::error_code rec;
+        std::filesystem::rename(tmpPath, m_path, rec);
     }
 
 private:

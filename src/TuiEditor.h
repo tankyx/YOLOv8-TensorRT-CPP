@@ -12,8 +12,10 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -99,8 +101,13 @@ public:
                 return false;
             }
         }
-        if (std::rename(tmp.c_str(), m_path.c_str()) != 0) {
-            err = "rename failed: " + tmp;
+        // std::rename() fails on Windows when the destination already exists
+        // (the CRT refuses to overwrite); std::filesystem::rename maps to
+        // MoveFileEx(MOVEFILE_REPLACE_EXISTING) and has POSIX replace semantics.
+        std::error_code rec;
+        std::filesystem::rename(tmp, m_path, rec);
+        if (rec) {
+            err = "rename failed: " + tmp + " (" + rec.message() + ")";
             std::remove(tmp.c_str());
             return false;
         }

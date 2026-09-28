@@ -186,6 +186,11 @@ HidSerial    =                          # blank = match by VID/PID only
 DebugView                 = true
 DebugOverlayTargetProcess = cs2.exe
 
+# Optional small window showing the capture ROI (exactly what the detector
+# sees) with boxes drawn on it. Close the window to turn it off.
+DebugCaptureWindow        = false
+DebugCaptureWindowFPS     = 30
+
 # Threading
 PinThreads         = false
 CaptureThreadCore  = 0
