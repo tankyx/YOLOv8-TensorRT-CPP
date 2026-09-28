@@ -9,11 +9,13 @@
 //   2. PipeWire: pw_thread_loop + pw_context + pw_core (pw_context_connect_fd on the portal
 //      fd) + pw_stream bound to the portal-provided node id. Buffers are negotiated as raw
 //      video, BGRA/BGRx preferred (RGBA/RGBx accepted with a byte swizzle on copy).
-//   3. The stream's process callback copies the newest buffer into a CUDA pinned host buffer
-//      under a mutex and bumps a frame sequence number.
+//   3. The stream's process callback copies the newest buffer's detection ROI into a CUDA
+//      pinned host buffer under a mutex and bumps a frame sequence number. Only the centred
+//      ROI (CaptureWidth x CaptureHeight, see resolveRoi) is copied: the detector crops that
+//      same window, so the rest of a 4K frame would be pure host-copy overhead.
 //   4. CaptureScreen() stages the pinned buffer (double-buffered, so an in-flight async H2D
 //      copy from the previous iteration is never overwritten) and enqueues cudaMemcpy2DAsync
-//      into the caller's GpuMat.
+//      of the ROI rectangle into the caller's full-size GpuMat.
 //
 // Dependencies: libpipewire-0.3, libdbus-1, CUDA runtime, OpenCV core/cuda.
 
@@ -31,6 +33,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
@@ -270,7 +273,7 @@ void forEachResultEntry(DBusMessageIter *results, const std::function<void(const
 // ---------------------------------------------------------------------------
 
 struct LinuxCapture::Impl {
-    Impl() {
+    explicit Impl(int fps, int roiW, int roiH) : targetFps(fps), cfgRoiW(roiW), cfgRoiH(roiH) {
         try {
             portalHandshake();
             setupPipeWire();
@@ -555,12 +558,40 @@ struct LinuxCapture::Impl {
     uint8_t *pinned = nullptr;  // cudaHostAlloc, allocated on the caller thread, written by the PipeWire thread
     size_t pinnedBytes = 0;     // 0 until `pinned` matches the negotiated format
     uint64_t frameSeq = 0;
+    std::condition_variable frameReadyCv; // signalled by the process callback when frameSeq++
 
     // CaptureScreen side.
     uint8_t *staging[2] = {nullptr, nullptr};
     size_t stagingBytes = 0;
     int stagingIndex = 0;
     uint64_t lastSeq = 0;
+
+    // Target capture rate (0 = unlimited) and the time of the last full-frame copy; both
+    // used by onProcess to drop frames that arrive faster than requested.
+    int targetFps = 0;
+    std::chrono::steady_clock::time_point lastCopyTime{};
+
+    // Detection ROI (centred CaptureWidth x CaptureHeight window, 0 = whole frame) and the
+    // same rectangle resolved against the negotiated frame size. Only this window is copied
+    // host-side; everything outside it is never touched.
+    int cfgRoiW = 0;
+    int cfgRoiH = 0;
+    int roiX = 0;
+    int roiY = 0;
+    int roiW = 0;
+    int roiH = 0;
+    size_t roiRowBytes = 0;
+
+    // Call with `frameMutex` held once the negotiated size is known. Mirrors the crop in
+    // ObjectDetectionSystem::detectionThread (centre, identical integer arithmetic), so the
+    // window copied here is exactly the window the detector reads.
+    void resolveRoi() {
+        roiW = (cfgRoiW > 0) ? std::min(cfgRoiW, width) : width;
+        roiH = (cfgRoiH > 0) ? std::min(cfgRoiH, height) : height;
+        roiX = std::min(std::max(width / 2 - roiW / 2, 0), std::max(width - roiW, 0));
+        roiY = std::min(std::max(height / 2 - roiH / 2, 0), std::max(height - roiH, 0));
+        roiRowBytes = static_cast<size_t>(roiW) * 4;
+    }
 
     static void pwInitOnce() {
         static std::once_flag flag;
@@ -623,7 +654,9 @@ struct LinuxCapture::Impl {
         const spa_rectangle maxSize = SPA_RECTANGLE(8192, 8192);
         const spa_fraction defFps = SPA_FRACTION(0, 1);
         const spa_fraction minFps = SPA_FRACTION(0, 1);
-        const spa_fraction maxFps = SPA_FRACTION(1000, 1);
+        // 0 = unlimited, otherwise ask the producer for at most this many frames per second.
+        const int streamMaxFps = targetFps > 0 ? targetFps : 1000;
+        const spa_fraction maxFps = SPA_FRACTION(static_cast<uint32_t>(streamMaxFps), 1);
         uint8_t paramsBuf[1024];
         spa_pod_builder builder = SPA_POD_BUILDER_INIT(paramsBuf, sizeof(paramsBuf));
         const spa_pod *params[1];
@@ -744,6 +777,7 @@ struct LinuxCapture::Impl {
             self->height = h;
             self->swapRB = swap;
             self->negotiatedBytes = bytes;
+            self->resolveRoi(); // only this window is copied from here on
             if (changed) {
                 std::cerr << "LinuxCapture: negotiated " << w << "x" << h
                           << (swap ? " RGBA (swizzled to BGRA)" : " BGRA") << std::endl;
@@ -796,6 +830,23 @@ struct LinuxCapture::Impl {
             return;
         }
 
+        // Drop-if-pending: the consumer has not taken the previous copy yet, so this frame
+        // would only overwrite it — skip the full-frame memcpy entirely.
+        if (self->frameSeq != self->lastSeq) {
+            pw_stream_queue_buffer(self->stream, pwbuf);
+            return;
+        }
+
+        // Enforce the target capture rate even when the producer ignores the framerate hint
+        // above. The 0.85 factor tolerates delivery jitter: a frame arriving a hair early
+        // must not halve the effective rate.
+        if (self->targetFps > 0 &&
+            std::chrono::steady_clock::now() - self->lastCopyTime <
+                std::chrono::microseconds(850000 / self->targetFps)) {
+            pw_stream_queue_buffer(self->stream, pwbuf);
+            return;
+        }
+
         // Bound every read by the mapped size, never trust chunk->offset/size/stride blindly:
         // reading past the mmap'd spa_data region is a segfault.
         const spa_chunk *chunk = data->chunk;
@@ -811,25 +862,42 @@ struct LinuxCapture::Impl {
         const int srcStride = (chunk && chunk->stride > 0) ? chunk->stride : self->width * 4;
 
         const uint8_t *src = static_cast<const uint8_t *>(data->data) + offset;
-        const size_t rowBytes = static_cast<size_t>(self->width) * 4;
-        int rows = self->height;
-        if (srcStride > 0 && avail < static_cast<size_t>(srcStride) * static_cast<size_t>(rows)) {
-            rows = static_cast<int>(avail / static_cast<size_t>(srcStride));
+
+        // Only the centred detection ROI is copied — the detector crops exactly this window
+        // (ObjectDetectionSystem::detectionThread), so the rest of the frame is dead weight
+        // (at 4K that was ~33 MB of host copy per frame to deliver a 640x640 result).
+        const int roiX = self->roiX;
+        const int roiY = self->roiY;
+        const int roiW = self->roiW > 0 ? self->roiW : self->width;
+        const int roiH = self->roiH > 0 ? self->roiH : self->height;
+        const size_t rowBytes = static_cast<size_t>(roiW) * 4;
+
+        // Rows the producer actually filled (never trust chunk->size/stride blindly).
+        int availRows = self->height;
+        if (srcStride > 0 && avail < static_cast<size_t>(srcStride) * static_cast<size_t>(availRows)) {
+            availRows = static_cast<int>(avail / static_cast<size_t>(srcStride));
         }
-        if (rows <= 0) {
-            // Producer left the buffer empty: no new frame, do not bump the sequence.
+        if (availRows <= roiY) {
+            // Producer left this buffer empty (or shorter than the ROI): no new frame.
             pw_stream_queue_buffer(self->stream, pwbuf);
             return;
         }
+        const int rows = std::min(roiH, availRows - roiY);
         // Never read more than one stride per row even if the row is narrower than width*4.
-        const size_t copyBytes = std::min(rowBytes, static_cast<size_t>(srcStride));
+        const size_t srcRowOffset = static_cast<size_t>(roiX) * 4;
+        const size_t copyBytes = (srcStride > 0 && static_cast<size_t>(srcStride) > srcRowOffset)
+                                     ? std::min(rowBytes, static_cast<size_t>(srcStride) - srcRowOffset)
+                                     : 0;
 
-        if (!self->swapRB && srcStride == static_cast<int>(rowBytes) &&
-            avail >= rowBytes * static_cast<size_t>(rows)) {
-            std::memcpy(self->pinned, src, rowBytes * static_cast<size_t>(rows));
+        const bool contiguous = !self->swapRB && srcStride == static_cast<int>(rowBytes) &&
+                                srcRowOffset == 0 && avail >= rowBytes * static_cast<size_t>(availRows);
+        if (contiguous) {
+            std::memcpy(self->pinned, src + static_cast<size_t>(roiY) * static_cast<size_t>(srcStride),
+                        rowBytes * static_cast<size_t>(rows));
         } else {
             for (int y = 0; y < rows; ++y) {
-                const uint8_t *s = src + static_cast<size_t>(y) * static_cast<size_t>(srcStride);
+                const uint8_t *s = src + static_cast<size_t>(roiY + y) * static_cast<size_t>(srcStride) +
+                                   srcRowOffset;
                 uint8_t *d = self->pinned + static_cast<size_t>(y) * rowBytes;
                 if (self->swapRB) {
                     const int pixels = static_cast<int>(copyBytes / 4);
@@ -852,19 +920,21 @@ struct LinuxCapture::Impl {
                 }
             }
         }
-        if (rows < self->height) {
+        if (rows < roiH) {
             std::memset(self->pinned + static_cast<size_t>(rows) * rowBytes, 0,
-                        rowBytes * static_cast<size_t>(self->height - rows));
+                        rowBytes * static_cast<size_t>(roiH - rows));
         }
 
+        self->lastCopyTime = std::chrono::steady_clock::now();
         ++self->frameSeq;
+        self->frameReadyCv.notify_all();
         pw_stream_queue_buffer(self->stream, pwbuf);
     }
 
     // ---- CaptureScreen ---------------------------------------------------
 
     bool capture(cv::cuda::GpuMat &frame, cudaStream_t cudaStream) {
-        std::lock_guard<std::mutex> lock(frameMutex);
+        std::unique_lock<std::mutex> lock(frameMutex);
         if (negotiatedBytes == 0 || width <= 0 || height <= 0) {
             return false; // stream has not negotiated a format yet
         }
@@ -906,10 +976,24 @@ struct LinuxCapture::Impl {
         }
 
         if (frameSeq == lastSeq) {
-            return false; // no new frame yet — caller retries next iteration
+            // No new frame yet: block until the PipeWire callback publishes one rather than
+            // returning immediately and making the caller poll. The caller used to spin every
+            // 250 us (~3.3k wakeups/s measured); this makes it ~1-2 wakeups per delivered
+            // frame. The timeout keeps shutdown and a stalled stream bounded.
+            frameReadyCv.wait_for(lock, std::chrono::milliseconds(8),
+                                  [this] { return frameSeq != lastSeq; });
+            if (frameSeq == lastSeq) {
+                return false; // still nothing — caller retries
+            }
         }
 
-        const size_t bytes = negotiatedBytes;
+        // Only the detection ROI travels to the GPU: the pinned buffer holds just that window
+        // and the H2D lands it in the matching rectangle of the frame. The frame itself keeps
+        // its full screen size, so the caller's crop maths and overlay offsets are unchanged.
+        const int copyW = roiW > 0 ? roiW : width;
+        const int copyH = roiH > 0 ? roiH : height;
+        const size_t widthBytes = static_cast<size_t>(copyW) * 4;
+        const size_t bytes = widthBytes * static_cast<size_t>(copyH);
 
         // Stage under the mutex so the PipeWire thread cannot overwrite the frame while the
         // async H2D below is still queued. Two staging buffers alternate, giving the previous
@@ -922,10 +1006,11 @@ struct LinuxCapture::Impl {
             frame.create(height, width, CV_8UC4);
         }
 
-        const size_t widthBytes = static_cast<size_t>(width) * 4;
+        uint8_t *gpuDst = frame.data + static_cast<size_t>(roiY) * frame.step +
+                          static_cast<size_t>(roiX) * 4;
         cudaError_t cerr =
-            cudaMemcpy2DAsync(frame.data, frame.step, dst, widthBytes, widthBytes,
-                              static_cast<size_t>(height), cudaMemcpyHostToDevice, cudaStream);
+            cudaMemcpy2DAsync(gpuDst, frame.step, dst, widthBytes, widthBytes,
+                              static_cast<size_t>(copyH), cudaMemcpyHostToDevice, cudaStream);
         if (cerr != cudaSuccess) {
             std::cerr << "LinuxCapture: cudaMemcpy2DAsync failed: " << cudaGetErrorString(cerr) << std::endl;
             return false;
@@ -981,7 +1066,16 @@ struct LinuxCapture::Impl {
 // Public API
 // ---------------------------------------------------------------------------
 
-LinuxCapture::LinuxCapture() : m_impl(std::make_unique<Impl>()) {}
+LinuxCapture::LinuxCapture(int targetFps, int roiWidth, int roiHeight)
+    : m_impl(std::make_unique<Impl>(targetFps, roiWidth, roiHeight)) {
+    std::cerr << "LinuxCapture: target capture rate "
+              << (targetFps > 0 ? std::to_string(targetFps) + " fps" : std::string("unlimited"))
+              << std::endl;
+    if (roiWidth > 0 && roiHeight > 0) {
+        std::cerr << "LinuxCapture: detection ROI " << roiWidth << "x" << roiHeight
+                  << " (only that window is copied per frame)" << std::endl;
+    }
+}
 
 LinuxCapture::~LinuxCapture() = default;
 

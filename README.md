@@ -159,7 +159,7 @@ Labels       = player                   # class names
 # Capture
 CaptureWidth  = 640
 CaptureHeight = 640
-CaptureFPS    = 240
+CaptureFPS    = 160
 
 # Detection
 HeadLabelID1  = 0                       # primary head class id

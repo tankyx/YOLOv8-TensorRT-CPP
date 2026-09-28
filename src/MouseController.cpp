@@ -1,8 +1,10 @@
 #include "MouseController.h"
 
 #ifndef _WIN32
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <glob.h>
@@ -245,12 +247,24 @@ bool MouseController::ConnectToDevice() {
     return true;
 }
 
+static int evdevNodeIndex(const char *path) {
+    const char *slash = std::strrchr(path, '/');
+    return std::atoi(slash ? slash + 6 : path); // skip the "/event" prefix
+}
+
 bool MouseController::openInputDevices() {
     glob_t g {};
-    if (glob("/dev/input/event[0-9]*", 0, nullptr, &g) != 0) {
+    // glob() orders entries lexicographically by default, so "event10" sorts
+    // before "event2": high-numbered virtual nodes (bridge passthrough, uinput
+    // clones) would shadow the physical devices that enumerate first. Sort
+    // numerically so the lowest-numbered matching nodes are preferred.
+    if (glob("/dev/input/event[0-9]*", GLOB_NOSORT, nullptr, &g) != 0) {
         globfree(&g);
         return false;
     }
+    std::sort(g.gl_pathv, g.gl_pathv + g.gl_pathc, [](const char *a, const char *b) {
+        return evdevNodeIndex(a) < evdevNodeIndex(b);
+    });
 
     constexpr size_t keyWords = (KEY_MAX + 8 * sizeof(unsigned long)) / (8 * sizeof(unsigned long));
     constexpr size_t relWords = (REL_MAX + 8 * sizeof(unsigned long)) / (8 * sizeof(unsigned long));

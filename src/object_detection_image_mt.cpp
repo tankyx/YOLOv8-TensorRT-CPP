@@ -117,7 +117,7 @@ void ObjectDetectionSystem::loadConfigFromINI(const std::string &iniFile) {
 
     captureWidth  = config.getInt("CaptureWidth", 640);
     captureHeight = config.getInt("CaptureHeight", 640);
-    captureFPS    = config.getInt("CaptureFPS", 240);
+    captureFPS    = config.getInt("CaptureFPS", 160); // Linux capture-rate cap (0 = unlimited)
 
     pinThreads         = config.getBool("PinThreads", false);
     captureThreadCore  = config.getInt("CaptureThreadCore", 0);
@@ -160,7 +160,7 @@ void ObjectDetectionSystem::initializeSystem() {
 #else
     // On Linux the capture backend (PipeWire portal) knows the real screen size;
     // create it up-front so MouseController gets correct dimensions.
-    capture = std::make_unique<ScreenCapture>();
+    capture = std::make_unique<ScreenCapture>(captureFPS, captureWidth, captureHeight);
     screenWidth  = capture->screenWidth();
     screenHeight = capture->screenHeight();
 #endif
@@ -369,6 +369,12 @@ void ObjectDetectionSystem::captureThread() {
                 cudaStreamSynchronize(captureStream);
                 gpuCaptureQueue.push(std::move(*currentFrame));
                 std::swap(currentFrame, nextFrame);
+            } else {
+                // No new frame. On Linux CaptureScreen itself waited ~8 ms for the PipeWire
+                // callback to publish one, so this is the rare fallback (stalled stream or a
+                // compositor slower than that window) rather than the steady-state poll.
+                // Windows DXGI still returns immediately, so there this nap is the poll rate.
+                std::this_thread::sleep_for(std::chrono::microseconds(250));
             }
 
             auto end = std::chrono::high_resolution_clock::now();
@@ -457,6 +463,9 @@ void ObjectDetectionSystem::detectionThread() {
                     b.confidence = d.probability;
                     boxes.push_back(b);
                 }
+                // Boxes are in captured-frame pixels; the overlay maps them onto
+                // whatever surface/buffer size it actually draws into.
+                debugOverlay->setSourceSize(frame.cols, frame.rows);
                 debugOverlay->setDetections(std::move(boxes));
                 debugOverlay->setStats(detectionLatency.getAverageLatency(), 0);
                 auto tR2 = std::chrono::high_resolution_clock::now();

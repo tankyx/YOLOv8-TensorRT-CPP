@@ -63,6 +63,12 @@ public:
     void setDetections(std::vector<DetectionBox> boxes);
     void setStats(double detectMs, int fps);
 
+    // Pixel space the incoming boxes are expressed in (the captured output's
+    // size). The layer surface can be configured at a different size, so paint()
+    // maps boxes by surface/source. 0 (default) falls back to the size passed to
+    // the constructor.
+    void setSourceSize(int w, int h);
+
 private:
     struct Buffer {
         wl_buffer *buffer = nullptr;
@@ -106,6 +112,9 @@ private:
     std::vector<OutputInfo *> _outputs;
     int _preferredW = 0; // captured output size, for pickOutput()
     int _preferredH = 0;
+
+    std::atomic<int> _sourceW{0}; // setSourceSize(); 0 = use _preferred* above
+    std::atomic<int> _sourceH{0};
 
     Buffer _buffers[2];
     Buffer *_lastAttached = nullptr; // buffer content currently on screen

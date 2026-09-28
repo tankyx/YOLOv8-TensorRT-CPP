@@ -23,15 +23,26 @@ public:
     // Runs the full portal handshake (D-Bus) and connects the PipeWire stream.
     // Throws std::runtime_error on hard failure (no session bus, portal refused,
     // PipeWire connect failed). May block on the KDE permission dialog the first time.
-    LinuxCapture();
+    // `targetFps` caps the rate at which frames are copied to the GPU (0 = unlimited).
+    // The value is offered to the portal as the stream framerate and enforced again in
+    // the PipeWire callback, so the host copies never run at the compositor's delivery
+    // rate (which scales with the game's own frame rate).
+    //
+    // `roiWidth`/`roiHeight` describe the centred window the caller actually uses
+    // (CaptureWidth/CaptureHeight in the ini). Only that window is copied host-side and
+    // uploaded; the GpuMat keeps its full screen size, so the caller's crop maths and
+    // overlay offsets stay unchanged. 0x0 copies the whole frame.
+    explicit LinuxCapture(int targetFps = 0, int roiWidth = 0, int roiHeight = 0);
     ~LinuxCapture();
 
     LinuxCapture(const LinuxCapture &) = delete;
     LinuxCapture &operator=(const LinuxCapture &) = delete;
 
-    // Capture one frame into `frame` (CV_8UC4 BGRA). Sized to the screen resolution; the
-    // caller crops to ROI afterwards. Returns false when no new frame is available yet
-    // (caller retries next loop iteration), true when a fresh frame was copied onto `stream`.
+    // Capture one frame into `frame` (CV_8UC4 BGRA). Sized to the screen resolution; only the
+    // configured ROI window is refreshed (nothing reads the rest, so it keeps its previous
+    // contents) — host traffic is (ROI area / frame area) of the old full-frame copy. Blocks
+    // up to ~8 ms waiting for a new frame, then returns false if none arrived (so callers need
+    // not poll); returns true when a fresh frame was copied onto `stream`.
     bool CaptureScreen(cv::cuda::GpuMat &frame, cudaStream_t stream);
 
     int screenWidth() const;

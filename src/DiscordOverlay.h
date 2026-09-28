@@ -13,6 +13,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -100,6 +101,11 @@ private:
     OverlayHeader *_mappedHeader{nullptr};
     UINT           _bufferWidth{0};
     UINT           _bufferHeight{0};
+
+    // Pixel space the incoming boxes are expressed in (captured output size).
+    // 0 = unknown, render() then draws 1:1 as before.
+    std::atomic<UINT> _srcWidth{0};
+    std::atomic<UINT> _srcHeight{0};
 
     // D2D / DWrite / WIC — touched ONLY from the render thread
     ID2D1Factory       *_d2dFactory{nullptr};
@@ -306,15 +312,26 @@ private:
 
         _currentDirty.reset();
 
+        // Incoming boxes are in the captured output's pixel space; the Discord
+        // framebuffer is the game's own render target (scaled / windowed game
+        // resolution). Scale between the two so boxes land on the same spot on
+        // screen. Source size 0 keeps the previous 1:1 behaviour.
+        const UINT  srcW = _srcWidth.load(std::memory_order_relaxed);
+        const UINT  srcH = _srcHeight.load(std::memory_order_relaxed);
+        const float sx = srcW > 0 ? static_cast<float>(_bufferWidth)  / static_cast<float>(srcW) : 1.0f;
+        const float sy = srcH > 0 ? static_cast<float>(_bufferHeight) / static_cast<float>(srcH) : 1.0f;
+        const float pad = 2.0f * (sx > sy ? sx : sy); // dirty rects live in buffer space
+
         _renderTarget->BeginDraw();
         _renderTarget->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f));
+        _renderTarget->SetTransform(D2D1::Matrix3x2F::Scale(sx, sy));
 
         // Detection boxes + labels
         for (const auto &d : dets) {
             D2D1_RECT_F rect = D2D1::RectF(d.x, d.y, d.x + d.w, d.y + d.h);
             ID2D1SolidColorBrush *brush = _redBrush; // simplest scheme: any class -> red
             _renderTarget->DrawRectangle(rect, brush, 1.5f);
-            _currentDirty.extendBox(d.x, d.y, d.x + d.w, d.y + d.h, 2.0f);
+            _currentDirty.extendBox(d.x * sx, d.y * sy, (d.x + d.w) * sx, (d.y + d.h) * sy, pad);
 
             if (_labelFormat) {
                 wchar_t labelBuf[64];
@@ -325,11 +342,13 @@ private:
                 swprintf_s(labelBuf, L"%ls %.0f%%", wide.c_str(), d.confidence * 100.0f);
                 D2D1_RECT_F textRect = D2D1::RectF(d.x, (std::max)(0.f, d.y - 14.f), d.x + 200.f, d.y);
                 _renderTarget->DrawText(labelBuf, static_cast<UINT32>(wcslen(labelBuf)), _labelFormat, textRect, brush);
-                _currentDirty.extendBox(textRect.left, textRect.top, textRect.right, textRect.bottom, 2.0f);
+                _currentDirty.extendBox(textRect.left * sx, textRect.top * sy,
+                                        textRect.right * sx, textRect.bottom * sy, pad);
             }
         }
 
-        // Stats line top-left
+        // Stats line top-left — screen-space HUD, drawn unscaled.
+        _renderTarget->SetTransform(D2D1::Matrix3x2F::Identity());
         if (_statsFormat) {
             wchar_t statsBuf[96];
             swprintf_s(statsBuf, L"YOLO  det=%.2fms  fps=%d  n=%zu", latencyMs, fps, dets.size());
@@ -408,6 +427,14 @@ public:
     }
 
     bool isRunning() const { return _mappedHeader != nullptr && _running.load(std::memory_order_relaxed); }
+
+    // The Discord framebuffer is the game's own render target, which can differ
+    // in size from the captured desktop (scaled / windowed game resolution).
+    // Declaring the source space lets render() scale boxes onto it.
+    void setSourceSize(int w, int h) {
+        _srcWidth.store(w > 0 ? static_cast<UINT>(w) : 0u, std::memory_order_relaxed);
+        _srcHeight.store(h > 0 ? static_cast<UINT>(h) : 0u, std::memory_order_relaxed);
+    }
 
     UINT getBufferWidth() const { return _bufferWidth; }
     UINT getBufferHeight() const { return _bufferHeight; }

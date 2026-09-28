@@ -497,8 +497,26 @@ void LinuxOverlay::paint(Buffer &buf) {
     std::vector<Item> items;
     items.reserve(_boxes.size());
 
-    IntRect scene = statsRect;
+    // Boxes arrive in the captured output's pixel space; the layer surface can be
+    // configured at a different size, so map them onto the surface once here.
+    const int srcW = _sourceW.load(std::memory_order_relaxed) > 0 ? _sourceW.load(std::memory_order_relaxed) : _preferredW;
+    const int srcH = _sourceH.load(std::memory_order_relaxed) > 0 ? _sourceH.load(std::memory_order_relaxed) : _preferredH;
+    const float sx = (srcW > 0 && _width  > 0) ? static_cast<float>(_width)  / static_cast<float>(srcW) : 1.0f;
+    const float sy = (srcH > 0 && _height > 0) ? static_cast<float>(_height) / static_cast<float>(srcH) : 1.0f;
+
+    std::vector<DetectionBox> mapped;
+    mapped.reserve(_boxes.size());
     for (const auto &b : _boxes) {
+        DetectionBox m = b;
+        m.x = b.x * sx;
+        m.y = b.y * sy;
+        m.w = b.w * sx;
+        m.h = b.h * sy;
+        mapped.push_back(m);
+    }
+
+    IntRect scene = statsRect;
+    for (const auto &b : mapped) {
         if (!std::isfinite(b.x) || !std::isfinite(b.y) ||
             !std::isfinite(b.w) || !std::isfinite(b.h)) continue;
 
@@ -701,6 +719,11 @@ void LinuxOverlay::stop() {
 void LinuxOverlay::setLabelNames(const std::vector<std::string> &names) {
     std::lock_guard<std::mutex> lk(_stateMutex);
     _sharedLabels = names;
+}
+
+void LinuxOverlay::setSourceSize(int w, int h) {
+    _sourceW.store(w > 0 ? w : 0, std::memory_order_relaxed);
+    _sourceH.store(h > 0 ? h : 0, std::memory_order_relaxed);
 }
 
 void LinuxOverlay::setDetections(std::vector<DetectionBox> boxes) {
