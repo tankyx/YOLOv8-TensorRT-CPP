@@ -218,8 +218,8 @@ protected:
             return false;
         }
 
-        auto explicitBatch = 1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
-        auto network = std::unique_ptr<nvinfer1::INetworkDefinition>(builder->createNetworkV2(explicitBatch));
+        // TensorRT 10+ only supports explicit-batch networks; TRT 11 removed the flag entirely.
+        auto network = std::unique_ptr<nvinfer1::INetworkDefinition>(builder->createNetworkV2(0));
         if (!network) {
             return false;
         }

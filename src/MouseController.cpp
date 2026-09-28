@@ -1,5 +1,17 @@
 #include "MouseController.h"
 
+#ifndef _WIN32
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <fcntl.h>
+#include <glob.h>
+#include <linux/input.h>
+#include <linux/uinput.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#endif
+
 
 MouseController::MouseController(int screenWidth, int screenHeight, int detectionZoneWidth, int detectionZoneHeight, float sensitivity,
                                  int centralSquareSize, float minGain, float maxGain, float maxSpeed, int HL1, int HL2, int cpi, int nLab,
@@ -7,7 +19,11 @@ MouseController::MouseController(int screenWidth, int screenHeight, int detectio
                                  float smoothing, float debugSnapGain, bool debugAimEnabled)
     : screenWidth(screenWidth), screenHeight(screenHeight), detectionZoneWidth(detectionZoneWidth),
       detectionZoneHeight(detectionZoneHeight), sensitivity(sensitivity), centralSquareSize(centralSquareSize),
-      minGain(minGain), maxSpeed(maxSpeed), maxGain(maxGain), hidDevice(nullptr), headLabel1(HL1), headLabel2(HL2), cpi(cpi), nLabels(nLab),
+      minGain(minGain), maxSpeed(maxSpeed), maxGain(maxGain),
+#ifdef _WIN32
+      hidDevice(nullptr),
+#endif
+      headLabel1(HL1), headLabel2(HL2), cpi(cpi), nLabels(nLab),
       probabilityThreshold(probabilityThreshold), hidVendorId(hidVendorId), hidProductId(hidProductId), hidSerial(std::move(hidSerial)) {
     setDebugSnapGain(debugSnapGain);
     setDebugAimEnabled(debugAimEnabled);
@@ -52,15 +68,32 @@ std::pair<float, float> MouseController::pixelDeltaToCounts(float deltaX, float 
     if (deltaX == 0.0f && deltaY == 0.0f) return {0.0f, 0.0f};
     const float angleX = atan2f(deltaX, m_focalLength);
     const float angleY = atan2f(deltaY, m_focalLength);
-    return {angleX / m_anglePerCountRad, angleY / m_anglePerCountRad};
+    return {_countsScale * angleX / m_anglePerCountRad, _countsScale * angleY / m_anglePerCountRad};
 }
 
 MouseController::~MouseController() {
+#ifdef _WIN32
     if (hidDevice) {
         CloseHandle(hidDevice);
     }
+#else
+    if (m_uinputFd >= 0) {
+        ioctl(m_uinputFd, UI_DEV_DESTROY);
+        close(m_uinputFd);
+        m_uinputFd = -1;
+    }
+    if (m_evdevMouseFd >= 0) {
+        close(m_evdevMouseFd);
+        m_evdevMouseFd = -1;
+    }
+    if (m_evdevKbdFd >= 0) {
+        close(m_evdevKbdFd);
+        m_evdevKbdFd = -1;
+    }
+#endif
 }
 
+#ifdef _WIN32
 bool MouseController::ConnectToDevice() {
     // Initialize HID library
     GUID hidGuid;
@@ -152,6 +185,136 @@ bool MouseController::ConnectToDevice() {
     std::cout << "Device opened successfully" << std::endl;
     return true;
 }
+#else
+namespace {
+// Test whether bit `code` is set in an EVIOCGBIT capability bitmask.
+bool evdevHasBit(const unsigned long *bits, size_t wordCount, unsigned int code) {
+    constexpr size_t wordBits = sizeof(unsigned long) * 8;
+    if (code / wordBits >= wordCount) return false;
+    return (bits[code / wordBits] >> (code % wordBits)) & 1UL;
+}
+} // namespace
+
+bool MouseController::ConnectToDevice() {
+    // Output side: create a virtual mouse on /dev/uinput. Movement and click
+    // reports are emitted as evdev events (see sendHIDReport).
+    m_uinputFd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+    if (m_uinputFd < 0) {
+        std::cerr << "MouseController: cannot open /dev/uinput: " << std::strerror(errno) << ". "
+                  << "Add your user to the 'input' group and install a udev rule such as "
+                  << "KERNEL==\"uinput\", MODE=\"0660\", GROUP=\"input\", OPTIONS+=\"static_node=uinput\" "
+                  << "(then re-login). Aim/click output is disabled." << std::endl;
+        return false;
+    }
+
+    if (ioctl(m_uinputFd, UI_SET_EVBIT, EV_REL) < 0 ||
+        ioctl(m_uinputFd, UI_SET_RELBIT, REL_X) < 0 ||
+        ioctl(m_uinputFd, UI_SET_RELBIT, REL_Y) < 0 ||
+        ioctl(m_uinputFd, UI_SET_EVBIT, EV_KEY) < 0 ||
+        ioctl(m_uinputFd, UI_SET_KEYBIT, BTN_LEFT) < 0 ||
+        ioctl(m_uinputFd, UI_SET_KEYBIT, BTN_RIGHT) < 0 ||
+        ioctl(m_uinputFd, UI_SET_KEYBIT, BTN_MIDDLE) < 0) {
+        std::cerr << "MouseController: uinput capability setup failed: " << std::strerror(errno) << std::endl;
+        close(m_uinputFd);
+        m_uinputFd = -1;
+        return false;
+    }
+
+    struct uinput_setup setup {};
+    std::snprintf(setup.name, UINPUT_MAX_NAME_SIZE, "yolo-virtual-mouse");
+    setup.id.bustype = BUS_USB;
+    setup.id.vendor = hidVendorId;
+    setup.id.product = hidProductId;
+    setup.id.version = 1;
+
+    if (ioctl(m_uinputFd, UI_DEV_SETUP, &setup) < 0 || ioctl(m_uinputFd, UI_DEV_CREATE) < 0) {
+        std::cerr << "MouseController: uinput device creation failed: " << std::strerror(errno) << std::endl;
+        close(m_uinputFd);
+        m_uinputFd = -1;
+        return false;
+    }
+    std::cout << "Virtual mouse created on /dev/uinput" << std::endl;
+
+    // Input side: locate the physical mouse (and a keyboard for the trigger
+    // hold key). Without these, button queries gracefully read as released.
+    if (!openInputDevices()) {
+        std::cerr << "MouseController: no readable physical mouse/keyboard under /dev/input/. "
+                  << "Button/trigger state will read as not pressed. Add your user to the "
+                  << "'input' group or install a udev rule for /dev/input/event* (then re-login)." << std::endl;
+    }
+    return true;
+}
+
+bool MouseController::openInputDevices() {
+    glob_t g {};
+    if (glob("/dev/input/event[0-9]*", 0, nullptr, &g) != 0) {
+        globfree(&g);
+        return false;
+    }
+
+    constexpr size_t keyWords = (KEY_MAX + 8 * sizeof(unsigned long)) / (8 * sizeof(unsigned long));
+    constexpr size_t relWords = (REL_MAX + 8 * sizeof(unsigned long)) / (8 * sizeof(unsigned long));
+
+    for (size_t i = 0; i < g.gl_pathc && (m_evdevMouseFd < 0 || m_evdevKbdFd < 0); ++i) {
+        const int fd = open(g.gl_pathv[i], O_RDONLY | O_NONBLOCK);
+        if (fd < 0) continue; // permission denied or node vanished — try the next one
+
+        char name[256] = {0};
+        if (ioctl(fd, EVIOCGNAME(sizeof(name) - 1), name) < 0) name[0] = '\0';
+        // Never read back our own synthetic device (or any other uinput clone).
+        if (std::strcmp(name, "yolo-virtual-mouse") == 0 || std::strstr(name, "uinput") != nullptr) {
+            close(fd);
+            continue;
+        }
+
+        unsigned long keyBits[keyWords] = {0};
+        unsigned long relBits[relWords] = {0};
+        ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keyBits)), keyBits);
+        ioctl(fd, EVIOCGBIT(EV_REL, sizeof(relBits)), relBits);
+        const bool hasRelX = evdevHasBit(relBits, relWords, REL_X);
+
+        // Physical mouse: relative X movement plus a left button.
+        if (m_evdevMouseFd < 0 && hasRelX && evdevHasBit(keyBits, keyWords, BTN_LEFT)) {
+            m_evdevMouseFd = fd;
+            std::cout << "Physical mouse: " << g.gl_pathv[i] << " (" << name << ")" << std::endl;
+            continue;
+        }
+        // Keyboard: has the trigger key plus real alpha keys, and no relative axes
+        // (avoids matching mice that expose a few key codes).
+        if (m_evdevKbdFd < 0 && !hasRelX && evdevHasBit(keyBits, keyWords, KEY_LEFTSHIFT) &&
+            evdevHasBit(keyBits, keyWords, KEY_A)) {
+            m_evdevKbdFd = fd;
+            std::cout << "Trigger-key keyboard: " << g.gl_pathv[i] << " (" << name << ")" << std::endl;
+            continue;
+        }
+        close(fd);
+    }
+    globfree(&g);
+    return m_evdevMouseFd >= 0 && m_evdevKbdFd >= 0;
+}
+
+void MouseController::drainInputDevices() {
+    struct input_event ev {};
+    if (m_evdevMouseFd >= 0) {
+        while (read(m_evdevMouseFd, &ev, sizeof(ev)) == static_cast<ssize_t>(sizeof(ev))) {
+            if (ev.type == EV_KEY) {
+                if (ev.code == BTN_LEFT) {
+                    m_leftPressed = (ev.value != 0);
+                } else if (ev.code == BTN_RIGHT) {
+                    m_rightPressed = (ev.value != 0);
+                }
+            }
+        }
+    }
+    if (m_evdevKbdFd >= 0) {
+        while (read(m_evdevKbdFd, &ev, sizeof(ev)) == static_cast<ssize_t>(sizeof(ev))) {
+            if (ev.type == EV_KEY && ev.code == KEY_LEFTSHIFT) {
+                m_triggerKeyHeld = (ev.value != 0);
+            }
+        }
+    }
+}
+#endif
 
 void MouseController::setCrosshairPosition(int x, int y) {
     crosshairX = x;
@@ -166,6 +329,7 @@ void MouseController::applyRecoilCompensation(float dx, float dy) {
     }
 }
 
+#ifdef _WIN32
 bool MouseController::processHIDReport(std::vector<uint8_t> &report) {
     if (hidDevice == nullptr) {
         if (!hidWarningLogged) {
@@ -197,7 +361,9 @@ bool MouseController::processHIDReport(std::vector<uint8_t> &report) {
     // be present but transiently unavailable (e.g. USB suspend). Drop the report this tick.
     return false;
 }
+#endif
 
+#ifdef _WIN32
 void MouseController::sendHIDReport(int16_t dx, int16_t dy, uint8_t button) {
     // Create a 64-byte report
     std::vector<uint8_t> report(65, 0);
@@ -214,6 +380,45 @@ void MouseController::sendHIDReport(int16_t dx, int16_t dy, uint8_t button) {
 
     processHIDReport(report);
 }
+#else
+void MouseController::sendHIDReport(int16_t dx, int16_t dy, uint8_t button) {
+    if (m_uinputFd < 0) {
+        if (!hidWarningLogged) {
+            std::cerr << "MouseController: uinput device unavailable; aim/click suppressed until reconnect." << std::endl;
+            hidWarningLogged = true;
+        }
+        ConnectToDevice();
+        if (m_uinputFd < 0) return;
+    }
+
+    // Mirror the Windows report semantics: dx/dy little-endian deltas plus a
+    // button byte whose bit0 is LMB (see the report layout above). BTN_LEFT
+    // is re-emitted on every report just like the firmware re-applies the
+    // button byte; the kernel dedupes unchanged key states.
+    auto emit = [this](uint16_t type, uint16_t code, int32_t value) {
+        struct input_event ev {};
+        ev.type = type;
+        ev.code = code;
+        ev.value = value;
+        return write(m_uinputFd, &ev, sizeof(ev)) == static_cast<ssize_t>(sizeof(ev));
+    };
+
+    bool ok = true;
+    if (dx != 0) ok = emit(EV_REL, REL_X, dx) && ok;
+    if (dy != 0) ok = emit(EV_REL, REL_Y, dy) && ok;
+    ok = emit(EV_KEY, BTN_LEFT, (button & 0x01) ? 1 : 0) && ok;
+    ok = emit(EV_SYN, SYN_REPORT, 0) && ok;
+
+    if (!ok) {
+        std::cerr << "MouseController: uinput write failed: " << std::strerror(errno)
+                  << ". Will recreate the device on next call." << std::endl;
+        close(m_uinputFd);
+        m_uinputFd = -1;
+        return;
+    }
+    hidWarningLogged = false;
+}
+#endif
 
 float MouseController::calculateSpeedScaling(const cv::Rect &rect) {
     // Define the thresholds for small, medium, and large detection boxes
@@ -324,17 +529,70 @@ void MouseController::aim(const std::vector<Object> &detections) {
     float movementX;
     float movementY;
     if (clickThrough) {
-        // LMB path: lower base gain to reduce oscillation from aim-punch.
-        // Aim punch moves the detection box, and a high gain chases it too
-        // aggressively.  Ceiling also lowered from 0.55 → 0.40.
+        // LMB path: fixed-fraction tracking identical to CS2Miam's spraying
+        // formula (aimbot.hpp) — per-frame gain = _smoothVal * AIM_SPEED, flat
+        // with distance. At Smoothing=4 that's 0.25 per tick, replacing the old
+        // distance-boosted gain (up to 0.40 near the target) that snapped.
         _bezier.deactivate();
         auto [fullCountX, fullCountY] = pixelDeltaToCounts(movePxX, movePxY);
-        const float baseGain = (std::max)(0.04f, 0.20f - _smoothVal * 0.25f);
-        const float t = 1.0f - distToBox / 80.0f;
-        const float gain = baseGain + (0.40f - baseGain) * (t > 0.0f ? t : 0.0f);
-        movementX = fullCountX * gain;
-        movementY = fullCountY * gain;
+        movementX = fullCountX * _smoothVal * AIM_SPEED;
+        movementY = fullCountY * _smoothVal * AIM_SPEED;
     } else {
+#ifndef _WIN32
+        // Linux input-path auto-calibration. The delivery chain (compositor,
+        // session scaling) can amplify raw counts by an unknown factor k. On
+        // the first RMB press with a target, send a fixed count burst, then
+        // measure how far the SAME target actually moved on screen (we capture
+        // it): k = observed_px / expected_px, and _countsScale = 1/k. Skipped
+        // when the user set CountsScale explicitly in the INI.
+        if (_countsScale == 1.0f && _calState != CAL_DONE) {
+            const float boxCX = (boxL + boxR) * 0.5f;
+            const float boxCY = (boxT + boxB) * 0.5f;
+            if (_calState == CAL_IDLE) {
+                _calTargetX = boxCX;
+                _calTargetY = boxCY;
+                _calLabel = closest.label;
+                sendHIDReport(CAL_COUNTS, 0, 0x00);
+                _calWaitFrames = 3; // let the view settle (~15 ms)
+                _calState = CAL_SENT;
+                return;
+            }
+            if (_calState == CAL_SENT) {
+                if (--_calWaitFrames > 0) {
+                    return;
+                }
+                _calState = CAL_MEASURE;
+                return;
+            }
+            if (_calState == CAL_MEASURE) {
+                // The view rotated right, so the scene shifted LEFT by the
+                // pixel distance matching the rotation.
+                const float expectedPx =
+                    m_focalLength * tanf(static_cast<float>(CAL_COUNTS) * m_anglePerCountRad);
+                const float observedPx = _calTargetX - boxCX;
+                if (closest.label == _calLabel && std::abs(boxCY - _calTargetY) < 80.0f &&
+                    observedPx > expectedPx * 0.2f) {
+                    const float k = observedPx / expectedPx;
+                    _countsScale = std::clamp(1.0f / k, 0.05f, 4.0f);
+                    std::cout << "[MouseController] Auto-calibration: sent " << CAL_COUNTS
+                              << " counts, target moved " << observedPx << "px (expected "
+                              << expectedPx << "px) -> amplification x" << k
+                              << ", CountsScale=" << _countsScale << std::endl;
+                    _calState = CAL_DONE;
+                    return;
+                }
+                // Target lost or ambiguous (left the ROI) — retry once from scratch.
+                if (_calRetries++ < 3) {
+                    _calState = CAL_IDLE;
+                } else {
+                    std::cerr << "[MouseController] Auto-calibration failed (target lost); "
+                                 "keeping CountsScale=1. Set it manually in the INI." << std::endl;
+                    _calState = CAL_DONE;
+                }
+                return;
+            }
+        }
+#endif
         // RMB debug path: snap to box centre (pixel-perfect at gain=1.0).
         _bezier.deactivate();
         const float boxCX = (boxL + boxR) * 0.5f;
@@ -366,9 +624,52 @@ void MouseController::aim(const std::vector<Object> &detections) {
     }
 }
 
+#ifdef _WIN32
 bool MouseController::isLeftMouseButtonPressed() { return (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0; }
 bool MouseController::isRightMouseButtonPressed() { return (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0; }
 bool MouseController::isTriggerKeyPressed() { return (GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0; } // Triggerbot hold key
+#else
+bool MouseController::isLeftMouseButtonPressed() {
+    if (m_evdevMouseFd < 0) {
+        if (!m_evdevWarnLogged) {
+            std::cerr << "MouseController: no readable physical mouse evdev node; "
+                      << "button queries return false. Check 'input' group / udev permissions." << std::endl;
+            m_evdevWarnLogged = true;
+        }
+        return false;
+    }
+    drainInputDevices();
+    return m_leftPressed;
+}
+
+bool MouseController::isRightMouseButtonPressed() {
+    if (m_evdevMouseFd < 0) {
+        if (!m_evdevWarnLogged) {
+            std::cerr << "MouseController: no readable physical mouse evdev node; "
+                      << "button queries return false. Check 'input' group / udev permissions." << std::endl;
+            m_evdevWarnLogged = true;
+        }
+        return false;
+    }
+    drainInputDevices();
+    return m_rightPressed;
+}
+
+// Triggerbot hold key: VK_LSHIFT on Windows -> KEY_LEFTSHIFT on Linux, read
+// from a keyboard evdev node (mouse nodes don't carry keyboard keys).
+bool MouseController::isTriggerKeyPressed() {
+    if (m_evdevKbdFd < 0) {
+        if (!m_evdevWarnLogged) {
+            std::cerr << "MouseController: no readable keyboard evdev node; "
+                      << "trigger key queries return false. Check 'input' group / udev permissions." << std::endl;
+            m_evdevWarnLogged = true;
+        }
+        return false;
+    }
+    drainInputDevices();
+    return m_triggerKeyHeld;
+}
+#endif
 
 void MouseController::leftClick() { sendHIDReport(0, 0, 0x01); }
 

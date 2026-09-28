@@ -8,10 +8,13 @@
 #include <random>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
 #include <windows.h>
 #include <setupapi.h>
 #include <hidsdi.h>
 #include <hidclass.h>
+#endif
 
 // Cubic-bezier path generator for screen-space mouse smoothing. Ported from
 // CS2Miam (bezier_curve.hpp) using cv::Point2f instead of Vector3 since we
@@ -91,6 +94,11 @@ public:
     void setSmoothing(float userVal);
     void setDebugSnapGain(float g) { _debugSnapGain = (std::max)(0.1f, g); }
     void setDebugAimEnabled(bool e) { _debugAimEnabled = e; }
+    // Global multiplier on pixelDeltaToCounts output (both LMB and RMB paths).
+    // Compensates input-delivery scaling of the OS session (compositor pointer
+    // scaling, fractional display scale). Calibrate with the RMB snap: lower it
+    // until the snap lands exactly on target. 1.0 = no compensation.
+    void setCountsScale(float s) { _countsScale = std::clamp(s, 0.05f, 4.0f); }
     float getSmoothing() const { return _userSmoothing; }
     void setGameCalibration(float sens, float fov, const std::string& game);
     ~MouseController();
@@ -120,7 +128,21 @@ private:
     int maxSpeed;
     float minGain;
     float maxGain;
+#ifdef _WIN32
     HANDLE hidDevice;
+#else
+    // Linux I/O: movement/click output goes to a virtual mouse created on
+    // /dev/uinput; physical button/trigger state is read from evdev nodes
+    // found at connect time (mouse for BTN_LEFT/BTN_RIGHT, keyboard for the
+    // trigger hold key). Cached states are refreshed by drainInputDevices().
+    int m_uinputFd = -1;
+    int m_evdevMouseFd = -1;
+    int m_evdevKbdFd = -1;
+    bool m_leftPressed = false;
+    bool m_rightPressed = false;
+    bool m_triggerKeyHeld = false;
+    bool m_evdevWarnLogged = false;
+#endif
 
     int headLabel1;
     int headLabel2;
@@ -164,18 +186,38 @@ private:
     // sensitivity calibration so the snap actually arrives in one tick.
     float _debugSnapGain = 3.0f;
 
+    // See setCountsScale(). Applied uniformly to both aim paths.
+    float _countsScale = 1.0f;
+
+#ifndef _WIN32
+    // RMB auto-calibration state (see aim()'s debug branch). Measures the
+    // Linux input-path amplification with a known count burst.
+    enum CalState : int { CAL_IDLE = 0, CAL_SENT = 1, CAL_MEASURE = 2, CAL_DONE = 3 };
+    static constexpr int CAL_COUNTS = 300;
+    int _calState = CAL_IDLE;
+    int _calWaitFrames = 0;
+    int _calRetries = 0;
+    float _calTargetX = 0.0f;
+    float _calTargetY = 0.0f;
+    int _calLabel = -1;
+#endif
+
     // Gate for the RMB-only debug aim path. When false, RMB does nothing —
     // only LMB triggers the smoothed aim.
     bool _debugAimEnabled = true;
 
+    // LMB per-frame gain is _smoothVal * AIM_SPEED — CS2Miam's fixed-fraction
+    // (spraying) formula from aimbot.hpp, so the convergence curve matches the
+    // reference project tick for tick. Flat with distance: no close-range boost.
+    static constexpr float AIM_SPEED = 3.75f;
+
     static float smoothingToInternal(float userVal) {
-        // Smoothing knob 1-10 → per-frame multiplier in [0.005, 0.50]. The bezier
-        // consumes this as (1 - multiplier) progress per tick, so userVal=1 yields
-        // multiplier ≈ 0 → progress ≈ 1 → snap, and userVal=10 yields multiplier 0.5
-        // → progress 0.5 → smooth. Wider than CS2Miam's original 90-100 band which
-        // capped progress at 10% per frame — too conservative for a ~220 Hz pipeline.
+        // CS2Miam mapping (aimbot.hpp::smoothingToInternal): knob 1-10 →
+        // percentage 90-100 → multiplier in [0.10, 0.005]. Combined with
+        // AIM_SPEED the effective per-frame gain spans [0.375, 0.019];
+        // knob=4 yields 0.25.
         const float clamped = std::clamp(userVal, 1.0f, 10.0f);
-        return (std::max)(0.005f, (clamped - 1.0f) * (0.5f / 9.0f));
+        return (std::max)(0.005f, 0.1f - (clamped - 1.0f) / 90.0f);
     }
 
     // Non-blocking trigger-click state machine (c12). Cooldown between releases
@@ -198,6 +240,11 @@ private:
     Object findClosestDetection(const std::vector<Object> &detections);
     void sendHIDReport(int16_t dx, int16_t dy, uint8_t button);
     bool ConnectToDevice();
+#ifdef _WIN32
     bool processHIDReport(std::vector<uint8_t> &report);
+#else
+    bool openInputDevices();
+    void drainInputDevices();
+#endif
     float calculateSpeedScaling(const cv::Rect &rect);
 };

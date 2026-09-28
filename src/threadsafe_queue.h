@@ -184,6 +184,19 @@ public:
         return frame;
     }
 
+    // Timed variant: returns false on timeout so the consumer can re-check its
+    // stop flag (plain pop() would block forever once frames stop flowing,
+    // e.g. a static screen under PipeWire damage-only delivery).
+    bool popFor(cv::cuda::GpuMat &out, std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (!cond_var_.wait_for(lock, timeout, [this] { return !queue_.empty(); })) {
+            return false;
+        }
+        out = std::move(queue_.front());
+        queue_.pop();
+        return true;
+    }
+
 private:
     std::queue<cv::cuda::GpuMat> queue_;
     std::mutex mutex_;

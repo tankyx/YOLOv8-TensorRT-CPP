@@ -8,6 +8,8 @@ This is a C++ implementation of YOLOv8 object detection using NVIDIA TensorRT fo
 
 ## Build Commands
 
+### Windows
+
 ```bash
 # Configure build
 mkdir build && cd build
@@ -19,6 +21,28 @@ cmake --build . --config Release
 # Install binaries
 cmake --install .
 ```
+
+### Linux (Wayland/KDE, Arch/CachyOS)
+
+Dependencies: `cuda`, `opencv-cuda` (AUR), `tensorrt` (AUR, 11.x). The user must
+be in the `input` group (for `/dev/uinput` + evdev) — re-login required.
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+    -DCUDAToolkit_ROOT=/opt/cuda -DCMAKE_CUDA_COMPILER=/opt/cuda/bin/nvcc
+cmake --build build -j$(nproc)
+
+# Run (INI + ONNX are copied next to the binary)
+cd build/bin && ./detect_object_image config_cs2.ini
+```
+
+Linux runtime notes:
+- First run pops the KDE screen-sharing portal dialog (persist afterwards).
+- Quit with Ctrl+C (SIGINT) instead of VK_INSERT.
+- Debug overlay and SoftwareFuser are Windows-only; both are compiled out on Linux.
+- TensorRT 11 removed `kFP16`/`kEXPLICIT_BATCH`: networks are always strongly
+  typed, so `Precision = half` requires an FP16-exported ONNX (see `dep/*_fp16.onnx`).
+- CUDA arch defaults to `native` on Linux (sm_120 for RTX 50 series).
 
 ## Key Architecture
 
@@ -171,7 +195,7 @@ It can be an absolute path if needed.
 
 ## Important Notes
 
-- The project is Windows-specific due to DirectX dependencies (DXGI, D3D11)
+- Cross-platform: Windows uses DXGI/D3D11 capture + HID mouse; Linux uses PipeWire/portal capture (`LinuxCapture.h/.cpp`) + uinput/evdev mouse. Overlay and SoftwareFuser remain Windows-only.
 - Thread pinning is used for performance optimization (configurable in INI)
 - FP16 precision requires custom CUDA kernels with 32-byte memory alignment
 - The software fusion module (`SoftwareFuser.cu`) is for capture card + desktop fusion, not INT8

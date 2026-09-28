@@ -3,10 +3,16 @@
 #include <opencv2/core/cuda.hpp>
 #include <opencv2/opencv.hpp>
 
+#ifdef _WIN32
 #include "DXGICaptureCUDA.h"
 #include "DiscordOverlay.h"
+#else
+#include "LinuxCapture.h"
+#include "LinuxOverlay.h"
+#include <csignal>
+#endif
 #include "DetectorFactory.h"
-#include "INIParser.h"
+#include "IniParser.h"
 #include "MetricsWriter.h"
 #include "MouseController.h"
 #include "threadsafe_queue.h"
@@ -19,7 +25,21 @@
 #include <chrono>
 #include <future>
 #include <thread>
+#ifdef _WIN32
 #include <windows.h>
+#endif
+
+#ifdef _WIN32
+using ScreenCapture = DXGICaptureCUDA;
+using DebugOverlay = DiscordOverlay;
+#else
+using ScreenCapture = LinuxCapture;
+using DebugOverlay = LinuxOverlay;
+
+// Ctrl+C / kill requests a clean shutdown (replaces the VK_INSERT check on Windows).
+static volatile sig_atomic_t g_quitRequested = 0;
+static void onQuitSignal(int) { g_quitRequested = 1; }
+#endif
 
 using namespace std::chrono;
 
@@ -42,9 +62,9 @@ private:
 
     INIParser config;
     std::unique_ptr<YoloDetector> yoloDetector;
-    std::unique_ptr<DXGICaptureCUDA> capture;
+    std::unique_ptr<ScreenCapture> capture;
     std::unique_ptr<MouseController> mouseController;
-    std::unique_ptr<DiscordOverlay> debugOverlay;
+    std::unique_ptr<DebugOverlay> debugOverlay;
     std::vector<std::string> labelNames;
 
     int captureWidth;
@@ -53,7 +73,9 @@ private:
     int screenWidth;
     int screenHeight;
     int captureThreadCore;
+#ifdef _WIN32
     HWND targetWnd;
+#endif
 
     LatencyQueue captureLatency, detectionLatency, renderLatency;
     std::atomic<bool> running;
@@ -124,8 +146,16 @@ void ObjectDetectionSystem::initializeSystem() {
     yoloDetector = DetectorFactory::create(config.getString("ModelPath"), yoloConfig, modelVersion);
     std::cout << "[INIT] YOLO detector OK" << std::endl;
 
+#ifdef _WIN32
     screenWidth  = GetSystemMetrics(SM_CXSCREEN);
     screenHeight = GetSystemMetrics(SM_CYSCREEN);
+#else
+    // On Linux the capture backend (PipeWire portal) knows the real screen size;
+    // create it up-front so MouseController gets correct dimensions.
+    capture = std::make_unique<ScreenCapture>();
+    screenWidth  = capture->screenWidth();
+    screenHeight = capture->screenHeight();
+#endif
 
     const uint16_t hidVid = static_cast<uint16_t>(config.getInt("HidVendorId", 0x3367));
     const uint16_t hidPid = static_cast<uint16_t>(config.getInt("HidProductId", 0x1978));
@@ -162,12 +192,18 @@ void ObjectDetectionSystem::initializeSystem() {
         }
     }
 
-    capture = std::make_unique<DXGICaptureCUDA>();
+    // Input-delivery compensation (compositor/display scaling). See setCountsScale.
+    mouseController->setCountsScale(config.getFloat("CountsScale", 1.0f));
+
+#ifdef _WIN32
+    capture = std::make_unique<ScreenCapture>();
+#endif
 
     detectionQueue.setMoveThresholdPx(config.getInt("DetectionMoveThresholdPx", 5));
 
     labelNames = config.getStringArray("Labels");
 
+#ifdef _WIN32
     if (debugView) {
         const DWORD pid = DiscordOverlay::findProcessIdByName(debugOverlayTargetProcess);
         if (pid == 0) {
@@ -183,6 +219,18 @@ void ObjectDetectionSystem::initializeSystem() {
             }
         }
     }
+#else
+    if (debugView) {
+        // Pass the captured screen size so the overlay picks the same monitor.
+        debugOverlay = std::make_unique<DebugOverlay>(screenWidth, screenHeight);
+        if (!debugOverlay->start()) {
+            std::cerr << "DebugView: Linux overlay failed to start." << std::endl;
+            debugOverlay.reset();
+        } else {
+            debugOverlay->setLabelNames(labelNames);
+        }
+    }
+#endif
 }
 
 void ObjectDetectionSystem::mainLoop() {
@@ -196,7 +244,7 @@ void ObjectDetectionSystem::mainLoop() {
             std::cout << "Capture: OK (frames flowing)" << std::endl;
             break;
         }
-        Sleep(100);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     if (captureLatency.getAverageLatency() <= 0.0 && detectionLatency.getAverageLatency() <= 0.0) {
         std::cout << "Capture: BLOCKED (no frames after 5s)" << std::endl;
@@ -205,6 +253,7 @@ void ObjectDetectionSystem::mainLoop() {
     int metricsTick = 0;
 
     while (running) {
+#ifdef _WIN32
         MSG msg = {};
         while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
@@ -214,6 +263,11 @@ void ObjectDetectionSystem::mainLoop() {
         if (GetAsyncKeyState(VK_INSERT) & 0x8000) {
             running = false;
         }
+#else
+        if (g_quitRequested) {
+            running = false;
+        }
+#endif
 
         logAverageLatencies(captureLatency, detectionLatency, renderLatency);
 
@@ -229,7 +283,8 @@ void ObjectDetectionSystem::mainLoop() {
                 if (!od.empty()) {
                     const int ch = od[0].d[1];
                     const int na = od[0].d[2];
-                    if (ch == 6 && na >= 100 && na <= 500) modelStr = "v26";
+                    // v26 end-to-end layout is (1, N, 6) — N in d[1], 6 in d[2].
+                    if ((ch == 6 && na >= 100 && na <= 500) || (na == 6 && ch >= 100 && ch <= 500)) modelStr = "v26";
                     else if (ch > 4 + static_cast<int>(labelNames.size())) modelStr = "v11";
                 }
             }
@@ -250,7 +305,7 @@ void ObjectDetectionSystem::mainLoop() {
             m_frameCountAccum = 0;
         }
 
-        Sleep(100);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 }
 
@@ -317,7 +372,14 @@ void ObjectDetectionSystem::captureThread() {
 void ObjectDetectionSystem::detectionThread() {
     try {
         while (running) {
+#ifdef _WIN32
             cv::cuda::GpuMat frame = gpuCaptureQueue.pop();
+#else
+            cv::cuda::GpuMat frame;
+            if (!gpuCaptureQueue.popFor(frame, std::chrono::milliseconds(200))) {
+                continue; // no new frame (static screen) — re-check `running`
+            }
+#endif
 
             auto t0 = std::chrono::high_resolution_clock::now();
 
@@ -350,10 +412,10 @@ void ObjectDetectionSystem::detectionThread() {
             // Overlay
             if (debugOverlay && debugOverlay->isRunning()) {
                 auto tR = std::chrono::high_resolution_clock::now();
-                std::vector<DiscordOverlay::DetectionBox> boxes;
+                std::vector<DebugOverlay::DetectionBox> boxes;
                 boxes.reserve(detections.size());
                 for (const auto &d : detections) {
-                    DiscordOverlay::DetectionBox b{};
+                    DebugOverlay::DetectionBox b{};
                     b.x = d.rect.x + static_cast<float>(x);
                     b.y = d.rect.y + static_cast<float>(y);
                     b.w = d.rect.width;
@@ -382,6 +444,10 @@ int main(int argc, char *argv[]) {
         if (argc != 2) {
             throw std::runtime_error("Usage: " + std::string(argv[0]) + " <path to INI file>");
         }
+#ifndef _WIN32
+        std::signal(SIGINT, onQuitSignal);
+        std::signal(SIGTERM, onQuitSignal);
+#endif
         ObjectDetectionSystem system(argv[1]);
         system.run();
     } catch (const std::exception &e) {

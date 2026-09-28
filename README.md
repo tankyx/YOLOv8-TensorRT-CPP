@@ -182,6 +182,23 @@ Version tokens: `v8n`, `v8s`, `v8m`, `v8l`, `v8x`, `v11n`, `v11s`, `v11m`, `v11l
 
 ## Building from source
 
+**Automated path (Windows).** `scripts\windows_setup.bat` walks the whole list below on a
+clean machine: git / CMake / Visual Studio 2022, the CUDA Toolkit, TensorRT merged into the
+CUDA root, an OpenCV build with CUDA, `scripts\env.bat` with the environment variables, then
+the project configure and Release build. Run it from an elevated `cmd`:
+
+```cmd
+scripts\windows_setup.bat -DryRun                # print every action, change nothing
+scripts\windows_setup.bat -TensorRtZip "%USERPROFILE%\Downloads\TensorRT-10.9.0.34.Windows.win10.cuda-12.9.zip"
+```
+
+TensorRT is the one dependency that can't be fetched unattended (NVIDIA gates the download
+behind a free account), so grab the zip first and hand it over with `-TensorRtZip`; without
+it the script stops before the OpenCV build and prints the link. Two details: it builds into
+`build2\` to match the `run_*.bat` launchers (use `-ProjectBuildDir build` for the layout
+below), and it logs to `<workdir>\windows_setup.log`. `Get-Help scripts\windows_setup.ps1 -Full`
+lists every switch. The manual steps below are the reference for what it does.
+
 ### Prerequisites
 
 - **Windows 10/11 (64-bit)** — DXGI Desktop Duplication + CUDA-D3D11 interop are

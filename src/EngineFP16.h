@@ -340,6 +340,13 @@ protected:
     const char *precisionSuffix() const override { return "fp16"; }
 
     void applyPrecisionFlags(nvinfer1::IBuilder &builder, nvinfer1::IBuilderConfig &config) override {
+#if NV_TENSORRT_MAJOR >= 11
+        (void)builder;
+        // TensorRT 11 removed BuilderFlag::kFP16 / platformHasFastFp16 / platformHasTf32:
+        // networks are always strongly typed, so FP16 execution must come from an
+        // FP16-exported ONNX model (see dep/*_fp16.onnx). TF32 stays opt-in.
+        config.setFlag(nvinfer1::BuilderFlag::kTF32);
+#else
         if (!builder.platformHasFastFp16()) {
             throw std::runtime_error("GPU does not support FP16");
         }
@@ -347,6 +354,7 @@ protected:
         if (builder.platformHasTf32()) {
             config.setFlag(nvinfer1::BuilderFlag::kTF32);
         }
+#endif
     }
 
 private:
