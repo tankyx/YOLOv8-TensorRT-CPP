@@ -7,8 +7,10 @@
 // arrow keys work without relying on VT input translation.
 //
 // Keys are normalized to a small enum; both arrow keys and j/k style vim keys
-// are available to callers. The UI itself is ASCII-only on purpose — no
-// codepage assumptions on the Windows console.
+// are available to callers. Character events keep their original case, so
+// text-entry screens (the config editor) can type values verbatim; callers
+// comparing command keys normalize with a tolower of their own. The UI itself
+// is ASCII-only on purpose — no codepage assumptions on the Windows console.
 
 #include <cstdint>
 #include <cstdio>
@@ -47,7 +49,7 @@ enum class Key {
 
 struct KeyEvent {
     Key key = Key::None;
-    char ch = 0; // valid when key == Key::Char (always lowercase for letters)
+    char ch = 0; // valid when key == Key::Char; original case is preserved
 };
 
 struct Size {
@@ -214,53 +216,31 @@ public:
             }
             wchar_t wc = ke.uChar.UnicodeChar;
             if (wc >= L' ' && wc < 127) {
-                char c = static_cast<char>(wc);
-                if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-                return KeyEvent{Key::Char, c};
+                return KeyEvent{Key::Char, static_cast<char>(wc)};
             }
         }
         return KeyEvent{};
 #else
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(STDIN_FILENO, &fds);
-        struct timeval tv;
-        tv.tv_sec = timeoutMs / 1000;
-        tv.tv_usec = (timeoutMs % 1000) * 1000;
-        int r = select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv);
-        if (r <= 0) {
+        int b0 = nextByte(timeoutMs);
+        if (b0 < 0) {
             return KeyEvent{};
         }
-        unsigned char buf[32];
-        ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
-        if (n <= 0) {
-            return KeyEvent{};
-        }
-        unsigned char b0 = buf[0];
         if (b0 == 0x1b) {
             // A lone ESC may be the start of a split escape sequence (arrow
             // keys often arrive as ESC [ A across two reads on a pty). Wait
             // briefly for the remainder before deciding.
-            if (n == 1) {
-                fd_set f2;
-                FD_ZERO(&f2);
-                FD_SET(STDIN_FILENO, &f2);
-                struct timeval tv2;
-                tv2.tv_sec = 0;
-                tv2.tv_usec = 30000; // 30 ms
-                if (select(STDIN_FILENO + 1, &f2, nullptr, nullptr, &tv2) > 0) {
-                    ssize_t n2 = read(STDIN_FILENO, buf + 1, sizeof(buf) - 1);
-                    if (n2 > 0) n = 1 + n2;
-                }
-            }
-            if (n >= 3 && buf[1] == '[') {
-                switch (buf[2]) {
+            const int b1 = nextByte(30);
+            if (b1 == '[') {
+                const int b2 = nextByte(30);
+                switch (b2) {
                     case 'A': return KeyEvent{Key::Up, 0};
                     case 'B': return KeyEvent{Key::Down, 0};
                     case 'C': return KeyEvent{Key::Right, 0};
                     case 'D': return KeyEvent{Key::Left, 0};
                     default: break;
                 }
+            } else {
+                ungetByte(b1); // not a sequence: hand the byte to the next read
             }
             return KeyEvent{Key::Escape, 0};
         }
@@ -274,15 +254,39 @@ public:
             return KeyEvent{Key::Char, 'c'};
         }
         if (b0 >= 32 && b0 < 127) {
-            char c = static_cast<char>(b0);
-            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-            return KeyEvent{Key::Char, c};
+            return KeyEvent{Key::Char, static_cast<char>(b0)};
         }
         return KeyEvent{Key::Unknown, 0};
 #endif
     }
 
 private:
+#if !defined(_WIN32)
+    // Next byte from the read-ahead buffer, refilling from stdin when empty.
+    // Returns -1 on timeout or EOF. Reading more than one byte per syscall is
+    // normal (fast typing, key repeat, paste), so every byte must be kept.
+    int nextByte(int timeoutMs) {
+        if (m_bufPos < m_bufLen) return m_buf[m_bufPos++];
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(STDIN_FILENO, &fds);
+        struct timeval tv;
+        tv.tv_sec = timeoutMs / 1000;
+        tv.tv_usec = (timeoutMs % 1000) * 1000;
+        if (select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) <= 0) return -1;
+        const ssize_t n = read(STDIN_FILENO, m_buf, sizeof(m_buf));
+        if (n <= 0) return -1;
+        m_bufLen = static_cast<int>(n);
+        m_bufPos = 1;
+        return m_buf[0];
+    }
+
+    void ungetByte(int b) {
+        if (b < 0) return;
+        if (m_bufPos > 0) m_buf[--m_bufPos] = static_cast<unsigned char>(b);
+    }
+#endif
+
 #if defined(_WIN32)
     HANDLE m_hIn = INVALID_HANDLE_VALUE;
     HANDLE m_hOut = INVALID_HANDLE_VALUE;
@@ -293,6 +297,9 @@ private:
 #else
     struct termios m_saved {};
     bool m_savedOk = false;
+    unsigned char m_buf[64];
+    int m_bufLen = 0;
+    int m_bufPos = 0;
 #endif
     bool m_tty = false;
 };

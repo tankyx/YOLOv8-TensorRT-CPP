@@ -14,13 +14,23 @@
 //   "model": "v8",
 //   "graph": true,
 //   "precision": "fp16",
-//   "uptime_s": 3421
+//   "uptime_s": 3421,
+//   "fw": 640, "fh": 640,
+//   "boxes": [[x,y,w,h,conf,label], ...]  // up to 8, capture-frame pixels
 // }
 
 #include <chrono>
 #include <fstream>
 #include <string>
 #include <cstdio>
+#include <vector>
+
+// Latest per-frame detection boxes, capture-frame pixels (origin = crop
+// top-left). Frame centre == crosshair. Published for external monitors.
+struct MetricsBox {
+    float x, y, w, h, conf;
+    int label;
+};
 
 class MetricsWriter {
 public:
@@ -39,7 +49,10 @@ public:
                 double detectionsPerFrame,
                 const char *modelVersion,
                 bool graphCaptured,
-                const char *precision) {
+                const char *precision,
+                const std::vector<MetricsBox> &boxes = {},
+                int frameW = 0,
+                int frameH = 0) {
         if (m_path.empty()) return;
 
         const auto now = std::chrono::steady_clock::now();
@@ -51,14 +64,15 @@ public:
         // Write to a temp file then rename for atomic replacement.
         const std::string tmpPath = m_path + ".tmp";
 
-        // snprintf into a stack buffer — 512 bytes is plenty for this payload.
-        char buf[512];
-        const int n = snprintf(buf, sizeof(buf),
+        // Fixed payload first; the box array is appended only while it fits, so
+        // a long box list can never lose the base stats or the whole write.
+        char buf[2048];
+        int n = snprintf(buf, sizeof(buf),
             "{\"ts\":%lld,\"capture\":{\"avg\":%.2f,\"min\":%.2f,\"max\":%.2f},"
             "\"detect\":{\"avg\":%.2f,\"min\":%.2f,\"max\":%.2f},"
             "\"render\":{\"avg\":%.2f,\"min\":%.2f,\"max\":%.2f},"
             "\"detections\":%.1f,\"model\":\"%s\",\"graph\":%s,\"precision\":\"%s\","
-            "\"uptime_s\":%.0f}\n",
+            "\"uptime_s\":%.0f",
             static_cast<long long>(ts),
             capAvg, capMin, capMax,
             detAvg, detMin, detMax,
@@ -70,6 +84,31 @@ public:
             elapsed);
 
         if (n <= 0 || static_cast<size_t>(n) >= sizeof(buf)) return;
+
+        // Box snapshot: newest frame only, capture-frame pixels. Capped at 8 so
+        // the file stays small enough for tail reads.
+        if (!boxes.empty()) {
+            const int m = snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n),
+                                   ",\"fw\":%d,\"fh\":%d,\"boxes\":[",
+                                   frameW, frameH);
+            if (m > 0 && static_cast<size_t>(n + m) < sizeof(buf)) n += m;
+            const size_t maxBoxes = boxes.size() < 8 ? boxes.size() : 8;
+            for (size_t i = 0; i < maxBoxes; ++i) {
+                const MetricsBox &b = boxes[i];
+                const int k = snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n),
+                                       "%s[%.1f,%.1f,%.1f,%.1f,%.2f,%d]",
+                                       i == 0 ? "" : ",",
+                                       b.x, b.y, b.w, b.h, b.conf, b.label);
+                if (k <= 0 || static_cast<size_t>(n + k) >= sizeof(buf)) break;
+                n += k;
+            }
+            const int c = snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n), "]}");
+            if (c > 0 && static_cast<size_t>(n + c) < sizeof(buf)) n += c;
+        } else {
+            const int c = snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n), "}");
+            if (c > 0 && static_cast<size_t>(n + c) < sizeof(buf)) n += c;
+        }
+        if (static_cast<size_t>(n) + 1 < sizeof(buf)) { buf[n++] = '\n'; buf[n] = '\0'; }
 
         // Write to tmp, then rename. On NTFS rename is atomic for small files.
         {

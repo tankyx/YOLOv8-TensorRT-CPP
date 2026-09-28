@@ -19,6 +19,8 @@
 #endif
 
 #include "IniParser.h"
+#include "TuiCharts.h"
+#include "TuiEditor.h"
 #include "TuiProcess.h"
 #include "TuiTerminal.h"
 
@@ -89,6 +91,12 @@ static std::string sanitize(const std::string &s) {
         if (u < 32 || u > 126) c = '.';
     }
     return out;
+}
+
+// Command keys arrive with their original case (the config editor needs
+// verbatim text); shortcuts compare through this.
+static char lowerCh(char c) {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
 }
 
 // ---------------------------------------------------------------------------
@@ -183,6 +191,53 @@ static bool jsonBool(const std::string &s, const char *key, bool &out) {
     return true;
 }
 
+// Parses the additive "boxes":[[x,y,w,h,conf,label],...] tail of status.json.
+// A status file from an older detector simply has no such key -> empty vector.
+static std::vector<tui::Box> jsonBoxArray(const std::string &s) {
+    std::vector<tui::Box> out;
+    size_t p = s.find("\"boxes\"");
+    if (p == std::string::npos) return out;
+    size_t i = s.find('[', p);
+    if (i == std::string::npos) return out;
+    ++i;
+    while (i < s.size() && s[i] != ']') {
+        if (s[i] == '[') {
+            size_t j = s.find(']', i);
+            if (j == std::string::npos) break;
+            const std::string body = s.substr(i + 1, j - i - 1);
+            const char *c = body.c_str();
+            char *end = nullptr;
+            double v[6] = {0, 0, 0, 0, 0, -1};
+            bool ok = true;
+            for (int n = 0; n < 6; ++n) {
+                v[n] = std::strtod(c, &end);
+                if (end == c) {
+                    ok = false;
+                    break;
+                }
+                c = end;
+                while (*c == ',' || *c == ' ') ++c;
+            }
+            if (ok) {
+                tui::Box b;
+                b.x = static_cast<float>(v[0]);
+                b.y = static_cast<float>(v[1]);
+                b.w = static_cast<float>(v[2]);
+                b.h = static_cast<float>(v[3]);
+                b.conf = static_cast<float>(v[4]);
+                b.label = static_cast<int>(v[5]);
+                out.push_back(b);
+            }
+            i = j + 1;
+        } else if (s[i] == ',') {
+            ++i;
+        } else {
+            break;
+        }
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Config discovery
 // ---------------------------------------------------------------------------
@@ -190,6 +245,7 @@ struct ConfigEntry {
     std::string file;
     std::string model;
     std::string labels;
+    std::string metrics; // MetricsStatus key; empty = metrics disabled
     int fps = 0;
     bool parsed = false;
 };
@@ -212,6 +268,7 @@ static std::vector<ConfigEntry> scanConfigs(const fs::path &dir) {
         if (ini.loadFile(de.path().string())) {
             e.model = ini.getString("ModelPath");
             e.labels = ini.getString("Labels");
+            e.metrics = ini.getString("MetricsStatus");
             e.fps = ini.getInt("CaptureFPS", 0);
             e.parsed = true;
         }
@@ -368,6 +425,27 @@ int main(int argc, char **argv) {
     std::chrono::steady_clock::time_point started{};
     ChildProcess child;
 
+    // ---- screens: config list (with action menu), config editor, monitor ----
+    enum class Screen { List, Editor };
+    Screen screen = Screen::List;
+    bool menuOpen = false;
+    int menuSel = 0;
+    const int kMenuItems = 3; // Edit config / Run detector / Back
+    tui::IniEditor editor;
+    // Latency history (one sample per status.json timestamp change) and the
+    // newest box snapshot; refilled on every launch.
+    std::vector<double> capHist;
+    std::vector<double> detHist;
+    std::vector<double> renHist;
+    std::vector<tui::Box> lastBoxes;
+    double lastMetricsTs = -1.0;
+    float lastFrameW = 0.f;
+    float lastFrameH = 0.f;
+    bool haveMetrics = false;
+    bool metricsStale = false;
+    const size_t kHistMax = 120;
+    std::string runningFile; // config file of the current run
+
     auto nowSec = []() {
         return std::chrono::duration<double>(
                    std::chrono::steady_clock::now().time_since_epoch())
@@ -394,6 +472,132 @@ int main(int argc, char **argv) {
         stopDeadline = -1.0;
         started = std::chrono::steady_clock::now();
         message = "running " + cfg.file;
+        runningFile = cfg.file;
+
+        // Fresh run: drop the previous run's charts and box snapshot.
+        capHist.clear();
+        detHist.clear();
+        renHist.clear();
+        lastBoxes.clear();
+        lastMetricsTs = -1.0;
+        lastFrameW = lastFrameH = 0.f;
+        haveMetrics = false;
+        metricsStale = false;
+    };
+
+    auto openEditor = [&]() {
+        if (configs.empty()) return;
+        std::string err;
+        if (editor.load((dir / configs[static_cast<size_t>(sel)].file).string(), err)) {
+            screen = Screen::Editor;
+            menuOpen = false;
+            message = "editing " + configs[static_cast<size_t>(sel)].file;
+        } else {
+            message = "editor: " + err;
+        }
+    };
+
+    // Lower pane while the detector runs with fresh metrics: latency
+    // sparklines, the ASCII box map around the crosshair, the current numbers
+    // and a short log tail so errors stay visible.
+    auto drawMetrics = [&](Canvas &cv, int top, int msgRow, double up, double detCount,
+                           const std::string &model, const std::string &prec,
+                           bool graph) {
+        const int avail = msgRow - top;
+        if (avail < 6) return;
+
+        const int logTail = (avail >= 14) ? 3 : 2;
+        const int statsRows = (avail - logTail >= 9) ? 2 : 1;
+        const int graphs = (avail - logTail - statsRows >= 8) ? 4 : 0; // 3 rows + spacer
+        int boxRows = avail - logTail - statsRows - graphs - 1;        // 1 = box header
+        if (boxRows < 2) boxRows = 2;
+        if (boxRows > 16) boxRows = 16;
+
+        const int logTailTop = msgRow - logTail;
+        int row = top;
+
+        if (graphs > 0) {
+            const int labelW = 8;
+            int sparkW = cv.cols - labelW - 24;
+            if (sparkW < 10) sparkW = 10;
+            struct Series {
+                const char *name;
+                const std::vector<double> *h;
+            };
+            const Series series[3] = {{ "capture", &capHist },
+                                      { "detect", &detHist },
+                                      { "render", &renHist }};
+            for (int i = 0; i < 3; ++i) {
+                const std::vector<double> &h = *series[i].h;
+                double sum = 0;
+                for (double v : h) sum += v;
+                const double last = h.empty() ? 0.0 : h.back();
+                const double mean = h.empty() ? 0.0 : sum / static_cast<double>(h.size());
+                std::string line = std::string(" ") + series[i].name;
+                while (line.size() < static_cast<size_t>(labelW)) line += ' ';
+                line += tui::sparkline(h, sparkW);
+                line += "  last " + fmt2(last) + "  avg " + fmt2(mean);
+                cv.put(row, 1, trunc(line, static_cast<size_t>(cv.cols)));
+                ++row;
+            }
+            ++row; // spacer between the graphs and the box map
+        }
+
+        cv.put(row, 1, "Box map (capture frame around the crosshair)");
+        cv.setStyle(row, STYLE_DIM);
+        ++row;
+
+        const int mapTop = row;
+        if (!lastBoxes.empty() && lastFrameW > 0.f && lastFrameH > 0.f) {
+            const int cols = std::min(31, cv.cols - 2);
+            int mapRows = logTailTop - mapTop - statsRows;
+            if (mapRows > boxRows) mapRows = boxRows;
+            if (mapRows > 0) {
+                std::vector<std::string> map =
+                    tui::renderBoxMap(lastBoxes, lastFrameW, lastFrameH, cols, mapRows);
+                for (size_t i = 0; i < map.size(); ++i) {
+                    cv.put(mapTop + static_cast<int>(i), 1, map[i]);
+                }
+            }
+        } else if (mapTop < logTailTop) {
+            cv.put(mapTop, 1, "  no box data yet (older detector, or nothing detected)");
+            cv.setStyle(mapTop, STYLE_DIM);
+        }
+        row = std::min(mapTop + boxRows, logTailTop);
+
+        // Stats: the running numbers, then the actionable target line.
+        const std::string s1 =
+            "  up " + std::to_string(static_cast<int>(up)) + "s   det/frame " +
+            fmt1(detCount) + "   model " + (model.empty() ? "?" : model) + "   " +
+            (prec.empty() ? "?" : prec) + "   graph " + (graph ? "yes" : "no") +
+            "   samples " + std::to_string(capHist.size());
+        std::string s2 = "  no boxes to measure";
+        if (!lastBoxes.empty() && lastFrameW > 0.f && lastFrameH > 0.f) {
+            s2 = "  nearest box " +
+                 fmt2(tui::nearestBoxDistance(lastBoxes, lastFrameW, lastFrameH)) +
+                 (tui::crosshairInsideBox(lastBoxes, lastFrameW, lastFrameH)
+                      ? "   ON TARGET"
+                      : "");
+        }
+        if (statsRows >= 2 && row + 1 < logTailTop) {
+            cv.put(row++, 1, trunc(s1, static_cast<size_t>(cv.cols)));
+            cv.put(row++, 1, trunc(s2, static_cast<size_t>(cv.cols)));
+        } else if (row < logTailTop) {
+            cv.put(row++, 1, trunc(s1 + "   " + s2, static_cast<size_t>(cv.cols)));
+        }
+
+        // Log tail, pinned to the bottom of the pane.
+        std::string logData = readFileTail(dir / "detector_tui.log", 8192);
+        std::vector<std::string> lines = splitLines(logData);
+        int from = static_cast<int>(lines.size()) - logTail;
+        if (from < 0) from = 0;
+        for (int i = from; i < static_cast<int>(lines.size()); ++i) {
+            const int r = logTailTop + (i - from);
+            if (r < 1 || r >= msgRow) break;
+            cv.put(r, 1,
+                   trunc(sanitize(lines[static_cast<size_t>(i)]),
+                         static_cast<size_t>(cv.cols)));
+        }
     };
 
     bool quit = false;
@@ -401,57 +605,116 @@ int main(int argc, char **argv) {
         KeyEvent k = term.readKey(200);
 
         // ---- keys ---------------------------------------------------------
-        switch (k.key) {
-            case Key::Up:
-                if (!running && !configs.empty()) {
-                    sel = (sel + static_cast<int>(configs.size()) - 1) %
-                          static_cast<int>(configs.size());
+        const char ch = lowerCh(k.ch); // shortcuts ignore shift/caps
+
+        if (screen == Screen::Editor) {
+            switch (editor.handleKey(k, message)) {
+                case tui::EditorAction::Back:
+                    screen = Screen::List;
+                    configs = scanConfigs(dir); // the edited config may have moved
+                    if (sel >= static_cast<int>(configs.size())) sel = 0;
+                    break;
+                case tui::EditorAction::SaveAndRun:
+                    screen = Screen::List;
+                    launch();
+                    break;
+                case tui::EditorAction::Quit:
+                    quit = true;
+                    break;
+                case tui::EditorAction::None:
+                    break;
+            }
+        } else if (menuOpen) {
+            // Action menu for the selected config.
+            if (k.key == Key::Up || (k.key == Key::Char && ch == 'k')) {
+                menuSel = (menuSel + kMenuItems - 1) % kMenuItems;
+            } else if (k.key == Key::Down || (k.key == Key::Char && ch == 'j')) {
+                menuSel = (menuSel + 1) % kMenuItems;
+            } else if (k.key == Key::Escape) {
+                menuOpen = false;
+            } else if (k.key == Key::Char && ch == 'q') {
+                quit = true;
+            } else if (k.key == Key::Char && (ch == 'e' || ch == 'l')) {
+                menuSel = (ch == 'e') ? 0 : 1;
+                menuOpen = false;
+                if (menuSel == 0) {
+                    openEditor();
+                } else {
+                    launch();
                 }
-                break;
-            case Key::Down:
-                if (!running && !configs.empty()) {
-                    sel = (sel + 1) % static_cast<int>(configs.size());
+            } else if (k.key == Key::Enter) {
+                const int pick = menuSel;
+                menuOpen = false;
+                if (pick == 0) {
+                    openEditor();
+                } else if (pick == 1) {
+                    launch();
                 }
-                break;
-            case Key::Enter:
-                if (!running) launch();
-                break;
-            case Key::Char:
-                switch (k.ch) {
-                    case 'k':
-                        if (!running && !configs.empty()) {
-                            sel = (sel + static_cast<int>(configs.size()) - 1) %
-                                  static_cast<int>(configs.size());
-                        }
-                        break;
-                    case 'j':
-                        if (!running && !configs.empty()) {
-                            sel = (sel + 1) % static_cast<int>(configs.size());
-                        }
-                        break;
-                    case 'r':
-                        if (!running) {
-                            configs = scanConfigs(dir);
-                            if (sel >= static_cast<int>(configs.size())) sel = 0;
-                            message = "rescanned: " + std::to_string(configs.size()) + " config(s)";
-                        }
-                        break;
-                    case 's':
-                        if (running && stopDeadline < 0.0) {
-                            child.requestStop();
-                            stopDeadline = nowSec() + 6.0;
-                            message = "stop requested (waiting for clean exit)";
-                        }
-                        break;
-                    case 'q':
-                        quit = true;
-                        break;
-                    default:
-                        break;
-                }
-                break;
-            default:
-                break;
+            }
+            if (configs.empty()) menuOpen = false;
+        } else {
+            switch (k.key) {
+                case Key::Up:
+                    if (!running && !configs.empty()) {
+                        sel = (sel + static_cast<int>(configs.size()) - 1) %
+                              static_cast<int>(configs.size());
+                    }
+                    break;
+                case Key::Down:
+                    if (!running && !configs.empty()) {
+                        sel = (sel + 1) % static_cast<int>(configs.size());
+                    }
+                    break;
+                case Key::Enter:
+                    if (!running && !configs.empty()) {
+                        menuOpen = true;
+                        menuSel = 0;
+                    }
+                    break;
+                case Key::Char:
+                    switch (ch) {
+                        case 'k':
+                            if (!running && !configs.empty()) {
+                                sel = (sel + static_cast<int>(configs.size()) - 1) %
+                                      static_cast<int>(configs.size());
+                            }
+                            break;
+                        case 'j':
+                            if (!running && !configs.empty()) {
+                                sel = (sel + 1) % static_cast<int>(configs.size());
+                            }
+                            break;
+                        case 'e':
+                            if (!running && !configs.empty()) openEditor();
+                            break;
+                        case 'l':
+                            if (!running && !configs.empty()) launch();
+                            break;
+                        case 'r':
+                            if (!running) {
+                                configs = scanConfigs(dir);
+                                if (sel >= static_cast<int>(configs.size())) sel = 0;
+                                message = "rescanned: " + std::to_string(configs.size()) +
+                                          " config(s)";
+                            }
+                            break;
+                        case 's':
+                            if (running && stopDeadline < 0.0) {
+                                child.requestStop();
+                                stopDeadline = nowSec() + 6.0;
+                                message = "stop requested (waiting for clean exit)";
+                            }
+                            break;
+                        case 'q':
+                            quit = true;
+                            break;
+                        default:
+                            break;
+                    }
+                    break;
+                default:
+                    break;
+            }
         }
 
         // ---- child state --------------------------------------------------
@@ -483,6 +746,41 @@ int main(int argc, char **argv) {
             cv.put(sz.rows, 1, " q quit");
             cv.setStyle(sz.rows, STYLE_DIM);
             render(term, cv);
+            continue;
+        }
+
+        // ---- config editor screen ------------------------------------------
+        if (screen == Screen::Editor) {
+            Canvas ecv(sz.rows, sz.cols);
+            const int ER = sz.rows;
+            const int EC = sz.cols;
+            const int eMsgRow = ER - 1;
+            std::string head =
+                " Editing " + editor.path() + (editor.dirty() ? "   (modified)" : "");
+            ecv.put(1, 1, trunc(head, static_cast<size_t>(EC)));
+            ecv.setStyle(1, STYLE_TITLE);
+            ecv.put(2, 1,
+                    trunc(" Values are edited in place; comments and key order survive.",
+                          static_cast<size_t>(EC)));
+            ecv.setStyle(2, STYLE_DIM);
+
+            int bodyRows = eMsgRow - 3;
+            if (bodyRows < 1) bodyRows = 1;
+            editor.ensureVisible(bodyRows);
+            const std::vector<std::pair<int, std::string>> rows = editor.visibleLines(bodyRows);
+            for (size_t i = 0; i < rows.size(); ++i) {
+                const int r = 3 + static_cast<int>(i);
+                if (r >= eMsgRow) break;
+                ecv.put(r, 1, trunc(sanitize(rows[i].second), static_cast<size_t>(EC)));
+                if (rows[i].first == editor.cursor()) ecv.setStyle(r, STYLE_SELECTED);
+            }
+            if (!message.empty()) {
+                ecv.put(eMsgRow, 1, trunc(sanitize(message), static_cast<size_t>(EC)));
+                ecv.setStyle(eMsgRow, STYLE_DIM);
+            }
+            ecv.put(ER, 1, trunc(" " + editor.footer(), static_cast<size_t>(EC)));
+            ecv.setStyle(ER, STYLE_DIM);
+            render(term, ecv);
             continue;
         }
 
@@ -548,6 +846,14 @@ int main(int argc, char **argv) {
         info.push_back("  exe:    " + exe.string());
         info.push_back("");
 
+        // Shared with the lower pane: current numbers + graph history.
+        double mUp = 0;
+        double mDet = 0;
+        std::string mModel;
+        std::string mPrec;
+        bool mGraph = false;
+        bool mFresh = false;
+
         if (running) {
             double elapsed = std::chrono::duration<double>(
                                  std::chrono::steady_clock::now() - started)
@@ -555,7 +861,7 @@ int main(int argc, char **argv) {
             info.push_back("Detector: RUNNING  pid " + std::to_string(child.pid()) +
                            "  up " + std::to_string(static_cast<int>(elapsed)) + "s");
 
-            std::string sj = readFileTail(dir / "status.json", 4096);
+            std::string sj = readFileTail(dir / "status.json", 8192);
             if (sj.empty()) {
                 info.push_back("  metrics: waiting for the first status.json ...");
             } else {
@@ -565,10 +871,13 @@ int main(int argc, char **argv) {
                 std::string cap = jsonObject(sj, "capture");
                 std::string det = jsonObject(sj, "detect");
                 std::string ren = jsonObject(sj, "render");
-                double v = 0;
-                std::string capAvg = jsonNumber(cap, "avg", v) ? fmt2(v) : "?";
-                std::string detAvg = jsonNumber(det, "avg", v) ? fmt2(v) : "?";
-                std::string renAvg = jsonNumber(ren, "avg", v) ? fmt2(v) : "?";
+                double capV = 0, detV = 0, renV = 0;
+                const bool haveCap = jsonNumber(cap, "avg", capV);
+                const bool haveDet = jsonNumber(det, "avg", detV);
+                const bool haveRen = jsonNumber(ren, "avg", renV);
+                std::string capAvg = haveCap ? fmt2(capV) : "?";
+                std::string detAvg = haveDet ? fmt2(detV) : "?";
+                std::string renAvg = haveRen ? fmt2(renV) : "?";
                 info.push_back("  capture " + capAvg + " ms   detect " + detAvg +
                                " ms   render " + renAvg + " ms" + (fresh ? "" : "   (stale)"));
                 std::string model, prec;
@@ -579,11 +888,48 @@ int main(int argc, char **argv) {
                 jsonNumber(sj, "detections", dcount);
                 jsonNumber(sj, "uptime_s", up);
                 jsonBool(sj, "graph", graph);
+                mModel = model;
+                mPrec = prec;
+                mDet = dcount;
+                mUp = up;
+                mGraph = graph;
+                mFresh = fresh;
                 info.push_back("  detections " + fmt1(dcount) + "   model " +
                                (model.empty() ? "?" : model) + "   " +
                                (prec.empty() ? "?" : prec) + "   graph " +
                                (graph ? "yes" : "no") + "   uptime " +
                                std::to_string(static_cast<int>(up)) + "s");
+
+                if (fresh && ts != lastMetricsTs) {
+                    // New sample: extend the graphs, refresh the box snapshot.
+                    lastMetricsTs = ts;
+                    if (haveCap) capHist.push_back(capV);
+                    if (haveDet) detHist.push_back(detV);
+                    if (haveRen) renHist.push_back(renV);
+                    while (capHist.size() > kHistMax) capHist.erase(capHist.begin());
+                    while (detHist.size() > kHistMax) detHist.erase(detHist.begin());
+                    while (renHist.size() > kHistMax) renHist.erase(renHist.begin());
+                    haveMetrics = true;
+
+                    double fw = 0, fh = 0;
+                    if (jsonNumber(sj, "fw", fw) && jsonNumber(sj, "fh", fh) && fw > 0 &&
+                        fh > 0) {
+                        lastFrameW = static_cast<float>(fw);
+                        lastFrameH = static_cast<float>(fh);
+                        lastBoxes = jsonBoxArray(sj);
+                    } else {
+                        lastFrameW = lastFrameH = 0.f;
+                        lastBoxes.clear();
+                    }
+                }
+
+                metricsStale = haveMetrics &&
+                               (std::time(nullptr) - static_cast<time_t>(ts)) > 5.0;
+                if (metricsStale) {
+                    message = "metrics stale - no status.json update for over 5s";
+                } else if (message.rfind("metrics stale", 0) == 0) {
+                    message = "running " + runningFile;
+                }
             }
             info.push_back("");
             info.push_back("  s stops the detector, q quits the TUI");
@@ -607,25 +953,69 @@ int main(int argc, char **argv) {
             cv.put(row, rx, trunc(sanitize(info[i]), static_cast<size_t>(rw)));
         }
 
-        // Log pane spans the full width below the top section.
-        const int logHeaderRow = 5 + topBlock;
-        const int logTop = logHeaderRow + 1;
+        // Lower pane spans the full width below the top section: live metrics
+        // once status.json is flowing, the rolling log otherwise.
+        const int paneHeaderRow = 5 + topBlock;
+        const int paneTop = paneHeaderRow + 1;
         const int msgRow = R - 1;
-        cv.put(logHeaderRow, 1, "Log (" + (dir / "detector_tui.log").filename().string() + ")");
-        cv.setStyle(logHeaderRow, STYLE_SECTION);
 
-        int logLines = msgRow - logTop;
-        if (logLines > 0) {
-            std::string logData = readFileTail(dir / "detector_tui.log", 16384);
-            std::vector<std::string> lines = splitLines(logData);
-            int from = static_cast<int>(lines.size()) - logLines;
-            if (from < 0) from = 0;
-            for (int i = from; i < static_cast<int>(lines.size()); ++i) {
-                int row = logTop + (i - from);
-                if (row >= msgRow) break;
-                cv.put(row, 1, trunc(sanitize(lines[static_cast<size_t>(i)]),
-                                     static_cast<size_t>(C)));
+        const bool showMetrics = running && haveMetrics && (msgRow - paneTop) >= 6;
+        if (showMetrics) {
+            std::string head = "Metrics (status.json)   capture/detect/render ms";
+            if (metricsStale) head += "   [stale]";
+            cv.put(paneHeaderRow, 1, trunc(head, static_cast<size_t>(C)));
+        } else if (running) {
+            const bool metricsOff = sel < static_cast<int>(configs.size()) &&
+                                    configs[static_cast<size_t>(sel)].metrics.empty();
+            cv.put(paneHeaderRow, 1,
+                   trunc(metricsOff ? "Log (metrics off: set MetricsStatus in the config)"
+                                    : "Log (starting - waiting for metrics)",
+                         static_cast<size_t>(C)));
+        } else {
+            cv.put(paneHeaderRow, 1,
+                   "Log (" + (dir / "detector_tui.log").filename().string() + ")");
+        }
+        cv.setStyle(paneHeaderRow, STYLE_SECTION);
+
+        if (showMetrics) {
+            drawMetrics(cv, paneTop, msgRow, mUp, mDet, mModel, mPrec, mGraph);
+        } else {
+            const int logLines = msgRow - paneTop;
+            if (logLines > 0) {
+                std::string logData = readFileTail(dir / "detector_tui.log", 16384);
+                std::vector<std::string> lines = splitLines(logData);
+                int from = static_cast<int>(lines.size()) - logLines;
+                if (from < 0) from = 0;
+                for (int i = from; i < static_cast<int>(lines.size()); ++i) {
+                    int row = paneTop + (i - from);
+                    if (row >= msgRow) break;
+                    cv.put(row, 1, trunc(sanitize(lines[static_cast<size_t>(i)]),
+                                         static_cast<size_t>(C)));
+                }
             }
+        }
+
+        // Action menu overlay: drawn last so it wins over the panes.
+        if (menuOpen && !configs.empty()) {
+            const int mw = 30;
+            const int my = 4;
+            const std::string rule =
+                "+" + std::string(static_cast<size_t>(mw - 2), '-') + "+";
+            cv.put(my, 1, trunc(rule, static_cast<size_t>(C)));
+            cv.setStyle(my, STYLE_DIM);
+            const char *items[kMenuItems] = {"Edit config", "Run detector", "Back"};
+            for (int i = 0; i < kMenuItems; ++i) {
+                std::string line = "| ";
+                line += (i == menuSel) ? "> " : "  ";
+                line += items[i];
+                while (line.size() < static_cast<size_t>(mw - 1)) line += ' ';
+                line += "|";
+                const int r = my + 1 + i;
+                cv.put(r, 1, trunc(line, static_cast<size_t>(C)));
+                if (i == menuSel) cv.setStyle(r, STYLE_SELECTED);
+            }
+            cv.put(my + 1 + kMenuItems, 1, trunc(rule, static_cast<size_t>(C)));
+            cv.setStyle(my + 1 + kMenuItems, STYLE_DIM);
         }
 
         // Message + footer.
@@ -637,9 +1027,14 @@ int main(int argc, char **argv) {
                          message.find("exited") != std::string::npos);
             cv.setStyle(msgRow, warn ? STYLE_WARN : STYLE_DIM);
         }
-        std::string keys = running
-                               ? " running:  s stop (clean)   q quit (stops detector)   Ctrl+C quit"
-                               : " idle:  up/down or j/k select   enter run   r rescan   q quit";
+        std::string keys;
+        if (menuOpen) {
+            keys = " menu:  up/down choose   enter confirm   e edit   l run   esc close";
+        } else if (running) {
+            keys = " running:  s stop (clean)   q quit (stops detector)   Ctrl+C quit";
+        } else {
+            keys = " idle:  up/down or j/k select   enter menu   e edit   l run   r rescan   q quit";
+        }
         cv.put(R, 1, trunc(keys, static_cast<size_t>(C)));
         cv.setStyle(R, STYLE_DIM);
 

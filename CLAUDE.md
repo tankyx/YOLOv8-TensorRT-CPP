@@ -166,9 +166,18 @@ never partial.
   "model": "v8",
   "graph": true,
   "precision": "fp16",
-  "uptime_s": 3421
+  "uptime_s": 3421,
+  "fw": 640,
+  "fh": 640,
+  "boxes": [[320.0, 300.0, 64.0, 128.0, 0.91, 0]]
 }
 ```
+
+`fw`/`fh` are the capture-ROI dimensions and `boxes` holds up to 8 detection
+boxes in capture-ROI pixels (origin top-left, `[x, y, w, h, conf, label]`).
+The ROI is centred on the screen centre, so the frame centre is the crosshair.
+All three fields are omitted entirely when the detector has no frame yet, so
+readers that ignore unknown keys keep working unchanged.
 
 ### What to watch for
 

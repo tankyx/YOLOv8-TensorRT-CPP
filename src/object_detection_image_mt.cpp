@@ -24,6 +24,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <mutex>
 #include <thread>
 #ifdef _WIN32
 #include <windows.h>
@@ -94,6 +95,13 @@ private:
     std::string m_metricsPath;
     int m_detectionCountAccum = 0;
     int m_frameCountAccum = 0;
+
+    // Latest per-frame box snapshot for MetricsWriter (status.json). Written on
+    // the detection thread, read once per second from the main loop.
+    std::mutex m_boxMutex;
+    std::vector<MetricsBox> m_lastBoxes;
+    int m_lastFrameW = 0;
+    int m_lastFrameH = 0;
 };
 
 ObjectDetectionSystem::ObjectDetectionSystem(const std::string &iniFile) : running(true) {
@@ -292,6 +300,15 @@ void ObjectDetectionSystem::mainLoop() {
             const double avgDets = (m_frameCountAccum > 0)
                 ? static_cast<double>(m_detectionCountAccum) / m_frameCountAccum : 0.0;
 
+            std::vector<MetricsBox> boxes;
+            int boxFrameW = 0, boxFrameH = 0;
+            {
+                std::lock_guard<std::mutex> lock(m_boxMutex);
+                boxes = m_lastBoxes;
+                boxFrameW = m_lastFrameW;
+                boxFrameH = m_lastFrameH;
+            }
+
             m_metrics.update(
                 captureLatency.getAverageLatency(),
                 captureLatency.getMinLatency(), captureLatency.getMaxLatency(),
@@ -299,7 +316,8 @@ void ObjectDetectionSystem::mainLoop() {
                 detectionLatency.getMinLatency(), detectionLatency.getMaxLatency(),
                 renderLatency.getAverageLatency(),
                 renderLatency.getMinLatency(), renderLatency.getMaxLatency(),
-                avgDets, modelStr, graphOk, "fp16");
+                avgDets, modelStr, graphOk, "fp16",
+                boxes, boxFrameW, boxFrameH);
 
             m_detectionCountAccum = 0;
             m_frameCountAccum = 0;
@@ -399,6 +417,21 @@ void ObjectDetectionSystem::detectionThread() {
 
             m_detectionCountAccum += static_cast<int>(detections.size());
             m_frameCountAccum += 1;
+
+            if (!m_metricsPath.empty()) {
+                std::vector<MetricsBox> snapshot;
+                snapshot.reserve(detections.size());
+                for (const auto &d : detections) {
+                    if (d.rect.width <= 0.f || d.rect.height <= 0.f) continue;
+                    snapshot.push_back(MetricsBox{d.rect.x, d.rect.y, d.rect.width,
+                                                  d.rect.height, d.probability, d.label});
+                    if (snapshot.size() >= 8) break;
+                }
+                std::lock_guard<std::mutex> lock(m_boxMutex);
+                m_lastBoxes = std::move(snapshot);
+                m_lastFrameW = croppedFrame.cols;
+                m_lastFrameH = croppedFrame.rows;
+            }
 
             mouseController->setCrosshairPosition(crosshairPos.x, crosshairPos.y);
             mouseController->aim(detections);

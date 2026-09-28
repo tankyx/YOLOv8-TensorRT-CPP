@@ -105,10 +105,24 @@ detector_tui.exe
 ```
 
 It scans its own directory for configs by default; use `--dir <config-dir>`
-and `--exe <detector-binary>` to override. Keys: `up`/`down` (or `j`/`k`)
-select a config, `enter` run, `s` stop the detector cleanly (**Insert** on
-Windows, SIGINT on Linux), `r` rescan, `q` quit. Detector output is captured
-to `detector_tui.log` next to the configs.
+and `--exe <detector-binary>` to override. Detector output is captured to
+`detector_tui.log` next to the configs.
+
+Keys on the config list: `up`/`down` (or `j`/`k`) select, `enter` opens the
+action menu (**Edit config** / **Run detector** / **Back**; `e` and `l` jump
+straight to either), `s` stop the running detector cleanly (**Insert** on
+Windows, SIGINT on Linux), `r` rescan, `q` quit.
+
+The editor edits the selected INI in place: `up`/`down` pick a key, `enter`
+edits its value, `s` saves (atomic write, comments and formatting preserved),
+`r` saves and runs, `esc` leaves — you are prompted before discarding unsaved
+changes. Edits apply to the config next to the binary; edit `dep/config_*.ini`
+to survive a rebuild, which re-copies `dep/` over the deployed files.
+
+The run view follows the detector: the raw log first, then — as soon as a
+fresh `status.json` appears — rolling sparklines for capture / detect / render,
+an ASCII map of the current detection boxes against the crosshair (frame
+centre), plus the last few log lines so errors stay visible.
 
 ### Triggers
 
@@ -172,7 +186,8 @@ DebugOverlayTargetProcess = cs2.exe
 PinThreads         = false
 CaptureThreadCore  = 0
 
-# Monitoring (optional JSON status file for codewhale)
+# Monitoring (optional JSON status file for codewhale / detector_tui).
+# Also carries the newest detection boxes (up to 8) for the TUI box map.
 MetricsStatus = status.json
 ```
 
