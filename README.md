@@ -87,6 +87,29 @@ run_cs2.bat v11s
 Press **Insert** to exit. Status line shows rolling 500 ms averages of
 capture / detection / render latency.
 
+### Interactive TUI launcher
+
+`detector_tui` is a terminal UI that lists the `config_*.ini` files, runs the
+detector as a child process and shows its live metrics (from `status.json`),
+the rolling log and the exit code — no CLI typing needed. It builds with the
+normal build and lands next to the detector binary.
+
+```cmd
+cd build2\bin\Release
+detector_tui.exe
+```
+
+```bash
+# Linux
+./build/bin/detector_tui
+```
+
+It scans its own directory for configs by default; use `--dir <config-dir>`
+and `--exe <detector-binary>` to override. Keys: `up`/`down` (or `j`/`k`)
+select a config, `enter` run, `s` stop the detector cleanly (**Insert** on
+Windows, SIGINT on Linux), `r` rescan, `q` quit. Detector output is captured
+to `detector_tui.log` next to the configs.
+
 ### Triggers
 
 | Key held | Behavior |

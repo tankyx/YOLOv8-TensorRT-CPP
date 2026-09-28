@@ -188,10 +188,27 @@ else()
     target_link_libraries(detect_object_image PRIVATE PkgConfig::PIPEWIRE PkgConfig::DBUS PkgConfig::WAYLAND)
 endif()
 
+# Interactive TUI launcher: terminal UI that runs the detector as a child
+# process. Pure C++17 with no CUDA/OpenCV/TensorRT dependency, so it also
+# builds on machines without the full toolchain installed for testing.
+add_executable(detector_tui
+    src/DetectorTui.cpp
+)
+
+if(WIN32)
+    # user32: console control handler + SendInput (synthetic Insert to stop
+    # the detector), GetModuleFileNameW for the default config directory.
+    target_link_libraries(detector_tui PRIVATE user32)
+endif()
+
 # Set output directories
 set_target_properties(detect_object_image PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+
+set_target_properties(detector_tui PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
 set_target_properties(yolov8_tensorrt PROPERTIES
@@ -201,6 +218,10 @@ set_target_properties(yolov8_tensorrt PROPERTIES
 
 # Install rules
 install(TARGETS detect_object_image
+    RUNTIME DESTINATION bin
+)
+
+install(TARGETS detector_tui
     RUNTIME DESTINATION bin
 )
 
