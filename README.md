@@ -117,6 +117,15 @@ action menu (**Edit config** / **Run detector** / **Back**; `e` and `l` jump
 straight to either), `s` stop the running detector cleanly (**Insert** on
 Windows, SIGINT on Linux), `r` rescan, `q` quit.
 
+Starting a detector switches to the **monitor** screen: a latency column on
+the left (capture/detect/render `avg`/`max`, plus `min` when the terminal is
+tall enough), a large ASCII map of the capture frame with the detection boxes
+around the crosshair, a compact live-numbers line (detections/frame, nearest
+box, model, graph, uptime) and a short log tail. Press `m` (or `esc`) to
+toggle back to the list, which keeps the latency averages as text and the full
+rolling log. The monitor returns to the list automatically when the detector
+exits.
+
 The editor edits the selected INI in place: `up`/`down` pick a key, `enter`
 edits its value, `s` saves (atomic write, comments and formatting preserved),
 `r` saves and runs, `esc` leaves — you are prompted before discarding unsaved
