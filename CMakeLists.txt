@@ -171,10 +171,8 @@ add_executable(detect_object_image
 if(NOT WIN32)
     target_sources(detect_object_image PRIVATE
         src/LinuxCapture.cpp
-        src/LinuxOverlay.cpp
-        src/wayland/xdg-shell-protocol.c
-        src/wayland/wlr-layer-shell-unstable-v1-protocol.c
     )
+    add_subdirectory(../Wayland_Game_Overlay wayland_overlay_build)
 endif()
 
 # Link CUDA runtime to libraries
@@ -209,7 +207,7 @@ if(WIN32)
     # Windows-specific libraries (DXGI + D3D11 used by DXGICapture; HID/setupapi by MouseController)
     target_link_libraries(detect_object_image PRIVATE setupapi hid d3d11 dxgi)
 else()
-    target_link_libraries(detect_object_image PRIVATE PkgConfig::PIPEWIRE PkgConfig::DBUS PkgConfig::WAYLAND)
+    target_link_libraries(detect_object_image PRIVATE PkgConfig::PIPEWIRE PkgConfig::DBUS PkgConfig::WAYLAND wayland_overlay)
 endif()
 
 # Interactive TUI launcher: terminal UI that runs the detector as a child

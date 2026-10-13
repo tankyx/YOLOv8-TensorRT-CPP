@@ -8,7 +8,7 @@
 #include "DiscordOverlay.h"
 #else
 #include "LinuxCapture.h"
-#include "LinuxOverlay.h"
+#include <WaylandOverlay.h>
 #include <csignal>
 #endif
 #include "DetectorFactory.h"
@@ -35,7 +35,7 @@ using ScreenCapture = DXGICaptureCUDA;
 using DebugOverlay = DiscordOverlay;
 #else
 using ScreenCapture = LinuxCapture;
-using DebugOverlay = LinuxOverlay;
+using DebugOverlay = WaylandOverlay;
 
 // Ctrl+C / kill requests a clean shutdown (replaces the VK_INSERT check on Windows).
 static volatile sig_atomic_t g_quitRequested = 0;
