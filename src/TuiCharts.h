@@ -12,42 +12,6 @@
 
 namespace tui {
 
-// Sparkline density ramp, low -> high.
-inline const char *sparkRamp() { return " .:-=+*#%@"; }
-
-// Oldest sample on the left, newest on the right. Values are scaled against
-// the visible window's own min/max, so a quiet series still shows its shape.
-// Fewer samples than `width` leaves the left side blank. Always returns
-// exactly `width` characters (empty string for width <= 0).
-inline std::string sparkline(const std::vector<double> &samples, int width) {
-    if (width <= 0) return std::string();
-    std::string out(static_cast<size_t>(width), ' ');
-    const int n = static_cast<int>(samples.size());
-    if (n == 0) return out;
-
-    const int start = std::max(0, n - width);      // window on the newest part
-    const int count = n - start;
-    const int pad   = std::max(0, width - count);  // right-align the newest
-
-    double lo = samples[static_cast<size_t>(start)];
-    double hi = lo;
-    for (int i = start; i < n; ++i) {
-        lo = std::min(lo, samples[static_cast<size_t>(i)]);
-        hi = std::max(hi, samples[static_cast<size_t>(i)]);
-    }
-
-    const char *ramp = sparkRamp();
-    const double span = hi - lo;
-    for (int c = 0; c < count; ++c) {
-        const double v = samples[static_cast<size_t>(start + c)];
-        double t = (span > 1e-12) ? (v - lo) / span : 0.5;
-        t = std::min(1.0, std::max(0.0, t));
-        const int r = static_cast<int>(t * 9.0 + 0.5);
-        out[static_cast<size_t>(pad + c)] = ramp[std::min(9, std::max(0, r))];
-    }
-    return out;
-}
-
 // One detection box in capture-frame pixels, origin = capture crop top-left.
 struct Box {
     float x = 0.f, y = 0.f, w = 0.f, h = 0.f, conf = 0.f;
@@ -149,6 +113,88 @@ inline std::vector<std::string> renderBoxMap(const std::vector<Box> &boxes,
     // The crosshair is drawn last so it always stays visible through a box.
     canvas[static_cast<size_t>(cy)][static_cast<size_t>(cx)] = '+';
     return canvas;
+}
+
+// Aim-cone radar: crosshair at the centre and a circle whose radius is AimFOV
+// expressed as a fraction of GameFOV over the panel height. Character cells
+// are about twice as tall as wide, so the vertical axis is scaled by 2 to keep
+// the circle round. Returns exactly `rows` strings of `cols` chars.
+inline std::vector<std::string> renderAimCircle(int cols, int rows,
+                                                double gameFov, double aimFov) {
+    std::vector<std::string> canvas;
+    if (cols <= 0 || rows <= 0) return canvas;
+    canvas.assign(static_cast<size_t>(rows), std::string(static_cast<size_t>(cols), ' '));
+
+    const int cx = cols / 2;
+    const int cy = rows / 2;
+    for (int r = 0; r < rows; ++r) canvas[static_cast<size_t>(r)][static_cast<size_t>(cx)] = '.';
+    for (int c = 0; c < cols; ++c) canvas[static_cast<size_t>(cy)][static_cast<size_t>(c)] = '.';
+
+    double R = 1.0;
+    if (gameFov > 0.0 && aimFov > 0.0) {
+        R = (aimFov / gameFov) * rows; // radius in cell-width units
+        const double maxR = std::min(cols / 2 - 1.0, rows - 2.0);
+        if (R < 1.0) R = 1.0;
+        if (R > maxR) R = maxR;
+    }
+    if (R < 1.0) R = 1.0;
+
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            const double dx = c - cx;
+            const double dy = r - cy;
+            const double d2 = dx * dx + (2.0 * dy) * (2.0 * dy);
+            if (d2 <= R * R) {
+                const double d = std::sqrt(d2);
+                canvas[static_cast<size_t>(r)][static_cast<size_t>(c)] = (R - d < 1.5) ? 'o' : '.';
+            }
+        }
+    }
+    canvas[static_cast<size_t>(cy)][static_cast<size_t>(cx)] = '+'; // crosshair last
+    return canvas;
+}
+
+// Horizontal bar over [min,max] with the [lo,hi] band highlighted.
+inline std::string renderRangeBar(int width, double lo, double hi, double min, double max) {
+    if (width <= 0) return {};
+    std::string out(static_cast<size_t>(width), '.');
+    if (max <= min) max = min + 1.0;
+    auto idx = [&](double v) {
+        double t = (v - min) / (max - min);
+        t = std::min(1.0, std::max(0.0, t));
+        return static_cast<int>(t * (width - 1) + 0.5);
+    };
+    const int a = idx(std::min(lo, hi));
+    const int b = idx(std::max(lo, hi));
+    for (int i = a; i <= b; ++i) out[static_cast<size_t>(i)] = '#';
+    if (a == b) out[static_cast<size_t>(a)] = '*';
+    else {
+        out[static_cast<size_t>(a)] = '[';
+        out[static_cast<size_t>(b)] = ']';
+    }
+    return out;
+}
+
+// Progress bar over [min,max]; logScale maps a wide positive range to the bar.
+inline std::string renderProgressBar(int width, double value, double min, double max,
+                                     bool logScale = false) {
+    if (width <= 2) return {};
+    std::string out(static_cast<size_t>(width), '.');
+    double t = 0.5;
+    if (logScale) {
+        const double lo = (min <= 0.0) ? 1e-6 : min;
+        const double hi = (max <= lo) ? lo * 10.0 : max;
+        const double v = (value <= 0.0) ? lo : value;
+        t = (std::log10(v) - std::log10(lo)) / (std::log10(hi) - std::log10(lo));
+    } else if (max > min) {
+        t = (value - min) / (max - min);
+    }
+    t = std::min(1.0, std::max(0.0, t));
+    const int filled = static_cast<int>(t * (width - 2) + 0.5);
+    out[0] = '[';
+    out[static_cast<size_t>(width - 1)] = ']';
+    for (int i = 1; i <= filled && i < width - 1; ++i) out[static_cast<size_t>(i)] = '=';
+    return out;
 }
 
 } // namespace tui

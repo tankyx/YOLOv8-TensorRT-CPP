@@ -26,8 +26,7 @@ namespace tui {
 enum class EditorAction {
     None,
     Back,
-    SaveAndRun,
-    Quit
+    SaveAndRun
 };
 
 class IniEditor {
@@ -124,13 +123,38 @@ public:
     int editCursor() const { return m_editCursor; }
     size_t rowCount() const { return m_rows.size(); }
 
+    // Look up a row by key; nullptr when absent.
+    const Row *findRow(const std::string &key) const {
+        for (const Row &r : m_rows)
+            if (r.key == key) return &r;
+        return nullptr;
+    }
+
+    // Current value for key; empty when the key is absent.
+    std::string getValue(const std::string &key) const {
+        const Row *r = findRow(key);
+        return r ? r->value : std::string();
+    }
+
+    // Replace the value for key (marks the document dirty). False when absent.
+    bool setValue(const std::string &key, const std::string &value) {
+        for (size_t i = 0; i < m_rows.size(); ++i) {
+            if (m_rows[i].key == key) {
+                spliceValue(i, value);
+                m_dirty = true;
+                return true;
+            }
+        }
+        return false;
+    }
+
     // Footer hint for the current mode.
     std::string footer() const {
         if (m_confirm) {
             return " unsaved changes:  s save   d discard   esc cancel";
         }
         if (m_editing) {
-            return " enter commit   esc cancel   left/right move   backspace delete";
+            return " enter commit   esc cancel   arrows/home/end   backspace/delete";
         }
         return " up/down move   enter edit   s save   r save+run   esc back";
     }
@@ -231,6 +255,16 @@ public:
                     return EditorAction::None;
                 case Key::Right:
                     if (m_editCursor < static_cast<int>(m_editBuffer.size())) ++m_editCursor;
+                    return EditorAction::None;
+                case Key::Delete:
+                    if (m_editCursor < static_cast<int>(m_editBuffer.size()))
+                        m_editBuffer.erase(static_cast<size_t>(m_editCursor), 1);
+                    return EditorAction::None;
+                case Key::Home:
+                    m_editCursor = 0;
+                    return EditorAction::None;
+                case Key::End:
+                    m_editCursor = static_cast<int>(m_editBuffer.size());
                     return EditorAction::None;
                 case Key::Char:
                     m_editBuffer.insert(m_editBuffer.begin() + m_editCursor, k.ch);

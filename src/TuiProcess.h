@@ -25,6 +25,7 @@
 #  endif
 #  include <windows.h>
 #else
+#  include <cerrno>
 #  include <fcntl.h>
 #  include <signal.h>
 #  include <sys/stat.h>
@@ -200,7 +201,16 @@ public:
             m_pid = -1;
             return false;
         }
-        return r == 0;
+        if (r < 0) {
+            // ECHILD: already reaped (no such child) -> treat as exited.
+            // EINTR and other errors: the child is still running.
+            if (errno == ECHILD) {
+                m_pid = -1;
+                return false;
+            }
+            return true;
+        }
+        return true; // r == 0: still running
 #endif
     }
 

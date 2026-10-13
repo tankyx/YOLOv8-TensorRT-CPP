@@ -42,6 +42,9 @@ enum class Key {
     Enter,
     Escape,
     Backspace,
+    Home,
+    End,
+    Delete,
     Resize,
     Char,
     Unknown
@@ -174,12 +177,6 @@ public:
 #endif
     }
 
-    void moveTo(int row, int col) { // 1-based
-        char buf[32];
-        std::snprintf(buf, sizeof(buf), "\x1b[%d;%dH", row, col);
-        write(buf);
-    }
-
     void clear() { write("\x1b[2J\x1b[H"); }
     void hideCursor() { write("\x1b[?25l"); }
     void showCursor() { write("\x1b[?25h"); }
@@ -212,6 +209,9 @@ public:
                 case VK_RETURN: return KeyEvent{Key::Enter, 0};
                 case VK_ESCAPE: return KeyEvent{Key::Escape, 0};
                 case VK_BACK:  return KeyEvent{Key::Backspace, 0};
+                case VK_HOME:   return KeyEvent{Key::Home, 0};
+                case VK_END:    return KeyEvent{Key::End, 0};
+                case VK_DELETE: return KeyEvent{Key::Delete, 0};
                 default: break;
             }
             wchar_t wc = ke.uChar.UnicodeChar;
@@ -237,8 +237,36 @@ public:
                     case 'B': return KeyEvent{Key::Down, 0};
                     case 'C': return KeyEvent{Key::Right, 0};
                     case 'D': return KeyEvent{Key::Left, 0};
-                    default: break;
+                    case 'H': return KeyEvent{Key::Home, 0};
+                    case 'F': return KeyEvent{Key::End, 0};
+                    case '1': case '2': case '3': case '4': case '5':
+                    case '6': case '7': case '8': case '9': {
+                        // "ESC [ n ~" (Home/End/Delete/Insert/PgUp/PgDn). The
+                        // '~' may trail; consume to it so it is not retyped.
+                        int b3 = nextByte(30);
+                        if (b3 == '~') {
+                            switch (b2) {
+                                case '1': case '7': return KeyEvent{Key::Home, 0};
+                                case '3': return KeyEvent{Key::Delete, 0};
+                                case '4': case '8': return KeyEvent{Key::End, 0};
+                                default: return KeyEvent{Key::Unknown, 0};
+                            }
+                        }
+                        // Modifier form "ESC [ n ; m ..." (e.g. Ctrl+arrows):
+                        // consume the rest of the sequence.
+                        while (b3 >= 0 && !(b3 >= 0x40 && b3 <= 0x7E)) b3 = nextByte(30);
+                        return KeyEvent{Key::Unknown, 0};
+                    }
+                    default: {
+                        // Unrecognized CSI (Shift+Tab, F-keys, etc.). If b2 is
+                        // not already the final byte, consume the rest.
+                        if (b2 >= 0 && !(b2 >= 0x40 && b2 <= 0x7E)) drainSeq();
+                        return KeyEvent{Key::Unknown, 0};
+                    }
                 }
+            } else if (b1 == 'O') {
+                drainSeq(); // SS3 (application keypad): consume the final byte
+                return KeyEvent{Key::Unknown, 0};
             } else {
                 ungetByte(b1); // not a sequence: hand the byte to the next read
             }
@@ -249,9 +277,6 @@ public:
         }
         if (b0 == 0x7f || b0 == 0x08) {
             return KeyEvent{Key::Backspace, 0};
-        }
-        if (b0 == 3) { // raw Ctrl+C (should normally arrive as SIGINT)
-            return KeyEvent{Key::Char, 'c'};
         }
         if (b0 >= 32 && b0 < 127) {
             return KeyEvent{Key::Char, static_cast<char>(b0)};
@@ -284,6 +309,16 @@ private:
     void ungetByte(int b) {
         if (b < 0) return;
         if (m_bufPos > 0) m_buf[--m_bufPos] = static_cast<unsigned char>(b);
+    }
+
+    // Reads and discards bytes until a CSI/SS3 final byte (0x40..0x7E, the
+    // last character of any such sequence) or timeout, so an unrecognized
+    // escape sequence is fully swallowed instead of its tail being retyped.
+    // Returns that final byte, or -1 on timeout.
+    int drainSeq() {
+        int b;
+        do { b = nextByte(30); } while (b >= 0 && !(b >= 0x40 && b <= 0x7E));
+        return b;
     }
 #endif
 

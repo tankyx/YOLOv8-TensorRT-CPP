@@ -22,6 +22,7 @@
 #include "TuiCharts.h"
 #include "TuiEditor.h"
 #include "TuiProcess.h"
+#include "TuiSettings.h"
 #include "TuiTerminal.h"
 
 #include <algorithm>
@@ -184,11 +185,12 @@ static bool jsonBool(const std::string &s, const char *key, bool &out) {
     if (p == std::string::npos) return false;
     p = s.find(':', p + k.size());
     if (p == std::string::npos) return false;
-    size_t t = s.find("true", p);
-    size_t f = s.find("false", p);
-    if (t == std::string::npos && f == std::string::npos) return false;
-    out = (f == std::string::npos) || (t != std::string::npos && t < f);
-    return true;
+    size_t q = p + 1;
+    while (q < s.size() &&
+           (s[q] == ' ' || s[q] == '\t' || s[q] == '\n' || s[q] == '\r')) ++q;
+    if (s.compare(q, 4, "true") == 0) { out = true; return true; }
+    if (s.compare(q, 5, "false") == 0) { out = false; return true; }
+    return false;
 }
 
 // Parses the additive "boxes":[[x,y,w,h,conf,label],...] tail of status.json.
@@ -301,6 +303,26 @@ static std::vector<ConfigEntry> scanConfigs(const fs::path &dir) {
     return out;
 }
 
+// All .onnx files under `dir`, as paths relative to `dir` (falling back to the
+// bare filename when a relative path cannot be computed). Sorted.
+static std::vector<std::string> scanOnnxFiles(const fs::path &dir) {
+    std::vector<std::string> out;
+    std::error_code ec;
+    fs::recursive_directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec);
+    const fs::recursive_directory_iterator end;
+    for (; !ec && it != end; it.increment(ec)) {
+        if (ec) break;
+        std::error_code fec;
+        if (!it->is_regular_file(fec)) continue;
+        if (it->path().extension() != ".onnx") continue;
+        std::error_code rec;
+        const fs::path rel = fs::relative(it->path(), dir, rec);
+        out.push_back(rec ? it->path().filename().string() : rel.string());
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
 // Directory of this executable (so the TUI can be launched from anywhere).
 static fs::path executableDir() {
 #if defined(_WIN32)
@@ -373,7 +395,7 @@ struct Canvas {
 static void render(Terminal &term, const Canvas &cv) {
     std::string out;
     out.reserve(static_cast<size_t>(cv.rows) * static_cast<size_t>(cv.cols + 16));
-    out += "\x1b[H";
+    out += "\x1b[2J\x1b[H";
     for (int r = 0; r < cv.rows; ++r) {
         switch (cv.style[static_cast<size_t>(r)]) {
             case STYLE_TITLE:    out += "\x1b[7m";  break;
@@ -408,6 +430,39 @@ static void printUsage(const char *argv0) {
         "Keys: up/down or j/k select config, enter run, s stop, r rescan, q quit.\n"
         "      m toggles the live detection monitor while a detector is running.\n",
         argv0);
+}
+
+// ---------------------------------------------------------------------------
+// Structured settings screen: the curated fields (TuiSettings.h) flattened
+// with section headers plus a trailing "Advanced" entry for the raw INI editor.
+// ---------------------------------------------------------------------------
+struct SettingsRow {
+    bool isSection = false;
+    bool isAdvanced = false;
+    int fieldIdx = -1;
+    std::string section;
+};
+
+static std::vector<SettingsRow> buildSettingsRows() {
+    std::vector<SettingsRow> rows;
+    const std::vector<tui::Field> &fields = tui::settingsFields();
+    std::string last;
+    for (int i = 0; i < static_cast<int>(fields.size()); ++i) {
+        if (fields[static_cast<size_t>(i)].section != last) {
+            SettingsRow h;
+            h.isSection = true;
+            h.section = fields[static_cast<size_t>(i)].section;
+            rows.push_back(h);
+            last = h.section;
+        }
+        SettingsRow r;
+        r.fieldIdx = i;
+        rows.push_back(r);
+    }
+    SettingsRow adv;
+    adv.isAdvanced = true;
+    rows.push_back(adv);
+    return rows;
 }
 
 // ---------------------------------------------------------------------------
@@ -471,12 +526,25 @@ int main(int argc, char **argv) {
     ChildProcess child;
 
     // ---- screens: config list (with action menu), config editor, monitor ----
-    enum class Screen { List, Editor, Monitor };
+    enum class Screen { List, Editor, Settings, Monitor, Onnx };
     Screen screen = Screen::List;
     bool menuOpen = false;
     int menuSel = 0;
     const int kMenuItems = 3; // Edit config / Run detector / Back
     tui::IniEditor editor;
+    // Structured settings screen state.
+    const std::vector<SettingsRow> setRows = buildSettingsRows();
+    int setSel = 0;
+    int setTop = 0;
+    bool setEditing = false;
+    bool setConfirm = false;
+    tui::LineEdit setEdit;
+    int setEditIdx = -1;
+    bool editorFromSettings = false;
+    // Onnx model picker state.
+    std::vector<std::string> pickerItems;
+    int pickerSel = 0;
+    int pickerFieldIdx = -1;
     // Newest box snapshot from status.json; refilled on every launch.
     std::vector<tui::Box> lastBoxes;
     double lastMetricsTs = -1.0;
@@ -525,12 +593,35 @@ int main(int argc, char **argv) {
         if (configs.empty()) return;
         std::string err;
         if (editor.load((dir / configs[static_cast<size_t>(sel)].file).string(), err)) {
-            screen = Screen::Editor;
+            editorFromSettings = false;
+            setSel = 0;
+            while (setSel < static_cast<int>(setRows.size()) && setRows[static_cast<size_t>(setSel)].isSection) ++setSel;
+            setTop = 0;
+            setEditing = false;
+            setConfirm = false;
+            setEditIdx = -1;
+            screen = Screen::Settings;
             menuOpen = false;
             message = "editing " + configs[static_cast<size_t>(sel)].file;
         } else {
             message = "editor: " + err;
         }
+    };
+
+    // Opens the .onnx picker for a field, pre-selecting the current value.
+    auto openOnnxPicker = [&](int fieldIdx) {
+        pickerItems = scanOnnxFiles(dir);
+        pickerFieldIdx = fieldIdx;
+        pickerSel = 0;
+        const std::string cur = editor.getValue(tui::settingsFields()[static_cast<size_t>(fieldIdx)].key);
+        for (size_t i = 0; i < pickerItems.size(); ++i) {
+            if (pickerItems[i] == cur ||
+                fs::path(pickerItems[i]).filename() == fs::path(cur).filename()) {
+                pickerSel = static_cast<int>(i);
+                break;
+            }
+        }
+        screen = Screen::Onnx;
     };
 
     // Reads status.json once and refreshes the shared box snapshot and the
@@ -612,7 +703,7 @@ int main(int argc, char **argv) {
         if (screen == Screen::Editor) {
             switch (editor.handleKey(k, message)) {
                 case tui::EditorAction::Back:
-                    screen = Screen::List;
+                    screen = editorFromSettings ? Screen::Settings : Screen::List;
                     configs = scanConfigs(dir); // the edited config may have moved
                     if (sel >= static_cast<int>(configs.size())) sel = 0;
                     break;
@@ -620,11 +711,148 @@ int main(int argc, char **argv) {
                     screen = Screen::List;
                     launch();
                     break;
-                case tui::EditorAction::Quit:
-                    quit = true;
-                    break;
                 case tui::EditorAction::None:
                     break;
+            }
+        } else if (screen == Screen::Settings) {
+            const int n = static_cast<int>(setRows.size());
+            auto moveSel = [&](int d) {
+                if (n == 0) return;
+                int p = setSel;
+                do { p = (p + d + n) % n; } while (setRows[static_cast<size_t>(p)].isSection);
+                setSel = p;
+            };
+
+            if (setConfirm) {
+                if (ch == 's') {
+                    std::string err;
+                    if (editor.save(err)) {
+                        message = "saved " + editor.path();
+                        setConfirm = false;
+                        screen = Screen::List;
+                    } else {
+                        message = "save failed: " + err;
+                    }
+                } else if (ch == 'd') {
+                    std::string err;
+                    if (editor.load(editor.path(), err)) message = "changes discarded";
+                    else message = "reload failed: " + err;
+                    setConfirm = false;
+                    screen = Screen::List;
+                } else if (k.key == Key::Escape) {
+                    setConfirm = false;
+                }
+            } else if (setEditing) {
+                const tui::Field &f = tui::settingsFields()[static_cast<size_t>(setRows[static_cast<size_t>(setEditIdx)].fieldIdx)];
+                if (k.key == Key::Escape) {
+                    setEditing = false;
+                    setEditIdx = -1;
+                } else if (k.key == Key::Enter) {
+                    const std::string v = tui::trim(setEdit.buf);
+                    std::string norm;
+                    if (f.type == tui::FieldType::Int) norm = tui::normalizeInt(f, v);
+                    else if (f.type == tui::FieldType::Float) norm = tui::normalizeFloat(f, v);
+                    else norm = v; // Text
+                    if (f.type != tui::FieldType::Text && norm.empty()) {
+                        message = "invalid value for " + std::string(f.label) + " (range " +
+                                  std::to_string(static_cast<long long>(f.min)) + "-" +
+                                  std::to_string(static_cast<long long>(f.max)) + ")";
+                    } else {
+                        editor.setValue(f.key, norm);
+                        setEditing = false;
+                        setEditIdx = -1;
+                        message = std::string(f.label) + " = " + norm;
+                    }
+                } else {
+                    setEdit.handle(k);
+                }
+            } else {
+                const SettingsRow &row = setRows[static_cast<size_t>(setSel)];
+                if (k.key == Key::Up || (k.key == Key::Char && ch == 'k')) {
+                    moveSel(-1);
+                } else if (k.key == Key::Down || (k.key == Key::Char && ch == 'j')) {
+                    moveSel(1);
+                } else if (k.key == Key::Enter) {
+                    if (row.isAdvanced) {
+                        editorFromSettings = true;
+                        screen = Screen::Editor;
+                    } else if (!row.isSection) {
+                        const tui::Field &f = tui::settingsFields()[static_cast<size_t>(row.fieldIdx)];
+                        if (f.type == tui::FieldType::Bool) {
+                            bool b = false;
+                            tui::parseBool(editor.getValue(f.key), b);
+                            editor.setValue(f.key, b ? "false" : "true");
+                            message = std::string(f.label) + " " + (b ? "off" : "on");
+                        } else if (f.type == tui::FieldType::Choice) {
+                            const std::vector<std::string> vals = tui::choiceValues(f);
+                            if (!vals.empty()) {
+                                const std::string cur = editor.getValue(f.key);
+                                size_t idx = 0;
+                                for (size_t i = 0; i < vals.size(); ++i) if (vals[i] == cur) { idx = i; break; }
+                                const std::string next = vals[(idx + 1) % vals.size()];
+                                editor.setValue(f.key, next);
+                                message = std::string(f.label) + " = " + next;
+                            }
+                        } else if (f.type == tui::FieldType::OnnxPicker) {
+                            openOnnxPicker(row.fieldIdx);
+                        } else {
+                            setEditing = true;
+                            setEditIdx = setSel;
+                            setEdit.start(editor.getValue(f.key));
+                        }
+                    }
+                } else if ((k.key == Key::Left || k.key == Key::Right) && !row.isSection && !row.isAdvanced) {
+                    const tui::Field &f = tui::settingsFields()[static_cast<size_t>(row.fieldIdx)];
+                    if (f.type == tui::FieldType::Bool) {
+                        bool b = false;
+                        tui::parseBool(editor.getValue(f.key), b);
+                        editor.setValue(f.key, b ? "false" : "true");
+                    } else if (f.type == tui::FieldType::Choice) {
+                        const std::vector<std::string> vals = tui::choiceValues(f);
+                        if (!vals.empty()) {
+                            const std::string cur = editor.getValue(f.key);
+                            size_t idx = 0;
+                            for (size_t i = 0; i < vals.size(); ++i) if (vals[i] == cur) { idx = i; break; }
+                            editor.setValue(f.key, vals[(idx + 1) % vals.size()]);
+                        }
+                    } else if (f.type == tui::FieldType::OnnxPicker) {
+                        openOnnxPicker(row.fieldIdx);
+                    }
+                } else if (ch == 's') {
+                    std::string err;
+                    if (editor.save(err)) message = "saved " + editor.path();
+                    else message = "save failed: " + err;
+                } else if (ch == 'r') {
+                    std::string err;
+                    if (!editor.save(err)) {
+                        message = "save failed: " + err;
+                    } else {
+                        screen = Screen::List;
+                        launch();
+                    }
+                } else if (k.key == Key::Escape || (k.key == Key::Char && ch == 'q')) {
+                    if (editor.dirty()) {
+                        setConfirm = true;
+                    } else {
+                        screen = Screen::List;
+                    }
+                }
+            }
+        } else if (screen == Screen::Onnx) {
+            const int n = static_cast<int>(pickerItems.size());
+            if (k.key == Key::Up || (k.key == Key::Char && ch == 'k')) {
+                if (n > 0) pickerSel = (pickerSel + n - 1) % n;
+            } else if (k.key == Key::Down || (k.key == Key::Char && ch == 'j')) {
+                if (n > 0) pickerSel = (pickerSel + 1) % n;
+            } else if (k.key == Key::Enter) {
+                if (pickerFieldIdx >= 0 && n > 0) {
+                    const tui::Field &f = tui::settingsFields()[static_cast<size_t>(pickerFieldIdx)];
+                    editor.setValue(f.key, pickerItems[static_cast<size_t>(pickerSel)]);
+                    message = std::string(f.label) + " = " + pickerItems[static_cast<size_t>(pickerSel)];
+                }
+                screen = Screen::Settings;
+            } else if (k.key == Key::Escape) {
+                screen = Screen::Settings;
             }
         } else if (screen == Screen::Monitor) {
             // Live monitor: keep it minimal, but never hide the stop/quit keys.
@@ -789,6 +1017,204 @@ int main(int argc, char **argv) {
             continue;
         }
 
+        // ---- onnx model picker ----------------------------------------------
+        if (screen == Screen::Onnx) {
+            Canvas cv(sz.rows, sz.cols);
+            const int R = sz.rows;
+            const int C = sz.cols;
+            cv.put(1, 1, trunc(sanitize(" Select model   dir: " + dir.string()), static_cast<size_t>(C)));
+            cv.setStyle(1, STYLE_TITLE);
+            cv.put(2, 1, trunc(sanitize(" enter select   esc cancel   up/down or j/k move"), static_cast<size_t>(C)));
+            cv.setStyle(2, STYLE_DIM);
+
+            const int n = static_cast<int>(pickerItems.size());
+            const int bodyTop = 3;
+            const int bodyRows = std::max(1, R - 4);
+            int start = 0;
+            if (n > bodyRows) {
+                start = pickerSel - bodyRows / 2;
+                if (start < 0) start = 0;
+                if (start > n - bodyRows) start = n - bodyRows;
+            }
+            const std::string cur = (pickerFieldIdx >= 0)
+                ? editor.getValue(tui::settingsFields()[static_cast<size_t>(pickerFieldIdx)].key)
+                : std::string();
+            for (int i = start; i < n && (i - start) < bodyRows; ++i) {
+                const int r = bodyTop + (i - start);
+                const std::string mark = (i == pickerSel) ? "> " : "  ";
+                const std::string suffix = (pickerItems[static_cast<size_t>(i)] == cur) ? "   (current)" : "";
+                cv.put(r, 1, trunc(sanitize(mark + pickerItems[static_cast<size_t>(i)] + suffix), static_cast<size_t>(C)));
+                if (i == pickerSel) cv.setStyle(r, STYLE_SELECTED);
+            }
+            if (n == 0) {
+                cv.put(bodyTop, 1, trunc(sanitize("  no .onnx files found in " + dir.string()), static_cast<size_t>(C)));
+                cv.setStyle(bodyTop, STYLE_WARN);
+            }
+            cv.put(R - 1, 1, trunc(sanitize("current: " + (cur.empty() ? std::string("(none)") : cur)), static_cast<size_t>(C)));
+            cv.setStyle(R - 1, STYLE_DIM);
+            cv.put(R, 1, trunc(sanitize(" model:  enter select   esc cancel"), static_cast<size_t>(C)));
+            cv.setStyle(R, STYLE_DIM);
+            render(term, cv);
+            continue;
+        }
+
+        // ---- structured settings screen -------------------------------------
+        if (screen == Screen::Settings) {
+            const std::vector<tui::Field> &fields = tui::settingsFields();
+            const int n = static_cast<int>(setRows.size());
+            Canvas cv(sz.rows, sz.cols);
+            const int R = sz.rows;
+            const int C = sz.cols;
+
+            std::string head = " Configure " + editor.path() + (editor.dirty() ? "   (modified)" : "");
+            cv.put(1, 1, trunc(sanitize(head), static_cast<size_t>(C)));
+            cv.setStyle(1, STYLE_TITLE);
+            cv.put(2, 1, trunc(sanitize(" enter change/edit   left/right toggle+cycle   s save   r save+run   esc back"), static_cast<size_t>(C)));
+            cv.setStyle(2, STYLE_DIM);
+
+            const int footerRow = R;
+            const int helpRow = R - 1;
+            const int bodyTop = 3;
+            const int bodyRows = std::max(1, R - 4);
+
+            if (setSel < setTop) setTop = setSel;
+            if (setSel >= setTop + bodyRows) setTop = setSel - bodyRows + 1;
+            int maxTop = n - bodyRows;
+            if (maxTop < 0) maxTop = 0;
+            if (setTop > maxTop) setTop = maxTop;
+
+            // Two panes below the header: field list on the left, live preview
+            // for the selected field on the right.
+            const int lw = std::min(40, std::max(30, C / 2));
+            const int px = lw + 3;
+            const int pw = std::max(10, C - px + 1);
+            const int valCol = std::min(28, std::max(16, lw - 12));
+
+            for (int i = setTop; i < n && (i - setTop) < bodyRows; ++i) {
+                const int r = bodyTop + (i - setTop);
+                const SettingsRow &row = setRows[static_cast<size_t>(i)];
+                if (row.isSection) {
+                    cv.put(r, 1, trunc(sanitize(" " + row.section), static_cast<size_t>(lw)));
+                    cv.setStyle(r, STYLE_SECTION);
+                    continue;
+                }
+                std::string text;
+                if (row.isAdvanced) {
+                    text = "  Advanced (raw INI) ...";
+                } else {
+                    const tui::Field &f = fields[static_cast<size_t>(row.fieldIdx)];
+                    std::string val = editor.getValue(f.key);
+                    if (setEditing && i == setSel) {
+                        val = setEdit.withCaret();
+                    } else if (f.type == tui::FieldType::Bool) {
+                        bool b = false;
+                        tui::parseBool(val, b);
+                        val = b ? "on" : "off";
+                    }
+                    std::string lab = "  " + std::string(f.label);
+                    while (lab.size() < static_cast<size_t>(valCol)) lab += ' ';
+                    text = lab + " " + val;
+                }
+                cv.put(r, 1, trunc(sanitize(text), static_cast<size_t>(lw)));
+                if (i == setSel) cv.setStyle(r, STYLE_SELECTED);
+            }
+
+            // ---- live preview panel ----------------------------------------
+            cv.put(bodyTop, px, trunc("preview", static_cast<size_t>(pw)));
+            cv.setStyle(bodyTop, STYLE_SECTION);
+
+            const SettingsRow &srow = setRows[static_cast<size_t>(setSel)];
+            const bool isField = !srow.isSection && !srow.isAdvanced;
+            const tui::Field *pf = isField ? &fields[static_cast<size_t>(srow.fieldIdx)] : nullptr;
+            auto num = [&](const char *key, double def) {
+                double v = def;
+                tui::parseDouble(editor.getValue(key), v);
+                return v;
+            };
+
+            std::vector<std::string> pv;
+            std::vector<std::string> radar;
+            int radarRows = 0;
+            std::string radarLabel;
+            if (pf) {
+                const std::string k = pf->key;
+                if (k == "GameFOV" || k == "AimFOV") {
+                    const double gameFov = num("GameFOV", 106.0);
+                    const double aimFov = num("AimFOV", 45.0);
+                    radarRows = std::max(3, bodyRows - 4);
+                    radar = tui::renderAimCircle(pw - 2, radarRows, gameFov, aimFov);
+                    radarLabel = "aim " + fmt1(aimFov) + "deg   game " + fmt1(gameFov) + "deg";
+                } else if (k == "MinGain" || k == "MaxGain") {
+                    const double lo = num("MinGain", 0.25);
+                    const double hi = num("MaxGain", 0.65);
+                    pv.push_back(tui::renderRangeBar(pw, lo, hi, 0.0, 1.0));
+                    pv.push_back(fmt2(lo) + " min          max " + fmt2(hi));
+                } else {
+                    double mn = 0.0, mx = 0.0;
+                    bool lg = false;
+                    if (k == "Smoothing") { mn = 1; mx = 10; }
+                    else if (k == "MaxSpeed") { mn = 0; mx = 1000; }
+                    else if (k == "MouseSensitivity") { mn = 0.001; mx = 100; lg = true; }
+                    else if (k == "DebugSnapGain") { mn = 0; mx = 100; }
+                    else if (k == "CaptureFPS") { mn = 1; mx = 500; }
+                    else if (k == "DebugCaptureWindowFPS") { mn = 0; mx = 240; }
+                    else if (k == "CPI") { mn = 100; mx = 100000; lg = true; }
+                    if (mx > mn) {
+                        const double v = num(k.c_str(), mn);
+                        pv.push_back(tui::renderProgressBar(pw, v, mn, mx, lg));
+                        pv.push_back(fmt2(v) + " / " + fmt2(mx));
+                    }
+                }
+            }
+            if (!radar.empty()) {
+                const std::string hrule = "+" + std::string(static_cast<size_t>(pw - 2), '-') + "+";
+                cv.put(bodyTop + 1, px, trunc(hrule, static_cast<size_t>(C)));
+                cv.setStyle(bodyTop + 1, STYLE_DIM);
+                for (int i = 0; i < radarRows; ++i) {
+                    const int r = bodyTop + 2 + i;
+                    if (r >= helpRow) break;
+                    cv.put(r, px, trunc(sanitize("|" + radar[static_cast<size_t>(i)] + "|"), static_cast<size_t>(C)));
+                }
+                cv.put(bodyTop + 2 + radarRows, px, trunc(hrule, static_cast<size_t>(C)));
+                cv.setStyle(bodyTop + 2 + radarRows, STYLE_DIM);
+                cv.put(bodyTop + 3 + radarRows, px, trunc(sanitize(radarLabel), static_cast<size_t>(pw)));
+            } else if (pv.empty()) {
+                const std::string val = pf ? editor.getValue(pf->key)
+                                           : std::string("(select a field)");
+                cv.put(bodyTop + 1, px, trunc(sanitize("current: " + val), static_cast<size_t>(pw)));
+                cv.setStyle(bodyTop + 1, STYLE_DIM);
+            } else {
+                for (size_t i = 0; i < pv.size(); ++i) {
+                    const int r = bodyTop + 1 + static_cast<int>(i);
+                    if (r >= helpRow) break;
+                    cv.put(r, px, trunc(sanitize(pv[i]), static_cast<size_t>(pw)));
+                }
+            }
+
+            std::string help;
+            bool warn = false;
+            if (!message.empty()) {
+                help = message;
+                warn = message.find("failed") != std::string::npos ||
+                       message.find("invalid") != std::string::npos;
+            } else if (setConfirm) {
+                help = "unsaved changes:  s save   d discard   esc cancel";
+            } else if (setEditing) {
+                help = "enter commit   esc cancel   home/end   backspace/delete";
+            } else if (!setRows[static_cast<size_t>(setSel)].isSection) {
+                const SettingsRow &row = setRows[static_cast<size_t>(setSel)];
+                help = row.isAdvanced ? "open the raw INI editor for every key"
+                                      : fields[static_cast<size_t>(row.fieldIdx)].help;
+            }
+            cv.put(helpRow, 1, trunc(sanitize(help), static_cast<size_t>(C)));
+            cv.setStyle(helpRow, warn ? STYLE_WARN : STYLE_DIM);
+
+            cv.put(footerRow, 1, trunc(sanitize(" configure:  enter change   s save   r save+run   esc back   q back"), static_cast<size_t>(C)));
+            cv.setStyle(footerRow, STYLE_DIM);
+            render(term, cv);
+            continue;
+        }
+
         // ---- config editor screen ------------------------------------------
         if (screen == Screen::Editor) {
             Canvas ecv(sz.rows, sz.cols);
@@ -838,8 +1264,8 @@ int main(int argc, char **argv) {
                 running ? " [RUNNING pid " + std::to_string(child.pid()) + "]"
                         : " [stopped, last exit " + std::to_string(lastExit) + "]";
             cv.put(1, 1,
-                   trunc(" YOLO Detector Monitor" + stateStr + "   " + runningFile +
-                             "   dir: " + dir.string(),
+                   trunc(sanitize(" YOLO Detector Monitor" + stateStr + "   " + runningFile +
+                             "   dir: " + dir.string()),
                          static_cast<size_t>(C)));
             cv.setStyle(1, STYLE_TITLE);
 
@@ -1012,7 +1438,8 @@ int main(int argc, char **argv) {
         } else {
             stateStr = " [idle]";
         }
-        cv.put(1, 1, trunc(" YOLO TensorRT Detector TUI" + stateStr + "   dir: " + dir.string(),
+        cv.put(1, 1, trunc(sanitize(" YOLO TensorRT Detector TUI" + stateStr +
+                           "   dir: " + dir.string()),
                            static_cast<size_t>(C)));
         cv.setStyle(1, STYLE_TITLE);
 

@@ -223,6 +223,12 @@ if(WIN32)
     target_link_libraries(detector_tui PRIVATE user32)
 endif()
 
+# Minimal self-check for the TUI settings helpers (pure C++17, no framework).
+enable_testing()
+add_executable(tui_settings_selftest test/tui_settings_selftest.cpp)
+target_include_directories(tui_settings_selftest PRIVATE src)
+add_test(NAME tui_settings_selftest COMMAND tui_settings_selftest)
+
 # Set output directories
 set_target_properties(detect_object_image PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
