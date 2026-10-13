@@ -1,0 +1,3 @@
+[submodule "third_party/Wayland_Game_Overlay"]
+	path = third_party/Wayland_Game_Overlay
+	url = https://github.com/tankyx/Wayland_Game_Overlay.git

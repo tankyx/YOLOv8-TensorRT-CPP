@@ -172,7 +172,7 @@ if(NOT WIN32)
     target_sources(detect_object_image PRIVATE
         src/LinuxCapture.cpp
     )
-    add_subdirectory(../Wayland_Game_Overlay wayland_overlay_build)
+    add_subdirectory(third_party/Wayland_Game_Overlay wayland_overlay_build)
 endif()
 
 # Link CUDA runtime to libraries
