@@ -3,4 +3,4 @@
 	url = https://github.com/tankyx/Wayland_Game_Overlay.git
 [submodule "third_party/PhysicalHidMouse"]
 	path = third_party/PhysicalHidMouse
-	url = git@github.com:tankyx/PhysicalHidMouse.git
+	url = https://github.com/tankyx/PhysicalHidMouse.git
