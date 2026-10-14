@@ -14,6 +14,8 @@
 #include <setupapi.h>
 #include <hidsdi.h>
 #include <hidclass.h>
+#else
+#include <physical_hid_mouse.h>
 #endif
 
 // Cubic-bezier path generator for screen-space mouse smoothing. Ported from
@@ -131,11 +133,11 @@ private:
 #ifdef _WIN32
     HANDLE hidDevice;
 #else
-    // Linux I/O: movement/click output goes to a virtual mouse created on
-    // /dev/uinput; physical button/trigger state is read from evdev nodes
-    // found at connect time (mouse for BTN_LEFT/BTN_RIGHT, keyboard for the
-    // trigger hold key). Cached states are refreshed by drainInputDevices().
-    int m_uinputFd = -1;
+    // Linux I/O: movement/click output goes to the physical USB HID mouse
+    // (shared PhysicalHidMouse library); physical button/trigger state is read
+    // from evdev nodes found at connect time (mouse for BTN_LEFT/BTN_RIGHT,
+    // keyboard for the trigger hold key). Refreshed by drainInputDevices().
+    phm::PhysicalHidMouse m_hid;
     int m_evdevMouseFd = -1;
     int m_evdevKbdFd = -1;
     bool m_leftPressed = false;

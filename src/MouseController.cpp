@@ -9,7 +9,6 @@
 #include <fcntl.h>
 #include <glob.h>
 #include <linux/input.h>
-#include <linux/uinput.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 #endif
@@ -79,11 +78,6 @@ MouseController::~MouseController() {
         CloseHandle(hidDevice);
     }
 #else
-    if (m_uinputFd >= 0) {
-        ioctl(m_uinputFd, UI_DEV_DESTROY);
-        close(m_uinputFd);
-        m_uinputFd = -1;
-    }
     if (m_evdevMouseFd >= 0) {
         close(m_evdevMouseFd);
         m_evdevMouseFd = -1;
@@ -198,44 +192,18 @@ bool evdevHasBit(const unsigned long *bits, size_t wordCount, unsigned int code)
 } // namespace
 
 bool MouseController::ConnectToDevice() {
-    // Output side: create a virtual mouse on /dev/uinput. Movement and click
-    // reports are emitted as evdev events (see sendHIDReport).
-    m_uinputFd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
-    if (m_uinputFd < 0) {
-        std::cerr << "MouseController: cannot open /dev/uinput: " << std::strerror(errno) << ". "
-                  << "Add your user to the 'input' group and install a udev rule such as "
-                  << "KERNEL==\"uinput\", MODE=\"0660\", GROUP=\"input\", OPTIONS+=\"static_node=uinput\" "
-                  << "(then re-login). Aim/click output is disabled." << std::endl;
+    // Output side: open the physical USB HID mouse -- an MCU presenting as a
+    // mouse. Reports travel the USB bus, not /dev/uinput, so the device is
+    // indistinguishable from an ordinary mouse to the OS.
+    m_hid.open(hidVendorId, hidProductId, std::string(hidSerial.begin(), hidSerial.end()));
+    if (!m_hid.ok()) {
+        std::cerr << "MouseController: no physical HID mouse for VID 0x" << std::hex << hidVendorId
+                  << " PID 0x" << hidProductId << std::dec << ". Install third_party/PhysicalHidMouse/"
+                  << "70-physical-hid-mouse.rules (or add your user to the 'input' group). "
+                  << "Aim/click output is disabled." << std::endl;
         return false;
     }
-
-    if (ioctl(m_uinputFd, UI_SET_EVBIT, EV_REL) < 0 ||
-        ioctl(m_uinputFd, UI_SET_RELBIT, REL_X) < 0 ||
-        ioctl(m_uinputFd, UI_SET_RELBIT, REL_Y) < 0 ||
-        ioctl(m_uinputFd, UI_SET_EVBIT, EV_KEY) < 0 ||
-        ioctl(m_uinputFd, UI_SET_KEYBIT, BTN_LEFT) < 0 ||
-        ioctl(m_uinputFd, UI_SET_KEYBIT, BTN_RIGHT) < 0 ||
-        ioctl(m_uinputFd, UI_SET_KEYBIT, BTN_MIDDLE) < 0) {
-        std::cerr << "MouseController: uinput capability setup failed: " << std::strerror(errno) << std::endl;
-        close(m_uinputFd);
-        m_uinputFd = -1;
-        return false;
-    }
-
-    struct uinput_setup setup {};
-    std::snprintf(setup.name, UINPUT_MAX_NAME_SIZE, "yolo-virtual-mouse");
-    setup.id.bustype = BUS_USB;
-    setup.id.vendor = hidVendorId;
-    setup.id.product = hidProductId;
-    setup.id.version = 1;
-
-    if (ioctl(m_uinputFd, UI_DEV_SETUP, &setup) < 0 || ioctl(m_uinputFd, UI_DEV_CREATE) < 0) {
-        std::cerr << "MouseController: uinput device creation failed: " << std::strerror(errno) << std::endl;
-        close(m_uinputFd);
-        m_uinputFd = -1;
-        return false;
-    }
-    std::cout << "Virtual mouse created on /dev/uinput" << std::endl;
+    std::cout << "Physical HID mouse: " << m_hid.path() << std::endl;
 
     // Input side: locate the physical mouse (and a keyboard for the trigger
     // hold key). Without these, button queries gracefully read as released.
@@ -396,38 +364,19 @@ void MouseController::sendHIDReport(int16_t dx, int16_t dy, uint8_t button) {
 }
 #else
 void MouseController::sendHIDReport(int16_t dx, int16_t dy, uint8_t button) {
-    if (m_uinputFd < 0) {
+    if (!m_hid.ok()) {
         if (!hidWarningLogged) {
-            std::cerr << "MouseController: uinput device unavailable; aim/click suppressed until reconnect." << std::endl;
+            std::cerr << "MouseController: physical HID mouse unavailable; aim/click suppressed until reconnect." << std::endl;
             hidWarningLogged = true;
         }
         ConnectToDevice();
-        if (m_uinputFd < 0) return;
+        if (!m_hid.ok()) return;
     }
 
-    // Mirror the Windows report semantics: dx/dy little-endian deltas plus a
-    // button byte whose bit0 is LMB (see the report layout above). BTN_LEFT
-    // is re-emitted on every report just like the firmware re-applies the
-    // button byte; the kernel dedupes unchanged key states.
-    auto emit = [this](uint16_t type, uint16_t code, int32_t value) {
-        struct input_event ev {};
-        ev.type = type;
-        ev.code = code;
-        ev.value = value;
-        return write(m_uinputFd, &ev, sizeof(ev)) == static_cast<ssize_t>(sizeof(ev));
-    };
-
-    bool ok = true;
-    if (dx != 0) ok = emit(EV_REL, REL_X, dx) && ok;
-    if (dy != 0) ok = emit(EV_REL, REL_Y, dy) && ok;
-    ok = emit(EV_KEY, BTN_LEFT, (button & 0x01) ? 1 : 0) && ok;
-    ok = emit(EV_SYN, SYN_REPORT, 0) && ok;
-
-    if (!ok) {
-        std::cerr << "MouseController: uinput write failed: " << std::strerror(errno)
-                  << ". Will recreate the device on next call." << std::endl;
-        close(m_uinputFd);
-        m_uinputFd = -1;
+    // The same 65-byte report the Windows path writes: dx/dy little-endian plus
+    // a button byte whose bit0 is LMB, sent to a real USB mouse.
+    if (!m_hid.move(dx, dy, button)) {
+        std::cerr << "MouseController: physical HID write failed; will retry on next call." << std::endl;
         return;
     }
     hidWarningLogged = false;

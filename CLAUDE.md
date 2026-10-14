@@ -25,7 +25,9 @@ cmake --install .
 ### Linux (Wayland/KDE, Arch/CachyOS)
 
 Dependencies: `cuda`, `opencv-cuda` (AUR), `tensorrt` (AUR, 11.x). The user must
-be in the `input` group (for `/dev/uinput` + evdev) — re-login required.
+be in the `input` group (for evdev, and for the `/dev/hidraw` physical HID mouse)
+— re-login required. Install `third_party/PhysicalHidMouse/70-physical-hid-mouse.rules`
+for the aim device.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
@@ -204,7 +206,7 @@ It can be an absolute path if needed.
 
 ## Important Notes
 
-- Cross-platform: Windows uses DXGI/D3D11 capture + HID mouse; Linux uses PipeWire/portal capture (`LinuxCapture.h/.cpp`) + uinput/evdev mouse. Overlay and SoftwareFuser remain Windows-only.
+- Cross-platform: Windows uses DXGI/D3D11 capture + HID mouse; Linux uses PipeWire/portal capture (`LinuxCapture.h/.cpp`) + physical HID/evdev mouse. Overlay and SoftwareFuser remain Windows-only.
 - Thread pinning is used for performance optimization (configurable in INI)
 - FP16 precision requires custom CUDA kernels with 32-byte memory alignment
 - The software fusion module (`SoftwareFuser.cu`) is for capture card + desktop fusion, not INT8

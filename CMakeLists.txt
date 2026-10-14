@@ -173,6 +173,8 @@ if(NOT WIN32)
         src/LinuxCapture.cpp
     )
     add_subdirectory(third_party/Wayland_Game_Overlay wayland_overlay_build)
+    # Aim output goes to a real USB HID mouse, not /dev/uinput (shared library).
+    add_subdirectory(third_party/PhysicalHidMouse physical_hid_mouse_build)
 endif()
 
 # Link CUDA runtime to libraries
@@ -207,7 +209,7 @@ if(WIN32)
     # Windows-specific libraries (DXGI + D3D11 used by DXGICapture; HID/setupapi by MouseController)
     target_link_libraries(detect_object_image PRIVATE setupapi hid d3d11 dxgi)
 else()
-    target_link_libraries(detect_object_image PRIVATE PkgConfig::PIPEWIRE PkgConfig::DBUS PkgConfig::WAYLAND wayland_overlay)
+    target_link_libraries(detect_object_image PRIVATE PkgConfig::PIPEWIRE PkgConfig::DBUS PkgConfig::WAYLAND wayland_overlay physical_hid_mouse)
 endif()
 
 # Interactive TUI launcher: terminal UI that runs the detector as a child
