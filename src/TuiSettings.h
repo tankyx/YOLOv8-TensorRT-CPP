@@ -45,6 +45,7 @@ inline const std::vector<Field> &settingsFields() {
         {"Target", "HeadLabelID2", "Target class 2", "secondary detection class id", FieldType::Int, 0, 999},
 
         {"Overlay", "DebugView", "Overlay", "draw the detection overlay", FieldType::Bool},
+        {"Overlay", "OverlayAntiAlias", "Overlay anti-alias", "smooth shape edges (Linux overlay)", FieldType::Bool},
         {"Overlay", "DebugOverlayTargetProcess", "Overlay process", "process name the overlay attaches to", FieldType::Text},
         {"Overlay", "DebugCaptureWindow", "Capture window", "show the capture-ROI debug window", FieldType::Bool},
         {"Overlay", "DebugCaptureWindowFPS", "Capture window FPS", "max fps of the debug window (0 = every frame)", FieldType::Int, 0, 240},

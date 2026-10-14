@@ -253,6 +253,7 @@ void ObjectDetectionSystem::initializeSystem() {
             debugOverlay.reset();
         } else {
             debugOverlay->setLabelNames(labelNames);
+            debugOverlay->setAntiAlias(config.getBool("OverlayAntiAlias", false));
         }
     }
 #endif
